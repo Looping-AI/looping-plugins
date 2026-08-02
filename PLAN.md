@@ -3,18 +3,21 @@
 > Sibling repos: [`looping-core`](https://github.com/Looping-AI/looping-core) ·
 > [`looping-starter`](https://github.com/Looping-AI/looping-starter)
 
+**Status: built.** Five subpaths, ported from the two predecessor repos, 222 specs green
+including a recorded VCR cassette against the live ARC API. What remains is the starter.
+
 ## What this repo is
 
-`@looping/plugins` — independent capability modules for Looping agents. One subpath export
-per plugin, one factory per subpath, config passed at instantiation.
+`@loopingai/plugins` — independent capability modules for Looping agents. One subpath export
+per plugin, config passed at instantiation.
 
 **The promise:** a project's bundle grows only with what it actually imports, never with
 the size of this library. That promise is structural (no root barrel, no `core → plugin`
-imports), not a tree-shaker's opinion — and CI in `looping-starter` proves it on every
-commit.
+imports), not a tree-shaker's opinion — and `npm run verify:exports` proves it on the built
+graph before every publish.
 
-**Rule of admission.** A module belongs here if an agent can sensibly *not* have it.
-Anything mandatory is `@looping/core`. Anything opinionated is the starter's.
+**Rule of admission.** A module belongs here if an agent can sensibly _not_ have it.
+Anything mandatory is `@loopingai/core`. Anything opinionated is the starter's.
 
 ---
 
@@ -23,8 +26,8 @@ Anything mandatory is `@looping/core`. Anything opinionated is the starter's.
 Each subpath exports **one factory taking config, never `env`**:
 
 ```ts
-// src/arc-agi/index.ts
-export function arcAgi(config: { apiKey: string; model?: string }): AgentPlugin
+// src/browser/index.ts
+export function browser(config: { binding: QuickActionBinding }): AgentPlugin;
 ```
 
 Config-at-instantiation is deliberate on two counts: `Env` is the ambient global
@@ -32,182 +35,174 @@ Config-at-instantiation is deliberate on two counts: `Env` is the ambient global
 reference it; and on Workers `env` doesn't exist at module scope anyway — the same
 constraint that forces core's runtime registry. One design, both problems.
 
+Everything comes from `@loopingai/core` itself — there is **no `/contract` subpath**:
+
 ```ts
-// from @looping/core/contract
-interface AgentPlugin<TRuntime = unknown> {
+import { definePlugin, type AgentPlugin } from "@loopingai/core";
+```
+
+`definePlugin` pins `contractVersion` from the core the plugin compiled against. Never write
+that number as a literal; the point is that it moves.
+
+```ts
+interface AgentPlugin<TRuntime = SubtaskRuntime> {
   key: string;
+  contractVersion: number; // definePlugin sets this
 
   // subagent side
-  subtaskType?:  SubtaskTypeSpec;                    // how the main agent delegates to it
-  toolFamilies?: Record<string, ToolFamilyBuilder>;  // replaces the if/else chain in tools.ts
+  subtaskType?: SubtaskTypeSpec;
+  toolFamilies?: Record<string, ToolFamilyBuilder<TRuntime>>;
 
   // main-agent side
-  mainAgentTools?: (ctx) => ToolSet;                 // e.g. arc_list_games
-  capability?:     string;                           // rendered into the main agent's soul
+  mainAgentTools?: (ctx: MainAgentToolContext) => ToolSet | Promise<ToolSet>;
+  capability?: string;
 
   // parent-DO lifecycle hooks
-  resolveRuntime?: (ctx) => Promise<TRuntime>;
-  enrichResult?:   (ctx, result) => Promise<Result>;
-  onAbort?:        (ctx) => Promise<void>;
+  resolveRuntime?: (ctx: ResolveRuntimeContext) => Promise<TRuntime>;
+  enrichResult?: (ctx, result) => Promise<RecipeExecutionResult>;
+  onAbort?: (ctx: ResolveRuntimeContext) => Promise<void>;
 
-  // storage + requirements
-  store?:    PluginStore;
+  // session lifecycle
+  shouldHandleTurn?: (ctx: TurnGateContext) => Promise<boolean>;
+  onMessagesDisplaced?: (messages: SessionMessage[]) => Promise<void>;
+
+  // storage, workspace + requirements
+  store?: PluginStore;
+  workspaceBacking?: (sql, name) => WorkspaceBacking;
   requires?: { secrets?: string[]; bindings?: string[] };
 }
 ```
 
-The three lifecycle hooks are not speculative — they are exactly the four arc-game leaks
-in `../reactive-agent/src/reactive-agent/index.ts` (`resolveRuntime`, `arcScorecardDeps`,
-`leaseScorecard`/`leasePlay`, `enrichResult`), inverted.
+### Not every subpath is a plugin
 
-`requires` earns its place because **a plugin cannot add its own wrangler binding** — the
-starter must. Declaring it makes startup fail loudly instead of at first tool call, and
-lets each plugin README ship a paste-ready `wrangler.jsonc` snippet.
+`/triage` and `/workspace` export a factory **and** plain functions, because part of what
+they own does not fit any hook: triage's `no_reply` needs turn-local loop state
+(`prepareStep`/`stopWhen` over `repliedAny`), and a host assembling its own `SubagentRuntime`
+may want `durableWorkspaceBacking` directly. Say so rather than pretending the contract
+covers everything.
+
+### Where a capability block goes
+
+`AgentPlugin.capability` and `SubtaskTypeSpec.capability` are rendered by **different call
+sites** (`runtime.renderCapabilities()` and `runtime.types.renderCapabilities()`). A plugin
+that declares a subtask type must put its block on the **type** and leave the plugin's unset,
+or the main agent reads the same advice twice per round — the exact drift the type's prompt
+fields were introduced to end. Tool-only plugins use `plugin.capability`.
 
 ---
 
 ## Packaging rules — non-negotiable, or isolation silently rots
 
-1. **Subpath `exports` per plugin. No root barrel.** There is no `@looping/plugins` import;
-   only `@looping/plugins/<name>`.
+1. **Subpath `exports` per plugin. No root barrel.** There is no `@loopingai/plugins` import;
+   only `@loopingai/plugins/<name>`.
 2. **`"sideEffects": false`.**
-3. **Heavy/unique deps are optional peers, never hard deps** — `@cloudflare/shell`,
-   `agents/browser`. Cheap here: nearly every plugin is pure code (`grid-analysis` has
-   literally zero imports).
-4. **Zero `core → plugins` imports.** Plugins import core **type-only** wherever possible.
-5. **No plugin imports another plugin.** `arc-agi` may use `grid-analysis`; if so it
-   declares it an optional peer rather than reaching across the tree.
-6. **CI proves it** — the check itself lives in `looping-starter` (build each example with
-   `wrangler deploy --dry-run --outdir`, assert cross-plugin absence + a checked-in size
-   budget).
+3. **Heavy/unique deps are optional peers** — `@cloudflare/shell`. Cheap here: nearly every
+   plugin is pure code.
+4. **Zero `core → plugins` imports.** Plugins import core type-only wherever possible.
+5. **A plugin's module graph stays inside its own directory.** A helper used by exactly one
+   plugin lives _inside_ that plugin — which is why grid analysis is internal to `/arc-agi`
+   rather than a subpath of its own. (The predecessor plan said "declare it an optional peer",
+   which is unworkable: they are the same package.)
+6. **`verify:exports` proves 1, 5 and realm isolation** on the built `dist/` graph, at
+   `prepack` and `prepublishOnly`. A cross-plugin re-export typechecks, lints and tests
+   perfectly while quietly doubling every consumer's bundle; only a check on the built graph
+   catches it.
 
 ---
 
-## Plugin-owned storage — self-bootstrapping DDL
+## Plugin-owned storage — drizzle for queries, hand-written DDL
 
-Drizzle's durable-sqlite migrator uses **one flat integer journal** and one global
-`__drizzle_migrations` table. Independently-versioned npm packages cannot share that index
-space. The proof is already in the predecessor repos: proactive's `m0001` is
-`0001_unusual_nova` (adds `context_id`), reactive's is `0001_great_goliath` (creates
-`subtasks`) — **two consumers of the same `notify_tasks` module already forked at slot 1.**
-Worse, `drizzle-kit generate` diffs against `meta/*_snapshot.json` in one `out` dir, so a
-plugin in its own repo cannot produce a correct diff at all.
+What a plugin cannot share is the **migrator**. `drizzle-orm/durable-sqlite/migrator` keeps
+one flat integer journal and one global `__drizzle_migrations` table, and two
+independently-versioned packages cannot share that index space — the two predecessor agents,
+both consuming the same `notify_tasks` module, had already forked it at index 1
+(`0001_unusual_nova` vs `0001_great_goliath`). And `drizzle-kit generate` diffs against a
+snapshot in a single `out` dir, so a plugin in its own repo cannot produce a correct diff.
 
-So: **plugins never touch the core journal.**
+**None of that touches the query builder.** `drizzle(storage, { schema })` is a typed wrapper
+over the same `DurableObjectStorage`, holding no journal and no connection state. So the rule
+is one import, not a whole library:
 
-- **Core** owns one drizzle journal for `notify_tasks` + `subtasks`, generated by
-  drizzle-kit exactly as today. Plugins are invisible to it.
-- **Plugins** declare a `PluginStore` with idempotent `ensureTables()` DDL plus their own
-  `plugin_migrations(plugin TEXT PRIMARY KEY, version INT)` bookkeeping, run at plugin
-  init, outside drizzle entirely.
+- Declare tables with `sqliteTable`, under the plugin's own prefix (`arc_scorecards`).
+- Emit idempotent `CREATE TABLE IF NOT EXISTS` in `PluginStore.ensureTables` — core re-runs
+  it on every hibernation wake-up.
+- Query through drizzle. A second handle beside core's `AgentDB` is safe.
+- **Never import `drizzle-orm/durable-sqlite/migrator`.** An eslint `no-restricted-imports`
+  rule states that where it cannot be forgotten.
 
-**This is already proven in-repo** — `../reactive-agent/src/subagent/index.ts:106` does
-exactly this for `execution_cache` / `run_state`.
-
-`arc-agi` is nearly free under this design: `scorecards` is *already* behind a 5-method
-port (`ScorecardStore`, `../reactive-agent/src/recipes/arc-game/scorecard.ts:35`),
-`AgentDB.scorecards` satisfies it structurally, and the tests already ship an in-memory
-`memStore`. Nothing joins against core tables.
-
-Cost, stated plainly: plugins lose `drizzle-kit generate` and write destructive DDL by
-hand. That is already half-true — `m0002` and `m0005` in reactive are hand-written table
-rebuilds, and `m0005`'s own comment says drizzle-kit emitted invalid SQL.
+Cost, stated plainly: ~8 lines of DDL per table, written by hand and kept in step with the
+declaration beside it. `store.spec.ts` pins that they agree, against real SQLite in a real
+Durable Object — which is the only thing that can say.
 
 ---
 
-## Layout
-
-```
-src/
-  arc-agi/        client, types, scorecard, soul, recipe, tools, game-tools, main-agent
-  grid-analysis/  grid diff, connected components, shape matching/travel, renderers
-  browser/        Browser Rendering quick-action tools
-  workspace/      @cloudflare/shell-backed WorkspaceHandle + ws_read/ws_write/ws_list
-  recall/         Vectorize-backed archive + semantic recall
-  triage/         pre-turn "is this even for me?" gate + no_reply tool
-```
-
-Each plugin directory is self-contained: source, specs, and a README with its config
-shape and `wrangler.jsonc` snippet.
-
-## The initial six
+## The five
 
 Paths are relative to `../reactive-agent` (R) and `../proactive-agent` (P).
 
-| Subpath | Source | LOC | Requires | Notes |
-|---|---|---|---|---|
-| `/grid-analysis` | `R:src/recipes/arc-game/analysis.ts` | 1,031 | nothing | **Zero imports, pure `number[][]`.** Ship first — the free proof that packaging works |
-| `/arc-agi` | `R:src/recipes/arc-game/{client,types,scorecard,soul,recipe,tools,game-tools,main-agent}.ts` | 1,596 | `ARC_API_KEY`; owns `scorecards` | The contract's stress test — the only plugin exercising all three lifecycle hooks and a `PluginStore` |
-| `/browser` | `R:src/agent/tools.ts` browser family | ~60 | `BROWSER` binding (paid plan) | `agents/browser` optional peer |
-| `/workspace` | `R:src/subagent/workspace.ts` | 121 | — | `@cloudflare/shell` optional peer. Already the sole shell import surface in R — a package boundary that pre-exists. Core owns the `WorkspaceHandle` *interface*; this owns the implementation |
-| `/recall` | `R:src/agent/recall.ts` | 125 | `VECTORIZE` index (1024-dim/cosine, `@cf/baai/bge-m3`) | Already defines its own `RecallIndex` port. `parseTurn` must become an injected metadata extractor — it parses a gateway-specific `<turn>` wrapper |
-| `/triage` | `P:src/agent/triage.ts` + `no_reply` | 170 | small model | Harvested from the deprecated proactive repo; reactive has no analog. A pre-turn gate that fails open |
+| Subpath      | Source                                                       | Requires                             | Notes                                                                                                   |
+| ------------ | ------------------------------------------------------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `/browser`   | `R:src/agent/tools.ts` browser family                        | `BROWSER` (paid plan)                | ~60 lines, one optional peer. The packaging proof — shipped first, before any contract complexity       |
+| `/arc-agi`   | `R:src/recipes/arc-game/*` + `R:src/db/models/scorecards.ts` | `ARC_API_KEY`; owns `arc_scorecards` | The stress test. Two lifecycle hooks, a `PluginStore`, the VCR cassette, and grid analysis internalized |
+| `/workspace` | `R:src/subagent/workspace.ts` + `R:src/agent/tools.ts`       | —                                    | ~65 lines across two files. Everything else already ships in core                                       |
+| `/recall`    | `R:src/agent/recall.ts` + `R:src/agent/model.ts`             | `VECTORIZE` (1024-dim/cosine)        | Owns its whole embedding path; namespace is a thunk                                                     |
+| `/triage`    | `P:src/agent/triage.ts` + `P:src/agent/tools.ts`             | —                                    | Harvested from the deprecated proactive repo; reactive has no analog                                    |
 
-≈ **3,100 lines.**
-
-The `arc-agi` VCR cassette spec (`R:test/recipes/arc-game/recorded.spec.ts` +
-`test/snapshots/`) follows its code into this repo. The VCR harness itself ships from
-`@looping/core/testing`.
+`/arc-agi` has **no `onAbort`**: nothing closes a scorecard any more — the API retires an idle
+card on its own — so an abandoned play needs no cleanup. Declaring an empty hook would imply
+otherwise.
 
 ---
 
-## The generic/specific seam inside arc-game
+## What this cost core (0.1.2)
 
-Worth preserving as the split is made — it's the cleanest seam in either predecessor repo:
+Three capabilities the v1 contract had no hook for, plus two harness bugs.
+`PLUGIN_CONTRACT_VERSION` stayed at **1**: the rule against re-typing exists to protect a
+_published_ plugin from a structural-type error several frames from its cause, and no plugin
+had been published.
 
-- **`analysis.ts` (1,031) names ARC nowhere.** It operates on `number[][]`: grid diffing,
-  connected components, shape matching and travel, renderers. Hence `/grid-analysis` as
-  its own subpath rather than an arc-agi internal.
-- **`tools.ts`'s machinery is generic-but-ARC-shaped**: orientation handling, `lastView`
-  dedupe, write-ahead `pendingAction`, batch-with-per-step-attribution rendering. Reusable
-  for any turn-based grid game behind an `act(action) -> frame` port. Leave it in
-  `/arc-agi` for now; extract only if a second game appears.
-- **Strictly ARC**: `client.ts` (the only thing touching `three.arcprize.org` — API paths,
-  AWSALB cookie affinity, `X-API-Key`), `types.ts`, `scorecard.ts` (the card lifecycle is
-  an artifact of ARC's ~15-min idle auto-close), `soul.ts`, `main-agent.ts`, `recipe.ts`.
-
----
-
-## Known hazards
-
-**`ToolFamilyContext.env: Env`.** The predecessor contract passes the ambient global `Env`
-to every tool family (`R:src/agent/tools.ts:93`). A published package cannot reference it.
-Resolved by config-at-instantiation, but every plugin needs auditing for stray `ctx.env`
-reads during the lift — `arc-agi` reads `env.ARC_API_KEY` at `tools.ts:63`, `browser` reads
-`ctx.env.BROWSER`.
-
-**Peer-dep duplication.** Two copies of `agents` in one Worker bundle breaks the
-`Session`/`SessionMessage` types and `instanceof`. Every plugin declares `agents`, `ai`,
-and `@looping/core` as peers — never deps.
-
-**Contract skew.** `peerDependencies: { "@looping/core": "^1" }` plus the runtime
-`PLUGIN_CONTRACT_VERSION` assert core exports. A three-repo publish train is the cost of
-three repos; the assert is what makes a skew fail readably instead of as a structural-type
-error.
+- **`shouldHandleTurn`** — the pre-turn gate `/triage` is. AND across plugins, fails open.
+- **`workspaceBacking`** — `/workspace` had no way to deliver core's one missing backend.
+  At most one plugin may declare it; core falls back to `memoryWorkspaceBacking`.
+- **`mainAgentTools(ctx)`, possibly async** — `/recall` gates its tool on
+  `await ctx.session.getCompactions()`.
+- **`cassetteNameFor`** named cassettes after the developer's home directory for any spec
+  outside `test/` (`.pop()` of a split that never matched returns the input unchanged).
+- **The VCR harness pins its test-runner peers.** See below — it cost an afternoon.
 
 ---
 
-## Milestones
+## The two version pins that are not preferences
 
-1. **Scaffold** — package skeleton, subpath `exports` map, `sideEffects: false`, shared
-   tsconfig/eslint/prettier from `@looping/core/eslint`. Depends on `@looping/core@next`.
-2. **`/grid-analysis`** — zero blockers, pure code. Ships with its specs and proves the
-   packaging end to end before any contract complexity lands.
-3. **`/browser`** — ~60 lines, one optional peer. Second-easiest proof.
-4. **`/arc-agi`** — the stress test. All three lifecycle hooks, a `PluginStore` with
-   self-bootstrapping DDL for `scorecards`, `requires: { secrets: ["ARC_API_KEY"] }`, plus
-   the VCR cassette spec. **If the contract is wrong, it's wrong here** — do this before
-   declaring the contract stable.
-5. **`/workspace`, `/recall`, `/triage`** — straightforward once the contract has survived
-   step 4.
-6. **Publish `0.1.0` to `next`.** Promote to `latest` alongside core, only after the
-   starter's three examples are green.
+Both fail unreadably, and both are now peer ranges on `@loopingai/core`:
+
+**`@cloudflare/vitest-pool-workers@^0.18`.** The VCR recorder installs as Miniflare's
+`fetchMock`, and **that option does not exist in Miniflare 5**, which pool `0.19`+ depends on
+— only `outboundService` remains. On a newer pool the option is silently ignored rather than
+rejected, so `disableNetConnect()` never applies, every request hits the real network, and
+each one fails as `internal error; reference = …` naming nothing at all.
+
+**`undici@7.28.0`.** `fetchMock` is an undici `MockAgent` and Miniflare validates it against
+_its own_ undici, so two copies in one `node_modules` fail with `Input not instance of
+MockAgent`. Miniflare pins exactly; core's peer range tracks it.
+
+A corollary for local development: **install core from a tarball, not a symlink.** A `file:`
+dependency is a symlink, Vite resolves through realpath, and core's imports then land in
+_its_ `node_modules` while this package's land in ours — two copies of `agents`, which breaks
+`instanceof` and makes `Session`/`SessionMessage` two unrelated types. `npm pack` in core,
+`npm i --no-save ../looping-core/loopingai-core-*.tgz` here.
+
+---
 
 ## Verification
 
-- Each plugin's specs move with it and stay green (`vitest run`).
-- Every plugin builds standalone with no `@looping/plugins/<other>` in its module graph.
-- `arc-agi` runs its recorded VCR cassette against `@looping/core/testing`.
-- **The real proof is in `looping-starter`**: the proactive example's bundle must contain
-  no arc-agi source strings, and every example bundle must stay under its checked-in size
-  budget.
+- `npm run check` — prettier, eslint (including the type-aware `no-deprecated` pass and the
+  migrator ban), `tsc`, build. `npm test` alone typechecks nothing.
+- `npm test` — 222 specs in real workerd.
+- `npm run verify:exports` — subpaths resolve, no spec reached `dist/`, no missing `.js`
+  extension, realms isolated, **and no plugin's graph leaves its own directory**.
+- `/arc-agi` replays its recorded cassette hermetically, with no `ARC_API_KEY` configured —
+  the key header is excluded from the snapshot, which is what makes it safe to commit.
+
+The remaining proof is `looping-starter`: three example bundles, cross-plugin absence at the
+bundler level, size budgets, and a live ARC game.

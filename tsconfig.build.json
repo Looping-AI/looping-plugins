@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  // Specs live next to the code they test, so they must be excluded explicitly
+  // or `dist/` ships them — and with them `vitest` and `cloudflare:test` imports
+  // in a consumer's runtime graph. `test/` is excluded wholesale: it holds the
+  // recorded specs and the pool's host Worker, none of which is published.
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.spec.ts", "test/**/*.ts"]
+}
