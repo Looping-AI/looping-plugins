@@ -25,7 +25,13 @@ if (existsSync(ENV_TEST)) process.loadEnvFile(ENV_TEST);
 // `RECORD=1` makes every activated cassette capture real traffic; every other run
 // replays. Generic — recorded specs key their own cassettes per test, so adding
 // one touches only that spec file, never this config.
-const RECORD = !!process.env.RECORD;
+//
+// Compared against `"1"` rather than tested for truthiness, because every string
+// is truthy: `RECORD=0` and `RECORD=false` — the two things someone reaches for
+// to turn recording *off* — would otherwise turn it on, overwriting committed
+// cassettes with live traffic. The opposite mistake (`RECORD=true` not
+// recording) fails loudly on the next assertion and costs nothing.
+const RECORD = process.env.RECORD === "1";
 
 /**
  * One agent serves the whole suite, because Miniflare accepts only a single

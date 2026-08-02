@@ -245,8 +245,30 @@ export function triage(config: TriageConfig): AgentPlugin {
   return definePlugin({
     key: "triage",
 
-    shouldHandleTurn: ({ history }) =>
-      shouldReply(classifier(), history, { historyMessages, messageMaxChars })
+    /**
+     * Building the classifier is inside the guarantee, not in front of it.
+     *
+     * `shouldReply` catches its own failures, but it can only catch what happens
+     * after it is entered — and `createWorkersAI` throws synchronously when the
+     * binding is missing, before the call is ever made. That threw straight out
+     * of this hook, which is the one outcome the whole design forbids: a triage
+     * outage must degrade to *running the turn*, never to a silent agent.
+     * (`createAgentRuntime` also treats a rejected gate as `true`, so the agent
+     * stayed correct — but a plugin that documents fail-open should not be
+     * relying on its host to make that true.)
+     */
+    shouldHandleTurn: async ({ history }) => {
+      let model: LanguageModel;
+      try {
+        model = classifier();
+      } catch (error) {
+        console.warn("[triage] classifier unavailable, replying by default", {
+          error: String(error)
+        });
+        return true;
+      }
+      return shouldReply(model, history, { historyMessages, messageMaxChars });
+    }
 
     // No `requires`. `AI` is core's own mandatory binding, not this plugin's to
     // demand — declaring it would report a core misconfiguration under this

@@ -236,14 +236,14 @@ describe("scorecards.touch", () => {
 });
 
 describe("scorecards.cleanup", () => {
-  it("deletes cards past the retention window and keeps recent ones", async () => {
+  it("deletes cards untouched past the retention window", async () => {
     // Safe in a way the predecessor's shape was not: a row holds no score, only
     // a dead card id and its jar, and a score is read back from the API on demand.
     const remaining = await withScorecards("sc-cleanup", (store, storage) => {
       store.open("old", {});
       store.open("new", {});
       storage.sql.exec(
-        "UPDATE arc_scorecards SET opened_at = ? WHERE card_id = 'old'",
+        "UPDATE arc_scorecards SET last_used_at = ? WHERE card_id = 'old'",
         Date.now() - SCORECARD_RETENTION_MS - MINUTE
       );
       store.cleanup();
@@ -252,5 +252,28 @@ describe("scorecards.cleanup", () => {
       ].flat();
     });
     expect(remaining).toEqual(["new"]);
+  });
+
+  it("keeps a long-lived card that is still being used", async () => {
+    // The two clocks diverge for exactly the card this ledger exists for: an
+    // agent playing regularly touches one card every chunk and keeps it open
+    // indefinitely. Sweeping on `openedAt` would delete a card that is live, in
+    // use, and holding the jar its in-flight plays need to read their scores.
+    const remaining = await withScorecards(
+      "sc-cleanup-live",
+      (store, storage) => {
+        store.open("ancient-but-live", {});
+        storage.sql.exec(
+          "UPDATE arc_scorecards SET opened_at = ? WHERE card_id = 'ancient-but-live'",
+          Date.now() - SCORECARD_RETENTION_MS - MINUTE
+        );
+        store.touch("ancient-but-live");
+        store.cleanup();
+        return [
+          ...storage.sql.exec("SELECT card_id FROM arc_scorecards").raw()
+        ].flat();
+      }
+    );
+    expect(remaining).toEqual(["ancient-but-live"]);
   });
 });

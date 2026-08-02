@@ -218,16 +218,26 @@ export function makeScorecardStore(
     },
 
     /**
-     * Delete scorecards older than the retention window. Safe in a way the old
-     * shape was not: a row holds no score, only a dead card id and its jar, and
-     * a score is read back from the API on demand.
+     * Delete scorecards untouched for the retention window. Safe in a way the
+     * old shape was not: a row holds no score, only a dead card id and its jar,
+     * and a score is read back from the API on demand.
+     *
+     * Retention is measured on `lastUsedAt`, not `openedAt`, because that is the
+     * column that says whether a card is *dead* — and "dead" is the only thing
+     * that makes a row safe to drop. The two diverge for exactly the card this
+     * ledger is built around: an agent playing regularly keeps one card alive
+     * indefinitely by touching it every chunk, so an `openedAt` cutoff would
+     * delete a card that is open, in use, and holding the jar its in-flight
+     * plays need to read their own scores.
      *
      * Not called from anywhere in this plugin — a maintenance cron is the host's,
      * and a plugin has no way to schedule one. Each README says so.
      */
     cleanup(): void {
       const cutoff = Date.now() - SCORECARD_RETENTION_MS;
-      db.delete(arcScorecards).where(lt(arcScorecards.openedAt, cutoff)).run();
+      db.delete(arcScorecards)
+        .where(lt(arcScorecards.lastUsedAt, cutoff))
+        .run();
     }
   };
 }

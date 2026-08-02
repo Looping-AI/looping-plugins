@@ -207,6 +207,33 @@ describe("triage()", () => {
     ).not.toThrow();
   });
 
+  it("fails open when the provider itself cannot be built", async () => {
+    // The gap `shouldReply`'s own try/catch cannot cover: `createWorkersAI`
+    // throws *synchronously* on a missing binding, before the call it guards is
+    // ever entered. That threw straight out of the hook — the one outcome the
+    // design forbids, since a triage outage must degrade to running the turn
+    // rather than to a silent agent.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const plugin = triage({ ai: undefined as unknown as Ai });
+
+    await expect(plugin.shouldHandleTurn!({ history })).resolves.toBe(true);
+    expect(warn.mock.calls[0][0]).toContain("classifier unavailable");
+    warn.mockRestore();
+  });
+
+  it("fails open through the runtime as well as on its own", async () => {
+    // Belt and braces: `createAgentRuntime` counts a rejected gate as `true`
+    // too. Both layers are asserted because the plugin documents the guarantee
+    // itself, and a plugin should not rely on its host to make its own docs true.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rt = createAgentRuntime({
+      plugins: [triage({ ai: undefined as unknown as Ai })]
+    });
+
+    expect(await rt.shouldHandleTurn({ history })).toBe(true);
+    warn.mockRestore();
+  });
+
   it("demands no bindings of the host", () => {
     // `AI` is core's own mandatory binding. Declaring it here would report a core
     // misconfiguration under this plugin's name.

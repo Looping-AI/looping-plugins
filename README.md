@@ -24,10 +24,17 @@ import { arcAgi } from "@loopingai/plugins/arc-agi";
 import { browser } from "@loopingai/plugins/browser";
 import { recall } from "@loopingai/plugins/recall";
 
-export const plugins = (env: Env, ctx: DurableObjectState) => [
-  arcAgi({ apiKey: env.ARC_API_KEY, storage: ctx.storage }),
+export interface PluginHost {
+  env: Env;
+  storage: DurableObjectStorage;
+  /** The verified caller this Durable Object belongs to. See below. */
+  callerKey: () => string;
+}
+
+export const plugins = ({ env, storage, callerKey }: PluginHost) => [
+  arcAgi({ apiKey: env.ARC_API_KEY, storage }),
   browser({ binding: env.BROWSER }),
-  recall({ ai: env.AI, index: env.VECTORIZE, namespace: () => callerKey })
+  recall({ ai: env.AI, index: env.VECTORIZE, namespace: callerKey })
 ];
 ```
 
@@ -40,12 +47,34 @@ it on the built graph before every publish.
 scope, and core's registry is built per Durable Object instance in `onStart()`.
 
 ```ts
-this.runtime = createAgentRuntime({
-  config,
-  plugins: plugins(this.env, this.ctx),
-  env: this.env // verify every plugin's declared bindings exist, at startup
-});
+export class MyAgent extends Agent<Env> {
+  /** Set on the first verified request; constant thereafter. See below. */
+  private identity?: string;
+
+  async onStart() {
+    this.runtime = createAgentRuntime({
+      config,
+      plugins: plugins({
+        env: this.env,
+        storage: this.ctx.storage,
+        // A thunk, not a value: `onStart` runs before any request, so the caller
+        // is not known yet. The DO is keyed 1:1 by that caller, so it is constant
+        // once it is — this just defers reading it until it exists.
+        callerKey: () => this.identity ?? ""
+      }),
+      env: this.env // verify every plugin's declared bindings exist, at startup
+    });
+  }
+
+  async onTurn(turn: AgentTurn, identity: GatewayIdentity) {
+    this.identity ??= identity.key!;
+    // …
+  }
+}
 ```
+
+That deferral is the whole reason `/recall` takes `namespace` as a function. Anything else
+needing per-caller state takes it the same way.
 
 ---
 

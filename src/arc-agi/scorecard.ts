@@ -105,7 +105,25 @@ export async function resolvePlay(
   gameId: string,
   now: number = Date.now()
 ): Promise<ResolvedPlay> {
-  const { cardId, cookies } = await resolveScorecard(deps, now);
+  return resolvePlayOn(deps, await resolveScorecard(deps, now), gameId);
+}
+
+/**
+ * {@link resolvePlay} on a card the caller has **already** leased.
+ *
+ * Split out because resolving the card inside is a race the caller may have
+ * gone to trouble to avoid: a host that collapses concurrent scorecard leases
+ * onto one call (as the plugin does) would have that work bypassed entirely if
+ * every play re-resolved its own card. Two plays for *different* games starting
+ * together would then each find an empty ledger and each open a card, which is
+ * exactly the shared-card behaviour the collapse exists to produce.
+ */
+export async function resolvePlayOn(
+  deps: ArcScorecardDeps,
+  card: ResolvedScorecard,
+  gameId: string
+): Promise<ResolvedPlay> {
+  const { cardId, cookies } = card;
   const recorded = deps.store.get(cardId)?.guids[gameId];
   if (recorded !== undefined) return { cardId, cookies, guid: recorded };
 

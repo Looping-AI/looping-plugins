@@ -83,7 +83,7 @@
     "@cloudflare/shell": "0.4.3",
     "@cloudflare/vitest-pool-workers": "^0.18.8",
     "@cloudflare/workers-types": "^5.20260801.1",
-    "@loopingai/core": "file:../looping-core",
+    "@loopingai/core": "^0.1.2",
     "@types/node": "^26.1.1",
     "agents": "^0.20.0",
     "ai": "^7.0.40",

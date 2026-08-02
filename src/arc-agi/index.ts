@@ -6,7 +6,7 @@ import { buildArcGamesTools } from "./game-tools.js";
 import { arcGameSpec, ARC_GAME_TYPE, type ArcRecipeModels } from "./recipe.js";
 import {
   gameScoreReport,
-  resolvePlay,
+  resolvePlayOn,
   resolveScorecard,
   type ArcScorecardDeps,
   type ResolvedPlay,
@@ -82,6 +82,20 @@ export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
   let leasingCard: Promise<ResolvedScorecard> | undefined;
   const leasingPlays = new Map<string, Promise<ResolvedPlay>>();
 
+  /**
+   * The card each execution *first* resolved onto, so a later chunk's lease can
+   * be recognised as a different one. See {@link ArcAgiConfig} and the note on
+   * `enrichResult`.
+   *
+   * In memory, and that is the honest limit: an isolate evicted between the
+   * final chunk and the result loses the entry and simply cannot tell. That is
+   * no worse than not tracking at all, and the common case — the parent
+   * resolving the last chunk and then handling its result — keeps it warm.
+   */
+  const firstCard = new Map<string, string>();
+  const executionKey = (taskId: string, subtaskId: number): string =>
+    `${taskId}:${subtaskId}`;
+
   const leaseScorecard = (): Promise<ResolvedScorecard> =>
     (leasingCard ??= resolveScorecard(deps()).finally(() => {
       leasingCard = undefined;
@@ -91,10 +105,16 @@ export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
     const inFlight = leasingPlays.get(gameId);
     if (inFlight) return inFlight;
     // Keyed per game: different games legitimately open different plays on the
-    // same card.
-    const pending = resolvePlay(deps(), gameId).finally(() => {
-      leasingPlays.delete(gameId);
-    });
+    // same card — but they must all be on *the same card*, so the play resolves
+    // onto the collapsed lease rather than looking one up for itself. Calling
+    // `resolvePlay` here instead would re-enter `resolveScorecard` per game and
+    // undo the collapse entirely: two games starting together would each find
+    // an empty ledger and each open a card.
+    const pending = leaseScorecard()
+      .then((card) => resolvePlayOn(deps(), card, gameId))
+      .finally(() => {
+        leasingPlays.delete(gameId);
+      });
     leasingPlays.set(gameId, pending);
     return pending;
   };
@@ -137,8 +157,16 @@ export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
       // A Subtask whose params never validated still reaches here. Resolve the
       // card alone and let the recipe's own validation report the missing game,
       // rather than RESETting on it and turning a clean failure into an API error.
-      if (!gameId) return leaseScorecard();
-      return leasePlay(gameId);
+      const resolved = gameId
+        ? await leasePlay(gameId)
+        : await leaseScorecard();
+
+      // Remember the first card only. A later chunk that lands on a different
+      // one has rolled over, and the play it names is not the play running.
+      const key = executionKey(ctx.taskId, ctx.subtaskId);
+      if (!firstCard.has(key)) firstCard.set(key, resolved.cardId);
+
+      return resolved;
     },
 
     /**
@@ -159,7 +187,35 @@ export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
     async enrichResult(ctx, result): Promise<RecipeExecutionResult> {
       const gameId = ctx.request.params.game_id;
       const cardId = ctx.runtime.cardId;
+      const key = executionKey(ctx.request.taskId, ctx.request.subtaskId);
+      const opened = firstCard.get(key);
+      firstCard.delete(key);
+
       if (result.status !== "completed" || !cardId || !gameId) return result;
+
+      // A rollover means this runtime names a card the play never ran on, so
+      // its score belongs to something else. The tool family keeps playing the
+      // session it already has when the lease diverges — deliberately, because
+      // joining the new play would throw away every level the real one reached
+      // — so the report is right and only the score would be wrong.
+      //
+      // Nothing here can recover the real one: the parent cannot read the
+      // child's workspace, which is the only place the play it actually ran is
+      // recorded. And a rollover means over 14 minutes passed between two
+      // chunks, so the old card is idle-closed and unreachable anyway. What is
+      // fixable is the lie — an empty RESET on the fresh card renders as a
+      // perfectly plausible "score 0, 0 levels", which reads as a play that
+      // achieved nothing rather than as a score that could not be read. Omit it
+      // instead; the main agent is told to report an absent score as
+      // unavailable.
+      if (opened !== undefined && opened !== cardId) {
+        console.warn("[arc-agi] scorecard rolled over mid-execution", {
+          gameId,
+          played: opened,
+          leased: cardId
+        });
+        return result;
+      }
 
       const score = await gameScoreReport(deps(), cardId, gameId);
       if (!score) return result;
