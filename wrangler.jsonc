@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // Dev-only. `@loopingai/plugins` is a library and never deploys — this config
+  // exists so `@cloudflare/vitest-pool-workers` has a Worker to bind, and so the
+  // recorded ARC spec can reach a real `ARC_API_KEY` from `.dev.vars`. It is
+  // excluded from the published tarball by `package.json`'s `files` allowlist;
+  // a consumer brings their own, and each plugin's README ships the snippet.
+  "name": "looping-plugins-test",
+  "main": "test/worker.ts",
+  "compatibility_date": "2026-07-01",
+
+  // The Agents SDK reaches for Node builtins (`node:async_hooks` among others),
+  // and the plugin stores run drizzle over durable-sqlite. Both need this.
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [{ "name": "TEST_AGENT", "class_name": "TestAgent" }]
+  },
+
+  // `new_sqlite_classes`, not `new_classes`: a `PluginStore` talks to
+  // `ctx.storage.sql`, which only exists on a SQLite-backed Durable Object.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TestAgent"]
+    }
+  ]
+}

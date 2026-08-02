@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    // Deliberately NOT wrangler's generated `worker-configuration.d.ts` — the
+    // same rule core follows, and for a sharper reason here: the whole point of
+    // config-at-instantiation is that a plugin never names a consumer's ambient
+    // `Env`. Leaving it out means a stray `Env` reference fails typecheck in this
+    // repo rather than at a consumer's build, where the symbol resolves to
+    // *their* bindings and the mistake is invisible.
+    //
+    // `@cloudflare/vitest-pool-workers/types` is here for the specs, which run
+    // inside workerd and import `cloudflare:test`.
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-pool-workers/types",
+      "node"
+    ],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true
+  },
+  // Specs included, because eslint's type-aware pass resolves each file to its
+  // nearest tsconfig and a co-located spec excluded here would have no project.
+  // `tsconfig.build.json` is where specs are held out of `dist/`.
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

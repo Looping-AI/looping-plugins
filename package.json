@@ -1,0 +1,114 @@
+{
+  "name": "@loopingai/plugins",
+  "version": "0.1.0",
+  "description": "Optional, composable capabilities for Looping agents: ARC-AGI-3, browser rendering, workspace, episodic recall, and pre-turn triage. One subpath per plugin, so a bundle grows only with what it imports.",
+  "keywords": [
+    "ai-agents",
+    "cloudflare-workers",
+    "durable-objects",
+    "agents-sdk",
+    "arc-agi",
+    "vectorize",
+    "browser-rendering",
+    "plugins"
+  ],
+  "license": "GPL-3.0-only",
+  "author": "Looping AI",
+  "homepage": "https://github.com/Looping-AI/looping-plugins#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Looping-AI/looping-plugins.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Looping-AI/looping-plugins/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    "./arc-agi": {
+      "types": "./dist/arc-agi/index.d.ts",
+      "import": "./dist/arc-agi/index.js"
+    },
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "import": "./dist/browser/index.js"
+    },
+    "./workspace": {
+      "types": "./dist/workspace/index.d.ts",
+      "import": "./dist/workspace/index.js"
+    },
+    "./recall": {
+      "types": "./dist/recall/index.d.ts",
+      "import": "./dist/recall/index.js"
+    },
+    "./triage": {
+      "types": "./dist/triage/index.d.ts",
+      "import": "./dist/triage/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "types": "wrangler types",
+    "format": "prettier --write .",
+    "lint": "eslint .",
+    "check": "prettier --check . && eslint . && tsc && npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:record": "RECORD=1 vitest run recorded.spec.ts",
+    "verify:exports": "node scripts/verify-exports.mjs",
+    "prepack": "npm run build && npm run verify:exports",
+    "prepublishOnly": "npm run check && npm test && npm run verify:exports"
+  },
+  "peerDependencies": {
+    "@cloudflare/shell": "^0.4.3",
+    "@loopingai/core": "^0.1.2",
+    "agents": "^0.20.0",
+    "ai": "^7.0.40",
+    "drizzle-orm": "^0.45.2",
+    "workers-ai-provider": "^4.0.0",
+    "zod": "^4.4.3"
+  },
+  "peerDependenciesMeta": {
+    "@cloudflare/shell": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/shell": "0.4.3",
+    "@cloudflare/vitest-pool-workers": "^0.18.8",
+    "@cloudflare/workers-types": "^5.20260801.1",
+    "@loopingai/core": "^0.1.2",
+    "@types/node": "^26.1.1",
+    "agents": "^0.20.0",
+    "ai": "^7.0.40",
+    "drizzle-orm": "^0.45.2",
+    "eslint": "^10.8.0",
+    "prettier": "^3.9.6",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.65.0",
+    "undici": "7.28.0",
+    "vitest": "^4.1.10",
+    "workers-ai-provider": "^4.0.0",
+    "wrangler": "^4.114.0",
+    "zod": "^4.4.3"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "allowScripts": {
+    "esbuild": false,
+    "fsevents": false,
+    "sharp": false,
+    "workerd": false,
+    "core-js-pure": false
+  }
+}
