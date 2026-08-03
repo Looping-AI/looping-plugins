@@ -324,6 +324,31 @@ export const noReplyTool = tool({
   execute: async () => NO_REPLY_IGNORED
 });
 
+/**
+ * What the agent is told about {@link noReplyTool}, as a system-prompt suffix.
+ *
+ * It lives here rather than in a host's prompt file for the same reason a subtask
+ * type carries its own `capability`: everything the model is told about a
+ * capability is declared by whatever owns that capability, so uninstalling the
+ * plugin takes its advice with it. A host describing a `no_reply` tool it no
+ * longer installs is the exact drift those fields exist to end.
+ *
+ * Not a `capability` on the plugin, though, and the distinction is the design.
+ * `capability` is rendered into the soul once and is true for the whole
+ * conversation; this has to be **withdrawn mid-turn**, the moment the agent
+ * speaks, in the same `prepareStep` that withdraws the tool. Advice for a tool
+ * that is no longer on the call is worse than no advice — so the loop injects it,
+ * and the loop is what knows when.
+ */
+export const NO_REPLY_GUIDANCE = [
+  "",
+  "",
+  "You see every message in this channel, including the many that are not for you.",
+  "Call the `no_reply` tool to end your turn without replying whenever the message needs no answer from you: people talking to each other, chatter, acknowledgements, or anything you were not asked about. You may also look something up first and then call `no_reply` if, having looked, there is genuinely nothing worth adding.",
+  "Staying silent is the right default in a busy channel. Reply only when you are addressed, asked a question, or can add something the conversation clearly needs.",
+  "Calling `no_reply` ends your turn at once — don't pair it with a tool whose result you still need, and don't write any text with it (that text is discarded). It is unavailable once you have already sent something this turn."
+].join("\n");
+
 /** The only part of a `StepResult` the no-reply predicates read. */
 type ToolCallingStep = { toolCalls: ReadonlyArray<{ toolName: string }> };
 
