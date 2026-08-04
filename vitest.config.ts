@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { createVcrAgent } from "@loopingai/core/testing/node";
+import { createVcr, recordFromEnv } from "@loopingai/core/testing/node";
 
 /**
  * Specs run **inside workerd**, not Node.
@@ -22,35 +22,31 @@ import { createVcrAgent } from "@loopingai/core/testing/node";
 const ENV_TEST = path.resolve(import.meta.dirname, ".env.test");
 if (existsSync(ENV_TEST)) process.loadEnvFile(ENV_TEST);
 
-// `RECORD=1` makes every activated cassette capture real traffic; every other run
-// replays. Generic — recorded specs key their own cassettes per test, so adding
-// one touches only that spec file, never this config.
-//
-// Compared against `"1"` rather than tested for truthiness, because every string
-// is truthy: `RECORD=0` and `RECORD=false` — the two things someone reaches for
-// to turn recording *off* — would otherwise turn it on, overwriting committed
-// cassettes with live traffic. The opposite mistake (`RECORD=true` not
-// recording) fails loudly on the next assertion and costs nothing.
-const RECORD = process.env.RECORD === "1";
-
 /**
- * One agent serves the whole suite, because Miniflare accepts only a single
- * `fetchMock`. It record/replays per-test cassettes, announced by each recorded
- * spec over an in-band control channel — the spec runs in workerd and has no
- * filesystem, so it cannot reach the recorder any other way.
+ * One recorder serves the whole suite. It record/replays per-test cassettes,
+ * announced by each recorded spec over an in-band control channel — the spec
+ * runs in workerd and has no filesystem, so it cannot reach the recorder any
+ * other way. Generic: recorded specs key their own cassettes per test, so adding
+ * one touches only that spec file, never this config.
+ *
+ * `recordFromEnv()` is `RECORD=1`, compared rather than coerced — every
+ * non-empty string is truthy, so `RECORD=0` and `RECORD=false`, the two things
+ * someone reaches for to turn recording *off*, would otherwise turn it on and
+ * overwrite committed cassettes with live traffic.
  *
  * `excludeHeaders` is the reason a committed cassette is safe: the ARC API key
  * never reaches the snapshot file, which is also why playback works with no key
  * configured at all.
+ *
+ * There is no `disableNetConnect()` any more. A request with no active cassette
+ * is blocked by default and names itself, instead of failing as an unnamed
+ * `internal error; reference = …`.
  */
-const fetchMock = createVcrAgent({
+const vcr = createVcr({
   snapshotsDir: path.resolve(import.meta.dirname, "./test/snapshots"),
-  record: RECORD,
-  passthroughHosts: [],
-  excludeHeaders: ["x-api-key", "cookie", "set-cookie"],
-  ignoreHeaders: []
+  record: recordFromEnv(),
+  excludeHeaders: ["x-api-key", "cookie", "set-cookie"]
 });
-fetchMock.disableNetConnect();
 
 // Placeholder so the pool has something to source `ARC_API_KEY` from. A real key
 // in .env.test takes precedence and is what `npm run test:record` needs.
@@ -83,7 +79,10 @@ export default defineConfig({
       // remote connection per test file — seconds of startup plus a reproducible
       // teardown hang.
       remoteBindings: false,
-      miniflare: { fetchMock }
+      // The hook Miniflare 4 and 5 both have. `fetchMock` was removed in pool
+      // 0.20, and an unknown key here is ignored rather than rejected — which
+      // is exactly how the previous wiring failed silently.
+      miniflare: { outboundService: vcr.outboundService }
     })
   ],
   test: {

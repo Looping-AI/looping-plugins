@@ -122,11 +122,12 @@ Three rules the whole design rests on:
 ## Testing
 
 Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the harness from
-`@loopingai/core/testing`. Two peer versions are pinned rather than open, because both fail
-unreadably — see [PLAN.md](PLAN.md#the-two-version-pins-that-are-not-preferences).
+`@loopingai/core/testing`. The recorded ARC spec replays committed cassettes, so the suite
+needs no credentials and no network — see
+[PLAN.md](PLAN.md#the-cassette-this-repo-owns) before re-recording one.
 
 ```bash
-npm test          # 222 specs
+npm test          # 231 specs
 npm run check     # prettier + eslint + tsc + build
 npm run verify:exports
 ```

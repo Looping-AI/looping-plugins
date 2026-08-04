@@ -168,29 +168,51 @@ had been published.
   `await ctx.session.getCompactions()`.
 - **`cassetteNameFor`** named cassettes after the developer's home directory for any spec
   outside `test/` (`.pop()` of a split that never matched returns the input unchanged).
-- **The VCR harness pins its test-runner peers.** See below — it cost an afternoon.
+- **The VCR harness pinned its test-runner peers.** See below — it cost an afternoon, and
+  core 0.3.0 removed both pins.
 
 ---
 
-## The two version pins that are not preferences
+## The two version pins that are not preferences — both now gone (core 0.3.0)
 
-Both fail unreadably, and both are now peer ranges on `@loopingai/core`:
+They were real, they each cost an afternoon, and they are recorded here because the
+_shape_ of the failure recurs even though these two instances are fixed.
 
-**`@cloudflare/vitest-pool-workers@^0.18`.** The VCR recorder installs as Miniflare's
-`fetchMock`, and **that option does not exist in Miniflare 5**, which pool `0.19`+ depends on
-— only `outboundService` remains. On a newer pool the option is silently ignored rather than
-rejected, so `disableNetConnect()` never applies, every request hits the real network, and
-each one fails as `internal error; reference = …` naming nothing at all.
+**`@cloudflare/vitest-pool-workers@^0.18`.** The VCR recorder installed as Miniflare's
+`fetchMock`, an option Miniflare 5 dropped and pool 0.20 removed from its overrides. An
+unknown key in `miniflare` is **ignored rather than rejected**, so on a newer pool nothing
+intercepted anything: `disableNetConnect()` never applied, every request hit the real
+network, and each one failed as `internal error; reference = …` naming nothing at all.
 
-**`undici@7.28.0`.** `fetchMock` is an undici `MockAgent` and Miniflare validates it against
-_its own_ undici, so two copies in one `node_modules` fail with `Input not instance of
-MockAgent`. Miniflare pins exactly; core's peer range tracks it.
+**`undici@7.28.0`.** `fetchMock` was validated with `instanceof MockAgent` against
+Miniflare's _own_ undici, so two copies in one `node_modules` failed with `Input not
+instance of MockAgent`.
 
-A corollary for local development: **install core from a tarball, not a symlink.** A `file:`
-dependency is a symlink, Vite resolves through realpath, and core's imports then land in
-_its_ `node_modules` while this package's land in ours — two copies of `agents`, which breaks
-`instanceof` and makes `Session`/`SessionMessage` two unrelated types. `npm pack` in core,
-`npm i --no-save ../looping-core/loopingai-core-*.tgz` here.
+Core 0.3.0 moved the recorder onto `outboundService` — the hook `fetchMock` was one line of
+sugar over, identical in Miniflare 4 and 5, with no `instanceof` check in either direction.
+Both pins went with it: the pool peer is `>=0.18` and core declares no `undici`.
+`setupRecording()` also asserts the recorder answered before a test runs, so a silently
+ignored option now fails by name instead of as an unnamed internal error.
+
+A corollary for local development still stands: **install core from a tarball, not a
+symlink.** A `file:` dependency is a symlink, Vite resolves through realpath, and core's
+imports then land in _its_ `node_modules` while this package's land in ours — two copies of
+`agents`, which breaks `instanceof` and makes `Session`/`SessionMessage` two unrelated
+types. `npm pack` in core, `npm i --no-save ../looping-core/loopingai-core-*.tgz` here.
+
+### The cassette this repo owns
+
+`test/snapshots/…json` was recorded by the old undici recorder, which keyed on
+`String(opts.body)` — and a Worker's POST body reaches the dispatcher as a `ReadableStream`,
+so **every POST in it stored the literal `[object ReadableStream]` instead of its payload**.
+Core 0.3.1 replays those entries by matching method + URL alone, which is exactly what the
+old recorder did with them.
+
+Two consequences worth knowing before touching it. The old harness could not tell two POSTs
+to one URL apart — the `POST /api/cmd/RESET` entry holds two responses for resets of two
+_different_ games — so a cassette in this format is weaker than it looks. And re-recording
+it (`npm run test:record`, live `ARC_API_KEY`, a currently-listed `RECORD_GAME`) is a
+strict improvement: real bodies get stored and matched.
 
 ---
 
