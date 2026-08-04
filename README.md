@@ -122,14 +122,25 @@ Three rules the whole design rests on:
 ## Testing
 
 Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the harness from
-`@loopingai/core/testing`. Two peer versions are pinned rather than open, because both fail
-unreadably — see [PLAN.md](PLAN.md#the-two-version-pins-that-are-not-preferences).
+`@loopingai/core/testing`.
 
 ```bash
-npm test          # 222 specs
+npm test          # 231 specs, no credentials and no network
 npm run check     # prettier + eslint + tsc + build
 npm run verify:exports
 ```
+
+`test/arc-agi/recorded.spec.ts` drives the **real** ARC API and replays a committed
+cassette, so it needs no key either. Re-record it against the live API with:
+
+```bash
+npm run test:record   # real ARC_API_KEY in .env.test (see .env.test.example)
+```
+
+The key reaches the live ARC API and nothing else: the recorder excludes the auth header, so
+it never lands in the committed cassette. It reaches the spec only as a Miniflare binding —
+`.env.test` is loaded into **Node's** `process.env`, which a spec running in workerd cannot
+see, so `vitest.config.ts` hands it across explicitly.
 
 ## License
 

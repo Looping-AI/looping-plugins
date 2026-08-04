@@ -1,0 +1,56 @@
+name: Release
+
+# Only once Test has gone green on main. A release is a tag that consumers and
+# `git compare` links resolve forever, so it must never name a commit whose
+# suite was red.
+on:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.event.workflow_run.conclusion == 'success'
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `workflow_run` hands us the repository, not the commit that was
+          # tested; pin the checkout to the exact sha Test passed on.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+
+      - id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >>"$GITHUB_OUTPUT"
+
+      # The version in package.json is the whole trigger. Every green main is
+      # checked and only one carrying a version with no release yet creates
+      # anything, so ordinary merges and re-runs are no-ops.
+      #
+      # Tag and title are `v`-prefixed, the common convention. 0.1.0 and 0.1.1
+      # were released bare and stay that way — the unprefixed lookup below is
+      # only so a version released under the old scheme is not released twice.
+      #
+      # This publishes nothing to npm — `npm publish` stays manual.
+      - name: Release this version, if it has none
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          for tag in "v$VERSION" "$VERSION"; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "$VERSION is already released as $tag — nothing to do."
+              exit 0
+            fi
+          done
+          gh release create "v$VERSION" \
+            --target "$SHA" \
+            --title "v$VERSION" \
+            --generate-notes
