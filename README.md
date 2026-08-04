@@ -137,8 +137,10 @@ cassette, so it needs no key either. Re-record it against the live API with:
 npm run test:record   # real ARC_API_KEY in .env.test (see .env.test.example)
 ```
 
-See [PLAN.md](PLAN.md#the-cassette-this-repo-owns) for what the recorded key does and does
-not reach.
+The key reaches the live ARC API and nothing else: the recorder excludes the auth header, so
+it never lands in the committed cassette. It reaches the spec only as a Miniflare binding —
+`.env.test` is loaded into **Node's** `process.env`, which a spec running in workerd cannot
+see, so `vitest.config.ts` hands it across explicitly.
 
 ## License
 
