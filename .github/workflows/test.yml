@@ -1,0 +1,63 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Superseded PR runs are cancelled; main is not, because Release keys off the
+# run that Test completes there.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v6
+        with:
+          # One source of truth with local dev; `engines` requires >=24.
+          node-version-file: .nvmrc
+
+      # `@loopingai/core` always from the registry, never from a sibling
+      # checkout. A `file:../looping-core` install is an inner-loop convenience,
+      # and a package that only builds against one must never be able to ship.
+      - run: npm ci
+
+      # `npm test` alone would pass on code that neither typechecks nor formats:
+      # vitest transpiles specs without checking them, and the type-aware lint
+      # rules only run here. `check` also builds, which the export gate below
+      # reads.
+      - run: npm run check
+
+      # Inside real workerd, against committed cassettes. No `ARC_API_KEY` is
+      # needed or wanted: the key header is excluded from every cassette, which
+      # is what makes playback work with no secret configured at all. An
+      # unrecorded spec fails here by design rather than skipping.
+      - run: npm test
+
+      # Playback writes nothing. `--porcelain` rather than `git diff`, because a
+      # recorder that wrongly ran would leave a *new* cassette, and an untracked
+      # file is invisible to a diff.
+      - name: Playback left the cassettes alone
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain -- test/snapshots)" ]; then
+            echo "Playback wrote to test/snapshots:"
+            git status --porcelain -- test/snapshots
+            exit 1
+          fi
+
+      # The defects that only fail at a consumer: a subpath resolving to a file
+      # that never emitted, a relative import missing its `.js`. `prepack` runs
+      # this too, but by then the mistake is already on its way to npm.
+      - run: npm run verify:exports
