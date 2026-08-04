@@ -205,31 +205,37 @@ imports then land in _its_ `node_modules` while this package's land in ours — 
 `agents`, which breaks `instanceof` and makes `Session`/`SessionMessage` two unrelated
 types. `npm pack` in core, `npm i --no-save ../looping-core/loopingai-core-*.tgz` here.
 
-### The cassette this repo owns — deleted, needs re-recording
+### The cassette this repo owns
 
-`test/arc-agi/recorded.spec.ts` has **no committed cassette**, so it fails with its
-"record it" message until someone runs:
+`test/arc-agi/recorded.spec.ts` replays a committed cassette, re-recorded from scratch
+against the live API when core 0.3.1 dropped the old format:
 
 ```bash
-npm run test:record      # live ARC_API_KEY in .env.test, currently-listed RECORD_GAME
+npm run test:record      # real ARC_API_KEY in .env.test, currently-listed RECORD_GAME
 ```
 
-That is deliberate rather than a gap left open: a missing cassette fails loudly so it stays
-visible, and the alternative was worse. The old cassette was written by undici's recorder,
-which keyed on `String(opts.body)` — and a Worker's POST body reaches the dispatcher as a
-`ReadableStream`, so **every POST in it stored the literal `[object ReadableStream]` instead
-of its payload**. Those bodies were not recoverable from the file, which meant such entries
-could only ever be matched on method + URL alone.
+The old cassette could not be converted. undici's recorder keyed on `String(opts.body)`, and
+a Worker's POST body reaches the dispatcher as a `ReadableStream`, so **every POST in it
+stored the literal `[object ReadableStream]` instead of its payload** — bodies that were
+simply not in the file. Such entries could only ever be matched on method + URL alone, which
+meant the old harness **could not tell two POSTs to one URL apart**: its single
+`POST /api/cmd/RESET` entry held two responses for resets of two _different_ games, replayed
+by call order. The new one has two entries with distinct bodies. That difference is the whole
+point of the format change.
 
-That is not a formatting quibble. It means the old harness **could not tell two POSTs to one
-URL apart**: the `POST /api/cmd/RESET` entry held two responses for resets of two _different_
-games, and playback could serve the wrong one with nothing to say so. Core 0.3.1 dropped the
-reader rather than carry that ambiguity forward. A fresh recording stores real bodies and
-matches on them.
+**`.env.test` only reaches Node, so the key needs an explicit binding.** `vitest.config.ts`
+loads the file into `process.env` — but a spec runs in **workerd**, which has no
+`process.env`, so the value has to be handed across as a Miniflare binding
+(`miniflare.bindings.ARC_API_KEY`). Without that line the spec reads `env.ARC_API_KEY` as
+`undefined`, falls back to `"replay-only"`, and every recording attempt dies on an ARC auth
+error however valid the key is. Miniflare also picks a key up from a `.dev.vars` beside
+`wrangler.jsonc` on its own — that is how the first cassette was recorded, and relying on it
+is what left `.env.test` wired to nothing.
 
-When re-recording: `RECORD_GAME` in the spec must name a game the ARC catalog currently
-lists, and the assertions are on response _shape_ rather than exact values, so a different
-game does not churn them.
+Two more things when re-recording. `RECORD_GAME` must name a game the ARC catalog currently
+lists — assertions are on response _shape_, not exact values, so a different game does not
+churn them. And the key never reaches the file: `excludeHeaders` drops `x-api-key` and the
+cookie jar on the way in, which is why playback needs no credentials at all.
 
 ---
 

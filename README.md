@@ -125,20 +125,20 @@ Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the ha
 `@loopingai/core/testing`.
 
 ```bash
-npm test          # 231 specs; 230 need no credentials and no network
+npm test          # 231 specs, no credentials and no network
 npm run check     # prettier + eslint + tsc + build
 npm run verify:exports
 ```
 
-The 231st — `test/arc-agi/recorded.spec.ts` — drives the **real** ARC API through the VCR
-recorder and needs a cassette that is not committed yet, so it fails until you record one:
+`test/arc-agi/recorded.spec.ts` drives the **real** ARC API and replays a committed
+cassette, so it needs no key either. Re-record it against the live API with:
 
 ```bash
-npm run test:record   # live ARC_API_KEY in .env.test
+npm run test:record   # real ARC_API_KEY in .env.test (see .env.test.example)
 ```
 
-See [PLAN.md](PLAN.md#the-cassette-this-repo-owns--deleted-needs-re-recording) for why the
-previous one was deleted rather than migrated.
+See [PLAN.md](PLAN.md#the-cassette-this-repo-owns) for what the recorded key does and does
+not reach.
 
 ## License
 

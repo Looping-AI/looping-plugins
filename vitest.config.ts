@@ -48,8 +48,9 @@ const vcr = createVcr({
   excludeHeaders: ["x-api-key", "cookie", "set-cookie"]
 });
 
-// Placeholder so the pool has something to source `ARC_API_KEY` from. A real key
-// in .env.test takes precedence and is what `npm run test:record` needs.
+// Placeholder for playback, where the value is irrelevant — the key header is
+// excluded from the cassette. A real key from .env.test takes precedence and is
+// what `npm run test:record` needs.
 process.env.ARC_API_KEY ??= "test-key";
 
 export default defineConfig({
@@ -79,10 +80,25 @@ export default defineConfig({
       // remote connection per test file — seconds of startup plus a reproducible
       // teardown hang.
       remoteBindings: false,
-      // The hook Miniflare 4 and 5 both have. `fetchMock` was removed in pool
-      // 0.20, and an unknown key here is ignored rather than rejected — which
-      // is exactly how the previous wiring failed silently.
-      miniflare: { outboundService: vcr.outboundService }
+      miniflare: {
+        // The hook Miniflare 4 and 5 both have. `fetchMock` was removed in pool
+        // 0.20, and an unknown key here is ignored rather than rejected — which
+        // is exactly how the previous wiring failed silently.
+        outboundService: vcr.outboundService,
+
+        // The bridge between the two realms, and it has to be explicit.
+        // `.env.test` is loaded above into **Node's** `process.env`, and a spec
+        // runs in workerd, which does not have it: without this line the
+        // recorded spec reads `env.ARC_API_KEY` as `undefined`, falls back to
+        // `"replay-only"`, and every recording attempt dies on an ARC auth
+        // error however valid the key in `.env.test` is.
+        //
+        // Miniflare does pick a key up from a `.dev.vars` beside
+        // `wrangler.jsonc` on its own, which is how the first cassette was
+        // recorded — but that file is not the one this repo documents, and
+        // relying on it left `.env.test` wired to nothing at all.
+        bindings: { ARC_API_KEY: process.env.ARC_API_KEY }
+      }
     })
   ],
   test: {
