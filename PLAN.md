@@ -194,25 +194,42 @@ Both pins went with it: the pool peer is `>=0.18` and core declares no `undici`.
 `setupRecording()` also asserts the recorder answered before a test runs, so a silently
 ignored option now fails by name instead of as an unnamed internal error.
 
+Cassettes changed too, and for the same reason: they now match on method + URL + body and
+never on headers. The old key hashed every non-excluded request header, including
+`cf-worker` and `user-agent: undici`, so a committed cassette stopped matching the moment
+miniflare or workerd changed what it sent — version-locking the whole suite.
+
 A corollary for local development still stands: **install core from a tarball, not a
 symlink.** A `file:` dependency is a symlink, Vite resolves through realpath, and core's
 imports then land in _its_ `node_modules` while this package's land in ours — two copies of
 `agents`, which breaks `instanceof` and makes `Session`/`SessionMessage` two unrelated
 types. `npm pack` in core, `npm i --no-save ../looping-core/loopingai-core-*.tgz` here.
 
-### The cassette this repo owns
+### The cassette this repo owns — deleted, needs re-recording
 
-`test/snapshots/…json` was recorded by the old undici recorder, which keyed on
-`String(opts.body)` — and a Worker's POST body reaches the dispatcher as a `ReadableStream`,
-so **every POST in it stored the literal `[object ReadableStream]` instead of its payload**.
-Core 0.3.1 replays those entries by matching method + URL alone, which is exactly what the
-old recorder did with them.
+`test/arc-agi/recorded.spec.ts` has **no committed cassette**, so it fails with its
+"record it" message until someone runs:
 
-Two consequences worth knowing before touching it. The old harness could not tell two POSTs
-to one URL apart — the `POST /api/cmd/RESET` entry holds two responses for resets of two
-_different_ games — so a cassette in this format is weaker than it looks. And re-recording
-it (`npm run test:record`, live `ARC_API_KEY`, a currently-listed `RECORD_GAME`) is a
-strict improvement: real bodies get stored and matched.
+```bash
+npm run test:record      # live ARC_API_KEY in .env.test, currently-listed RECORD_GAME
+```
+
+That is deliberate rather than a gap left open: a missing cassette fails loudly so it stays
+visible, and the alternative was worse. The old cassette was written by undici's recorder,
+which keyed on `String(opts.body)` — and a Worker's POST body reaches the dispatcher as a
+`ReadableStream`, so **every POST in it stored the literal `[object ReadableStream]` instead
+of its payload**. Those bodies were not recoverable from the file, which meant such entries
+could only ever be matched on method + URL alone.
+
+That is not a formatting quibble. It means the old harness **could not tell two POSTs to one
+URL apart**: the `POST /api/cmd/RESET` entry held two responses for resets of two _different_
+games, and playback could serve the wrong one with nothing to say so. Core 0.3.1 dropped the
+reader rather than carry that ambiguity forward. A fresh recording stores real bodies and
+matches on them.
+
+When re-recording: `RECORD_GAME` in the spec must name a game the ARC catalog currently
+lists, and the assertions are on response _shape_ rather than exact values, so a different
+game does not churn them.
 
 ---
 

@@ -122,15 +122,23 @@ Three rules the whole design rests on:
 ## Testing
 
 Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the harness from
-`@loopingai/core/testing`. The recorded ARC spec replays committed cassettes, so the suite
-needs no credentials and no network — see
-[PLAN.md](PLAN.md#the-cassette-this-repo-owns) before re-recording one.
+`@loopingai/core/testing`.
 
 ```bash
-npm test          # 231 specs
+npm test          # 231 specs; 230 need no credentials and no network
 npm run check     # prettier + eslint + tsc + build
 npm run verify:exports
 ```
+
+The 231st — `test/arc-agi/recorded.spec.ts` — drives the **real** ARC API through the VCR
+recorder and needs a cassette that is not committed yet, so it fails until you record one:
+
+```bash
+npm run test:record   # live ARC_API_KEY in .env.test
+```
+
+See [PLAN.md](PLAN.md#the-cassette-this-repo-owns--deleted-needs-re-recording) for why the
+previous one was deleted rather than migrated.
 
 ## License
 
