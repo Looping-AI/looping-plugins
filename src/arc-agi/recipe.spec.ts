@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { TEST_MODELS } from "@loopingai/core/testing";
 import {
   createAgentRuntime,
   validateRecipe,
@@ -19,6 +20,7 @@ const SUBAGENT_LIMITS = DEFAULT_CORE_CONFIG.subagentLimits;
 
 const runtime = () =>
   createAgentRuntime({
+    config: { model: TEST_MODELS },
     plugins: [
       arcAgi({
         apiKey: "k",
@@ -97,7 +99,9 @@ describe("ARC_GAME_RECIPE", () => {
     // naming one here is a preference rather than a demand — and an agent on a
     // different pair gets its own models instead of a validation error.
     const rt = createAgentRuntime({
-      config: { model: { chatModelId: "@cf/some/other-model" } },
+      config: {
+        model: { ...TEST_MODELS, chatModelId: "@cf/some/other-model" }
+      },
       plugins: [
         arcAgi({
           apiKey: "k",

@@ -1,6 +1,6 @@
 {
   "name": "@loopingai/plugins",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Optional, composable capabilities for Looping agents: ARC-AGI-3, browser rendering, workspace, episodic recall, and pre-turn triage. One subpath per plugin, so a bundle grows only with what it imports.",
   "keywords": [
     "ai-agents",
@@ -67,7 +67,7 @@
   },
   "peerDependencies": {
     "@cloudflare/shell": "^0.4.3",
-    "@loopingai/core": "^0.3.1",
+    "@loopingai/core": "^0.4.0",
     "agents": "^0.20.0",
     "ai": "^7.0.40",
     "drizzle-orm": "^0.45.2",
@@ -81,9 +81,9 @@
   },
   "devDependencies": {
     "@cloudflare/shell": "0.4.3",
-    "@cloudflare/vitest-pool-workers": "^0.20.1",
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
     "@cloudflare/workers-types": "^5.20260801.1",
-    "@loopingai/core": "^0.3.1",
+    "@loopingai/core": "^0.4.0",
     "@types/node": "^26.1.1",
     "agents": "^0.20.0",
     "ai": "^7.0.40",
@@ -94,7 +94,7 @@
     "typescript-eslint": "^8.66.0",
     "vitest": "^4.1.10",
     "workers-ai-provider": "^4.0.0",
-    "wrangler": "^4.118.0",
+    "wrangler": "^4.119.0",
     "zod": "^4.4.3"
   },
   "engines": {

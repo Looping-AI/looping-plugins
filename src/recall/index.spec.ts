@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { TEST_MODELS } from "@loopingai/core/testing";
 import { createAgentRuntime } from "@loopingai/core";
 import type { SessionLike } from "@loopingai/core/agent";
 import type { SessionMessage } from "agents/experimental/memory/session";
@@ -264,6 +265,7 @@ describe("recall()", () => {
   it("archives what compaction displaces, through the runtime's fan-out", async () => {
     const { index, upserted } = fakeIndex();
     const rt = createAgentRuntime({
+      config: { model: TEST_MODELS },
       plugins: [
         recall({ ai: {} as Ai, index, namespace: () => "caller:abc", embed })
       ]
@@ -287,6 +289,7 @@ describe("recall()", () => {
       query: async () => ({ count: 0, matches: [] }) as VectorizeMatches
     };
     const rt = createAgentRuntime({
+      config: { model: TEST_MODELS },
       plugins: [
         recall({
           ai: {} as Ai,
@@ -321,7 +324,11 @@ describe("recall()", () => {
   it("declares the binding it cannot add for itself", () => {
     expect(recall(config()).requires).toEqual({ bindings: ["VECTORIZE"] });
     expect(() =>
-      createAgentRuntime({ plugins: [recall(config())], env: {} })
+      createAgentRuntime({
+        config: { model: TEST_MODELS },
+        plugins: [recall(config())],
+        env: {}
+      })
     ).toThrow(/VECTORIZE/);
   });
 });

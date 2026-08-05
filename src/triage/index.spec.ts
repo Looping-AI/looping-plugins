@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { TEST_MODELS } from "@loopingai/core/testing";
 import type { LanguageModel } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import { createAgentRuntime } from "@loopingai/core";
@@ -174,6 +175,7 @@ describe("triage()", () => {
 
   it("declines a turn the classifier says is not for the agent", async () => {
     const rt = createAgentRuntime({
+      config: { model: TEST_MODELS },
       plugins: [
         triage({
           ai: {} as Ai,
@@ -186,6 +188,7 @@ describe("triage()", () => {
 
   it("handles a turn the classifier says is for the agent", async () => {
     const rt = createAgentRuntime({
+      config: { model: TEST_MODELS },
       plugins: [triage({ ai: {} as Ai, model: answering(verdict()) })]
     });
     expect(await rt.shouldHandleTurn({ history })).toBe(true);
@@ -203,7 +206,10 @@ describe("triage()", () => {
     });
     expect(() => triage({ ai })).not.toThrow();
     expect(() =>
-      createAgentRuntime({ plugins: [triage({ ai })] })
+      createAgentRuntime({
+        config: { model: TEST_MODELS },
+        plugins: [triage({ ai })]
+      })
     ).not.toThrow();
   });
 
@@ -227,6 +233,7 @@ describe("triage()", () => {
     // itself, and a plugin should not rely on its host to make its own docs true.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const rt = createAgentRuntime({
+      config: { model: TEST_MODELS },
       plugins: [triage({ ai: undefined as unknown as Ai })]
     });
 

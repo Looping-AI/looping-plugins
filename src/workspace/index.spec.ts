@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { TEST_MODELS } from "@loopingai/core/testing";
 import {
   createAgentRuntime,
   makeWorkspaceHandle,
@@ -65,7 +66,10 @@ describe("workspace()", () => {
     // Core declares the shape and enforces the caps but ships no backend, so
     // that an agent which never delegates file work carries no experimental
     // `@cloudflare/shell` dependency.
-    const rt = createAgentRuntime({ plugins: [workspace()] });
+    const rt = createAgentRuntime({
+      config: { model: TEST_MODELS },
+      plugins: [workspace()]
+    });
     expect(rt.workspaceBacking).toBeDefined();
     expect(rt.workspaceBacking).not.toBe(memoryWorkspaceBacking);
   });
@@ -98,7 +102,11 @@ describe("workspace()", () => {
     // declare in `wrangler.jsonc`.
     expect(workspace().requires).toBeUndefined();
     expect(
-      createAgentRuntime({ plugins: [workspace()], env: {} }).requirements
+      createAgentRuntime({
+        config: { model: TEST_MODELS },
+        plugins: [workspace()],
+        env: {}
+      }).requirements
     ).toEqual({ secrets: [], bindings: [] });
   });
 });

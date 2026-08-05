@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { DEFAULT_CORE_CONFIG } from "@loopingai/core";
 import type { ResolvedRecipe, SubtaskTypeSpec } from "@loopingai/core";
 import { ARC_GAME_SOUL } from "./soul.js";
 import { ARC_CAPABILITY, arcDelegationGuidance } from "./main-agent.js";
@@ -51,12 +50,13 @@ export interface ArcRecipeModels {
 /**
  * Build the recipe, optionally on a model pair of the host's choosing.
  *
- * The defaults are core's, and naming them is a *preference*, not a demand:
- * `validateRecipe` substitutes the host's configured model for any id outside
- * its allowlist, so an agent running on different models gets its own and
- * nothing fails. Pass ids here only to deliberately run a play on something
- * other than the agent's chat model — a play is a long sequence of cheap spatial
- * decisions, which is not the same workload as conversation.
+ * The default is the **host's own pair**, and naming one here is a
+ * *preference*, not a demand: `validateRecipe` substitutes the host's
+ * configured model for any id outside its allowlist, so an agent running on
+ * different models gets its own and nothing fails. Pass ids only to
+ * deliberately run a play somewhere other than the agent's chat model — a play
+ * is a long sequence of cheap spatial decisions, which is not the same workload
+ * as conversation.
  */
 export function arcGameRecipe(models: ArcRecipeModels = {}): ResolvedRecipe {
   return { ...ARC_GAME_RECIPE, ...stripUndefined(models) };
@@ -69,11 +69,26 @@ function stripUndefined(models: ArcRecipeModels): ArcRecipeModels {
   );
 }
 
+/**
+ * "No preference" — run this play on whatever the host agent runs on.
+ *
+ * Empty rather than a named model, and that is the whole mechanism:
+ * `validateRecipe` substitutes `policy.defaultPrimaryModelId` for any id outside
+ * the host's allowlist, and `""` is never in it. So the play lands on the
+ * agent's own pair without this package naming one.
+ *
+ * A published plugin must not carry a model id. Core stopped shipping model
+ * defaults for the reason that applies here twice over: a plugin has even less
+ * idea than core what an agent should be billed for, and an id frozen into a
+ * published package outlives every deprecation until someone bumps it.
+ */
+const HOST_MODELS = { primary: "", fallback: "" } as const;
+
 export const ARC_GAME_RECIPE: ResolvedRecipe = {
   key: ARC_GAME_TYPE,
   version: 1,
-  primaryModelId: DEFAULT_CORE_CONFIG.model.chatModelId,
-  fallbackModelId: DEFAULT_CORE_CONFIG.model.fallbackChatModelId,
+  primaryModelId: HOST_MODELS.primary,
+  fallbackModelId: HOST_MODELS.fallback,
   soul: ARC_GAME_SOUL,
   toolFamilies: ["arc-game"],
   enabled: true,
