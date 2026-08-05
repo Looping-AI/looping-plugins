@@ -125,10 +125,28 @@ Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the ha
 `@loopingai/core/testing`.
 
 ```bash
-npm test          # 231 specs, no credentials and no network
+npm test          # 232 specs, no credentials and no network
 npm run check     # prettier + eslint + tsc + build
 npm run verify:exports
 ```
+
+### Working against an unpublished core
+
+`@loopingai/core` is a **peer** dependency, so a plain `npm install` always resolves
+it from the registry — including over a local build you are testing against.
+
+```bash
+npm run link:local   # npm pack + tarball install from ../looping-core
+```
+
+Run it after changing core, **and after any `npm install` here**, which silently
+undoes it. Skipping it is quiet and misleading: `tsc` reports errors in _this_
+repo's source for a contract change sitting uninstalled one directory away.
+
+`npm pack` + tarball, deliberately — not `npm link`, which symlinks the checkout and
+gives it its own copy of every peer. Two copies of `agents` in one bundle breaks the
+`Session` types and every `instanceof`, at runtime rather than at the type level.
+Nothing is written to `package.json`, so CI still builds against the real packages.
 
 `test/arc-agi/recorded.spec.ts` drives the **real** ARC API and replays a committed
 cassette, so it needs no key either. Re-record it against the live API with:

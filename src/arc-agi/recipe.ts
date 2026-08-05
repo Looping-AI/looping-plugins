@@ -7,8 +7,9 @@ import { ARC_CAPABILITY, arcDelegationGuidance } from "./main-agent.js";
 export const ARC_GAME_TYPE = "arc-game";
 
 /**
- * Recipe for playing an ARC-AGI-3 game. Runs on the repo's default model pair;
- * what distinguishes it is its tool family, its soul, its context discipline, and
+ * Recipe for playing an ARC-AGI-3 game. Names no model, so it runs on whatever
+ * pair its host agent is configured with; what distinguishes it is its tool
+ * family, its soul, its context discipline, and
  * a turn budget twice the baseline — a play is a long sequence of cheap decisions,
  * and 20 turns bought roughly ten game actions once inspection was paid for.
  *
@@ -41,54 +42,12 @@ export const ARC_GAME_TYPE = "arc-game";
  * {@link file://../../agent/tools.ts ToolFamilyContext}, not through the tools the
  * model can see.
  */
-/** Which models a play runs on, when the host wants something other than its own. */
-export interface ArcRecipeModels {
-  primaryModelId?: string;
-  fallbackModelId?: string;
-}
-
-/**
- * Build the recipe, optionally on a model pair of the host's choosing.
- *
- * The default is the **host's own pair**, and naming one here is a
- * *preference*, not a demand: `validateRecipe` substitutes the host's
- * configured model for any id outside its allowlist, so an agent running on
- * different models gets its own and nothing fails. Pass ids only to
- * deliberately run a play somewhere other than the agent's chat model — a play
- * is a long sequence of cheap spatial decisions, which is not the same workload
- * as conversation.
- */
-export function arcGameRecipe(models: ArcRecipeModels = {}): ResolvedRecipe {
-  return { ...ARC_GAME_RECIPE, ...stripUndefined(models) };
-}
-
-/** Drop absent keys so a spread cannot overwrite a default with `undefined`. */
-function stripUndefined(models: ArcRecipeModels): ArcRecipeModels {
-  return Object.fromEntries(
-    Object.entries(models).filter(([, v]) => v !== undefined)
-  );
-}
-
-/**
- * "No preference" — run this play on whatever the host agent runs on.
- *
- * Empty rather than a named model, and that is the whole mechanism:
- * `validateRecipe` substitutes `policy.defaultPrimaryModelId` for any id outside
- * the host's allowlist, and `""` is never in it. So the play lands on the
- * agent's own pair without this package naming one.
- *
- * A published plugin must not carry a model id. Core stopped shipping model
- * defaults for the reason that applies here twice over: a plugin has even less
- * idea than core what an agent should be billed for, and an id frozen into a
- * published package outlives every deprecation until someone bumps it.
- */
-const HOST_MODELS = { primary: "", fallback: "" } as const;
-
 export const ARC_GAME_RECIPE: ResolvedRecipe = {
   key: ARC_GAME_TYPE,
   version: 1,
-  primaryModelId: HOST_MODELS.primary,
-  fallbackModelId: HOST_MODELS.fallback,
+  // A recipe states no model, and `ResolvedRecipe` has no field to state one
+  // with. Every recipe runs on the agent's own configured pair, which
+  // `validateRecipe` stamps onto the `ValidatedRecipe` a runner consumes.
   soul: ARC_GAME_SOUL,
   toolFamilies: ["arc-game"],
   enabled: true,
@@ -143,8 +102,3 @@ export const ARC_GAME_SPEC: SubtaskTypeSpec = {
   delegationGuidance: arcDelegationGuidance,
   recipe: ARC_GAME_RECIPE
 };
-
-/** {@link ARC_GAME_SPEC} on a caller-chosen model pair. See {@link arcGameRecipe}. */
-export function arcGameSpec(models: ArcRecipeModels = {}): SubtaskTypeSpec {
-  return { ...ARC_GAME_SPEC, recipe: arcGameRecipe(models) };
-}

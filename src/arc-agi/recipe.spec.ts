@@ -93,14 +93,17 @@ describe("ARC_GAME_RECIPE", () => {
     expect(ARC_GAME_RECIPE.historyWindow).toBeGreaterThanOrEqual(24);
   });
 
-  it("states a model preference the host's config is free to override", () => {
-    // A plugin cannot know what models its host runs on. `validateRecipe`
-    // substitutes the configured default for any id outside the allowlist, so
-    // naming one here is a preference rather than a demand — and an agent on a
-    // different pair gets its own models instead of a validation error.
+  it("runs on the host's models, whatever they are", () => {
+    // A recipe states no model — there is no field to state one with — so
+    // `validateRecipe` stamps on the host's pair. Asserted against a host
+    // running something this package has never heard of, which is the realistic
+    // case: a plugin cannot know what its consumer is billed for.
     const rt = createAgentRuntime({
       config: {
-        model: { ...TEST_MODELS, chatModelId: "@cf/some/other-model" }
+        model: {
+          chatModelId: "@cf/some/other-model",
+          fallbackChatModelId: "@cf/some/other-fallback"
+        }
       },
       plugins: [
         arcAgi({
@@ -111,36 +114,25 @@ describe("ARC_GAME_RECIPE", () => {
       ]
     });
 
-    expect(validateRecipe(ARC_GAME_RECIPE, rt.policy).primaryModelId).toBe(
-      "@cf/some/other-model"
-    );
+    const validated = validateRecipe(ARC_GAME_RECIPE, rt.policy);
+    expect(validated.primaryModelId).toBe("@cf/some/other-model");
+    // Both slots, and distinct. A play whose fallback matched its primary would
+    // retry the model that had just failed.
+    expect(validated.fallbackModelId).toBe("@cf/some/other-fallback");
+    expect(validated.primaryModelId).not.toBe(validated.fallbackModelId);
   });
 
-  it("runs a play on a model pair the host names explicitly", () => {
-    // The other direction: a play is a long sequence of cheap spatial decisions,
-    // which is a different workload from conversation, so a host may deliberately
-    // want it somewhere other than its chat model.
-    const rt = createAgentRuntime({
-      config: {
-        model: {
-          chatModelId: "@cf/chat/model",
-          fallbackChatModelId: "@cf/reasoning/model"
-        }
-      },
-      plugins: [
-        arcAgi({
-          apiKey: "k",
-          storage: {} as DurableObjectStorage,
-          store: {} as never,
-          primaryModelId: "@cf/reasoning/model"
-        })
-      ]
-    });
-
-    const recipe = rt.types.resolveRecipe(ARC_GAME_TYPE);
-    expect(validateRecipe(recipe, rt.policy).primaryModelId).toBe(
-      "@cf/reasoning/model"
-    );
+  it("carries no model id of its own", () => {
+    // The invariant, pinned structurally rather than through behaviour: a
+    // published plugin names no model. It has no idea what its host is billed
+    // for, and an id frozen into a package outlives every deprecation until
+    // someone bumps it.
+    //
+    // The behavioural assertion above would keep passing if someone
+    // reintroduced a hardcoded id, since `validateRecipe` overwrites both slots
+    // regardless. Only this notices.
+    expect(ARC_GAME_RECIPE).not.toHaveProperty("primaryModelId");
+    expect(ARC_GAME_RECIPE).not.toHaveProperty("fallbackModelId");
   });
 });
 
