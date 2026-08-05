@@ -32,7 +32,14 @@
  * Re-run it after changing core, and after any `npm install` here.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -81,6 +88,23 @@ for (const file of readdirSync(out)) {
   if (file.endsWith(".tgz")) tarballs.push(path.join(out, file));
 }
 
+/**
+ * The lockfile's exact bytes, captured *before* npm runs — this snapshot is what
+ * gets put back below.
+ *
+ * The predecessor restored with `git checkout -- package-lock.json`, which takes
+ * the file from the index and so silently discards any uncommitted lockfile work
+ * in progress: a dependency bump being tested, a conflict just resolved by hand.
+ * A development helper destroying unrelated work is the one thing it must never
+ * do, and the loss is invisible — the script prints that it *restored* the file.
+ *
+ * Reading the bytes is also fewer moving parts than shelling out to git: it
+ * works on an untracked lockfile, in a fresh clone with nothing staged, and
+ * outside a git checkout entirely.
+ */
+const lockfile = path.join(root, "package-lock.json");
+const lockBefore = existsSync(lockfile) ? readFileSync(lockfile, "utf8") : null;
+
 console.log(`installing ${tarballs.length} tarball(s)…`);
 // `--no-save` keeps the published ranges in package.json intact.
 execFileSync("npm", ["install", "--no-save", ...tarballs], {
@@ -89,7 +113,7 @@ execFileSync("npm", ["install", "--no-save", ...tarballs], {
 });
 
 /**
- * Restore the lockfile if npm rewrote it to point at the temp tarballs.
+ * Put the lockfile back exactly as it was.
  *
  * `--no-save` protects the *manifest*, not the lockfile: npm can still pin
  * `@loopingai/*` to `file:/var/folders/…/looping-pack-*.tgz`. Those paths do not
@@ -100,20 +124,26 @@ execFileSync("npm", ["install", "--no-save", ...tarballs], {
  * Restoring is safe precisely because the linked install is meant to be
  * throwaway: `node_modules` keeps the local tarballs, the lockfile keeps
  * describing the registry, and a plain `npm install` puts the two back in step.
+ *
+ * *Any* difference is reverted, not just a `file:` path. Everything npm writes
+ * here is an artifact of a throwaway install — a dropped `integrity`, a
+ * rewritten `version`, a reordered key — so none of it is worth keeping, and
+ * matching one known-bad pattern only holds until npm records it differently.
  */
-const lockfile = path.join(root, "package-lock.json");
-if (existsSync(lockfile)) {
-  const lock = readFileSync(lockfile, "utf8");
-  if (/"resolved":\s*"file:[^"]*looping-pack-/.test(lock)) {
-    execFileSync("git", ["checkout", "--", "package-lock.json"], {
-      cwd: root,
-      stdio: "inherit"
-    });
-    console.log(
-      "restored package-lock.json — npm had pinned a @loopingai/* entry to a " +
-        "temp tarball path that only exists on this machine, until it doesn't."
-    );
+if (lockBefore === null) {
+  // Nothing to protect: npm wrote the repo's first lockfile. Removing it leaves
+  // the tree as found, and stops one full of temp paths becoming what gets
+  // committed.
+  if (existsSync(lockfile)) {
+    rmSync(lockfile);
+    console.log("removed package-lock.json — there was none before this ran.");
   }
+} else if (readFileSync(lockfile, "utf8") !== lockBefore) {
+  writeFileSync(lockfile, lockBefore);
+  console.log(
+    "restored package-lock.json — npm had rewritten it against the temp " +
+      "tarballs, whose paths exist on this machine, until they don't."
+  );
 }
 
 console.log("done. Re-run after changing core, or after any `npm install`.");
