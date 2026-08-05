@@ -91,22 +91,33 @@ const TRIAGE_RULES = [
   "- When you are genuinely unsure, reply. A wrong silence is invisible to the person who needed you; a wrong reply is only noise."
 ].join("\n");
 
-export interface TriageConfig {
-  /** The `AI` binding. Read lazily — see {@link triage}. */
-  ai: Ai;
+/**
+ * The tuning half of {@link TriageConfig}: plain values, no bindings.
+ *
+ * Declare these once in a config module and spread them at the call site — see
+ * `RecallTuning` for why enumerating each field is a liability rather than just
+ * noise.
+ */
+export interface TriageTuning {
   /**
-   * AI Gateway id. Pass the host's single value here too, so classify calls stay
-   * correlated with chat calls in one gateway.
+   * AI Gateway id. Pass the host's **resolved** value
+   * (`PluginHost.aiGatewayId`), so classify calls stay correlated with chat calls
+   * in one gateway.
    */
   aiGatewayId?: string;
   /** Workers-AI id for the classifier. Defaults to a small, fast model. */
   modelId?: string;
-  /** Test override; skips the provider entirely. */
-  model?: LanguageModel;
   /** Trailing messages the classifier sees. Defaults to 12. */
   historyMessages?: number;
   /** Per-message char cap in the prompt. Defaults to 500. */
   messageMaxChars?: number;
+}
+
+export interface TriageConfig extends TriageTuning {
+  /** The `AI` binding. Read lazily — see {@link triage}. */
+  ai: Ai;
+  /** Test override; skips the provider entirely. */
+  model?: LanguageModel;
 }
 
 /** Trim a message body to the triage char cap, marking it when cut. */

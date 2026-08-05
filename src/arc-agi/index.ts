@@ -3,7 +3,7 @@ import type { AgentPlugin } from "@loopingai/core";
 import type { RecipeExecutionResult } from "@loopingai/core/subtasks";
 import { makeArcClient } from "./client.js";
 import { buildArcGamesTools } from "./game-tools.js";
-import { arcGameSpec, ARC_GAME_TYPE, type ArcRecipeModels } from "./recipe.js";
+import { ARC_GAME_SPEC, ARC_GAME_TYPE } from "./recipe.js";
 import {
   gameScoreReport,
   resolvePlayOn,
@@ -33,7 +33,7 @@ import type { ArcRuntime } from "./types.js";
  */
 
 /** Everything this plugin needs from its host. */
-export interface ArcAgiConfig extends ArcRecipeModels {
+export interface ArcAgiConfig {
   /** `ARC_API_KEY` — a secret the host must set. */
   apiKey: string;
   /**
@@ -52,7 +52,7 @@ export interface ArcAgiConfig extends ArcRecipeModels {
 }
 
 export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
-  const { apiKey, storage, primaryModelId, fallbackModelId } = config;
+  const { apiKey, storage } = config;
 
   // Built once per DO instance, like the plugin itself. `makeScorecardStore`
   // only constructs a drizzle handle — it issues no query until something asks —
@@ -122,7 +122,7 @@ export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
   return definePlugin<ArcRuntime>({
     key: "arc-agi",
 
-    subtaskType: arcGameSpec({ primaryModelId, fallbackModelId }),
+    subtaskType: ARC_GAME_SPEC,
 
     toolFamilies: {
       [ARC_GAME_FAMILY]: (ctx) => buildArcGameTools(apiKey, ctx)
@@ -136,7 +136,7 @@ export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
     mainAgentTools: () => buildArcGamesTools({ client: makeArcClient(apiKey) }),
 
     // No `capability` here: it is on the subtask type, with the delegation
-    // guidance it has to agree with. See `arcGameSpec`.
+    // guidance it has to agree with. See `ARC_GAME_SPEC`.
 
     /**
      * Resolve the session state an execution needs and no model can supply: the
@@ -238,4 +238,4 @@ export function arcAgi(config: ArcAgiConfig): AgentPlugin<ArcRuntime> {
 export { ARC_GAME_FAMILY, ARC_GAME_TYPE };
 export type { ArcRuntime, ScorecardStore };
 export { arcScorecardStore, makeScorecardStore } from "./store.js";
-export { arcGameRecipe, arcGameSpec } from "./recipe.js";
+export { ARC_GAME_RECIPE, ARC_GAME_SPEC } from "./recipe.js";

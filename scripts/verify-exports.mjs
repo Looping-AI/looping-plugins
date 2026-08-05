@@ -11,15 +11,20 @@
  *   2. No relative import in `dist/` omits its `.js` extension (Node ESM throws
  *      `ERR_MODULE_NOT_FOUND` on those; `moduleResolution: "Bundler"` does not).
  *   3. No spec files reached `dist/`.
- *   4. Realm isolation: no *runtime* subpath can reach `node:*`, `undici`,
+ *   4. No source maps reached `dist/`. Their `sources` is `../src/*.ts`, which
+ *      is not published, so every one is dangling — and a consumer's test runner
+ *      prints "Sourcemap for … points to missing source files" once per module
+ *      it loads, every run. `build` cleans `dist/` first, so this also catches
+ *      the stale-artifact case that made the original defect survive a rebuild.
+ *   5. Realm isolation: no *runtime* subpath can reach `node:*`, `undici`,
  *      `cloudflare:test` or `vitest` through any depth of relative import.
- *   5. **Plugin isolation**: no subpath's module graph reaches a file belonging
+ *   6. **Plugin isolation**: no subpath's module graph reaches a file belonging
  *      to another subpath. This is the promise the package is built around — a
  *      bundle grows only with what it imports — and it is the one that rots
  *      silently, because a convenience re-export across two plugins typechecks,
  *      lints, and tests perfectly while quietly doubling every consumer's
  *      bundle. Only a check on the built graph catches it.
- *   6. No root barrel: `exports` must have no `"."` entry, for the same reason.
+ *   7. No root barrel: `exports` must have no `"."` entry, for the same reason.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
@@ -83,11 +88,18 @@ for (const [subpath, value] of Object.entries(pkg.exports ?? {})) {
   if (runtime?.endsWith(".js")) subpathEntries.push([subpath, runtime]);
 }
 
-// --- 2 & 3. what reached dist/ ----------------------------------------------
+// --- 2, 3 & 4. what reached dist/ -------------------------------------------
 
 for (const file of walk(path.join(root, "dist"))) {
   if (/\.spec\.(js|d\.ts)$/.test(file)) {
     fail(`spec file shipped to dist: ${path.relative(root, file)}`);
+  }
+  if (file.endsWith(".map")) {
+    fail(
+      `source map shipped to dist: ${path.relative(root, file)} — its sources ` +
+        `are under src/, which this package does not publish, so it dangles at ` +
+        `every consumer`
+    );
   }
   if (!file.endsWith(".js")) continue;
   for (const spec of relativeImports(readFileSync(file, "utf8"))) {
@@ -100,7 +112,7 @@ for (const file of walk(path.join(root, "dist"))) {
   }
 }
 
-// --- 4 & 5. realm isolation, and plugin isolation ----------------------------
+// --- 5 & 6. realm isolation, and plugin isolation ----------------------------
 
 /** `./arc-agi` → `dist/arc-agi` — the directory a subpath's files must stay in. */
 const ownDir = (subpath) =>
@@ -132,7 +144,7 @@ for (const [subpath, target] of subpathEntries) {
   }
 }
 
-// --- 6. no root barrel -------------------------------------------------------
+// --- 7. no root barrel -------------------------------------------------------
 
 if (pkg.exports?.["."]) {
   fail(

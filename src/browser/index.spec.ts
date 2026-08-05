@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { TEST_MODELS } from "@loopingai/core/testing";
 import { createAgentRuntime, PLUGIN_CONTRACT_VERSION } from "@loopingai/core";
 import type { SessionLike } from "@loopingai/core/agent";
 import { browser, BROWSER_FAMILY } from "./index.js";
@@ -87,6 +88,7 @@ describe("browser()", () => {
     // inside a request a user is waiting on, several layers from the cause.
     expect(() =>
       createAgentRuntime({
+        config: { model: TEST_MODELS },
         plugins: [browser({ binding: fakeBinding })],
         env: {}
       })

@@ -154,23 +154,31 @@ export async function recallSearch(
   });
 }
 
-export interface RecallConfig {
-  /** The `AI` binding, for embeddings. Read lazily — see below. */
-  ai: Ai;
-  /** The `VECTORIZE` binding. Must be a 1024-dim, cosine index. */
-  index: RecallIndex;
+/**
+ * The tuning half of {@link RecallConfig}: plain values, no bindings.
+ *
+ * Split out so a host can declare its settings in one place and spread them,
+ * rather than re-typing each field at the call site:
+ *
+ * ```ts
+ * // config.ts — the values, typed
+ * export const RECALL: RecallTuning = { embeddingModelId: "@cf/baai/bge-m3", topK: 5 };
+ *
+ * // plugins.ts — the bindings, and the values spread
+ * recall({ ai: host.env.AI, index: host.env.VECTORIZE,
+ *          namespace: host.callerKey, aiGatewayId: host.aiGatewayId, ...RECALL })
+ * ```
+ *
+ * Field-by-field re-typing is not just verbose — it silently drops any option
+ * added later, so a new default lands everywhere except the deployments that
+ * enumerated the old set.
+ */
+export interface RecallTuning {
   /**
-   * The archive namespace for this agent instance — **a thunk, deliberately.**
-   *
-   * It derives from the verified caller's identity, which is not known when
-   * `plugins(env)` runs in `onStart`. The Durable Object is keyed 1:1 by that
-   * caller, so the value is constant once known; a thunk is what lets the host
-   * supply it late while both hooks here read the same one.
-   */
-  namespace: () => string;
-  /**
-   * AI Gateway id. Pass the host's single value here too, so embedding calls
-   * stay correlated with chat calls in one gateway.
+   * AI Gateway id. Pass the host's **resolved** value (`PluginHost.aiGatewayId`),
+   * so embedding calls stay correlated with chat calls in one gateway. Reading it
+   * off a config-overrides object instead yields `undefined` the moment that
+   * override is dropped in favour of core's default.
    */
   aiGatewayId?: string;
   /** Workers-AI embedding model. Must match the index's dimension. */
@@ -179,6 +187,22 @@ export interface RecallConfig {
   topK?: number;
   /** Stored-snippet cap, guarding Vectorize's ~10 KiB/vector. Defaults to 2000. */
   metadataTextMax?: number;
+}
+
+export interface RecallConfig extends RecallTuning {
+  /** The `AI` binding, for embeddings. Read lazily — see below. */
+  ai: Ai;
+  /** The `VECTORIZE` binding. Must be a 1024-dim, cosine index. */
+  index: RecallIndex;
+  /**
+   * The archive namespace for this agent instance — **a thunk, deliberately.**
+   *
+   * It derives from the verified caller's identity, which is not known when
+   * `plugins(host)` runs in `onStart`. The Durable Object is keyed 1:1 by that
+   * caller, so the value is constant once known; a thunk is what lets the host
+   * supply it late while both hooks here read the same one.
+   */
+  namespace: () => string;
   /** Test override; skips the provider entirely. */
   embed?: Embed;
 }
