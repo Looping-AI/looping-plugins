@@ -85,6 +85,8 @@ needing per-caller state takes it the same way.
 | [`/arc-agi`](src/arc-agi/)     | Play ARC-AGI-3 games — a delegable subtask type, a catalogue tool, a scorecard ledger | `ARC_API_KEY`                 |
 | [`/browser`](src/browser/)     | Read web pages via Browser Rendering Quick Actions                                    | `BROWSER` (paid plan)         |
 | [`/recall`](src/recall/)       | Episodic memory over Vectorize — search history that compaction folded away           | `VECTORIZE` (1024-dim/cosine) |
+| [`/repo`](src/repo/)           | Clone, commit, push a branch, open a pull request — over any sandbox                  | `GITHUB_TOKEN`                |
+| [`/sandbox`](src/sandbox/)     | A real Linux container: shell, package manager, network                               | `Sandbox` (paid plan)         |
 | [`/triage`](src/triage/)       | A pre-turn gate: is this message even for me?                                         | —                             |
 | [`/workspace`](src/workspace/) | A durable file store for long subagent runs, plus tools over it                       | `@cloudflare/shell`           |
 
