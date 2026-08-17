@@ -163,6 +163,33 @@ describe("installFingerprint", () => {
   });
 
   /**
+   * The half the fingerprint used to be blind to.
+   *
+   * `package.json` was only consulted when there was *no* lockfile, so a commit
+   * that adds a `postinstall`, or moves the `packageManager` pin from `pnpm@9`
+   * to `pnpm@10`, matched the stored fingerprint exactly and skipped the
+   * install. The tree that produced was quietly wrong rather than absent, and it
+   * surfaced as a missing module in some later build with nothing pointing back
+   * at the install that never ran.
+   */
+  it.each([
+    ['{"scripts":{"postinstall":"prisma generate"}}', "a postinstall"],
+    ['{"packageManager":"pnpm@10.0.0"}', "a packageManager bump"],
+    [
+      '{"dependencies":{"zod":"^4"}}',
+      "a dependency the lockfile has not caught up with"
+    ]
+  ])("reinstalls when package.json gains %s", async (packageJson) => {
+    const resolution = await resolve(files);
+    const before = await installFingerprint(probe(files), DIR, resolution);
+
+    const edited = { ...files, [at("package.json")]: packageJson };
+    expect(await installFingerprint(probe(edited), DIR, resolution)).not.toBe(
+      before
+    );
+  });
+
+  /**
    * Content, not mtime. A `fetch && reset --hard` onto a new commit rewrites the
    * lockfile whether or not the dependencies moved, and reinstalling on every
    * commit throws away the whole point of a warm container.

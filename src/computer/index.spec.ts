@@ -1420,10 +1420,30 @@ describe("the install gate on sb_exec", () => {
   });
 
   /**
-   * Failing open, deliberately. The gate reads another Durable Object; an RPC
-   * hiccup there must not take out a working shell, and running the command is
-   * exactly what would have happened before the gate existed.
+   * `installGateMs` is a ceiling, and it used to be a floor.
+   *
+   * The poll slept a flat three seconds before re-reading, without asking how
+   * much of the gate was left — so a 100 ms gate blocked for about three
+   * seconds, and the one knob a host has for bounding this wait overshot it by
+   * 30×. The sleep is now clamped to whatever remains.
    */
+  it("gives the turn back within the gate, not within a poll interval", async () => {
+    const { tools, execs } = gated(
+      { state: "running", command: "npm ci", startedAt: Date.now() },
+      { installGateMs: 100 }
+    );
+
+    const started = Date.now();
+    const out = await run(tools, "sb_exec", { command: "npm test" });
+    const elapsed = Date.now() - started;
+
+    expect(out).toContain("still running");
+    expect(execs).toHaveLength(0);
+    // The poll interval is three seconds and the gate is a tenth of one. Before
+    // the clamp this waited for the former.
+    expect(elapsed).toBeLessThan(1_000);
+  });
+
   it("runs the command when the status cannot be read", async () => {
     const { workspace, execs } = stub();
     const tools = buildComputerTools(workspace, config, async () => {

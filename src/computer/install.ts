@@ -244,10 +244,26 @@ async function firstPresent(
  * A content fingerprint of what the install depends on, for deciding whether an
  * existing `node_modules` is still the right one.
  *
- * The lockfile's **content**, not its mtime: a `git fetch && reset --hard` onto
- * a new commit rewrites the file whether or not its dependencies changed, and
- * re-installing on every commit would throw away the thing that makes a warm
- * container worth having.
+ * Content, not mtime: a `git fetch && reset --hard` onto a new commit rewrites
+ * these files whether or not their dependencies changed, and re-installing on
+ * every commit would throw away the thing that makes a warm container worth
+ * having.
+ *
+ * ## Both files, not just the lockfile
+ *
+ * `package.json` is hashed alongside the lockfile rather than only standing in
+ * when there is no lockfile. The two disagree more often than they look like
+ * they should: a commit can add a `postinstall`, bump the `packageManager` pin
+ * from `pnpm@9` to `pnpm@10`, or add a dependency without regenerating the lock,
+ * and every one of those changes what an install produces while leaving the
+ * lockfile byte-identical. Hashing the lockfile alone calls that a match, skips
+ * the install, and hands the subagent a `node_modules` that is quietly wrong —
+ * which surfaces as a missing module in a build, three tool calls later, with
+ * nothing pointing back at the install that never ran.
+ *
+ * The cost is the whole of the downside: a commit touching `package.json` for a
+ * reason that does not affect installs — a version bump — buys one redundant
+ * install. That is a far cheaper failure than the one above.
  *
  * ## This is only half of the skip condition
  *
@@ -265,18 +281,30 @@ export async function installFingerprint(
 ): Promise<string | null> {
   if (resolution.kind !== "run") return null;
 
-  // No lockfile — an override, or a `package.json` on its own. `package.json`
-  // is then the best available signal for "would this install differently".
-  const source = resolution.lockfile
-    ? `${dir}/${resolution.lockfile}`
-    : `${dir}/package.json`;
+  // An override can name a command with no lockfile behind it, and a bare
+  // `package.json` is a repository too — so either file being absent is
+  // ordinary, and only the pair being absent means there is nothing to
+  // fingerprint at all.
+  const names = [
+    "package.json",
+    ...(resolution.lockfile ? [resolution.lockfile] : [])
+  ];
 
-  if (!(await fs.exists(source))) return null;
-  const content = await fs.readFile(source, "utf8");
+  // Names as well as contents. Two lockfiles will not collide on content in
+  // practice, but a digest that cannot say *which* file it read is one that
+  // silently depends on the caller resolving them in the same order forever.
+  let input = resolution.command;
+  let found = false;
+  for (const name of names) {
+    if (!(await fs.exists(`${dir}/${name}`))) continue;
+    found = true;
+    input += `\n${name}\n${await fs.readFile(`${dir}/${name}`, "utf8")}`;
+  }
+  if (!found) return null;
 
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    new TextEncoder().encode(`${resolution.command} ${content}`)
+    new TextEncoder().encode(input)
   );
   return [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, "0"))

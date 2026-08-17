@@ -39,7 +39,11 @@ type Stubbed = Partial<Record<string, { stdout?: string; success?: boolean }>>;
 const GIT_DEFAULTS: Stubbed = {
   "rev-parse --git-dir": { success: false },
   "remote get-url origin": { stdout: "https://github.com/o/r" },
-  "symbolic-ref": { stdout: "origin/main" }
+  "symbolic-ref": { stdout: "origin/main" },
+  // The commit `repo_push` resolves in the checkout before anything credentialed
+  // runs. Distinct from the `--quiet` probe that asks whether the branch exists
+  // at all, which tests stub separately.
+  'rev-parse --verify "refs/heads/': { stdout: "1f0cd15e0f7c8b" }
 };
 
 function recorder(results: Stubbed = {}): {
@@ -270,7 +274,7 @@ describe("guardrails", () => {
    */
   it("switches to an existing branch instead of resetting it to HEAD", async () => {
     const { exec, calls } = recorder({
-      "rev-parse --verify": { success: true },
+      "rev-parse --verify --quiet": { success: true },
       "rev-list --count": { stdout: "1" }
     });
     const result = await run(tools(exec), "repo_push", {
@@ -288,7 +292,7 @@ describe("guardrails", () => {
 
   it("creates the branch when it does not exist yet", async () => {
     const { exec, calls } = recorder({
-      "rev-parse --verify": { success: false },
+      "rev-parse --verify --quiet": { success: false },
       "rev-list --count": { stdout: "1" }
     });
     const result = await run(tools(exec), "repo_push", {
@@ -308,7 +312,7 @@ describe("guardrails", () => {
    */
   it("refuses a branch with no commits the default branch lacks", async () => {
     const { exec, calls } = recorder({
-      "rev-parse --verify": { success: true },
+      "rev-parse --verify --quiet": { success: true },
       "rev-list --count": { stdout: "0" }
     });
     const result = await run(tools(exec), "repo_push", {
@@ -324,7 +328,7 @@ describe("guardrails", () => {
   it("skips the empty-branch guard when the baseline cannot be resolved", async () => {
     const { exec, calls } = recorder({
       symbolic: { success: false },
-      "rev-parse --verify": { success: true }
+      "rev-parse --verify --quiet": { success: true }
     });
     const result = await run(tools(exec), "repo_push", {
       dir: "/w/r",
@@ -421,8 +425,107 @@ describe("credential scoping", () => {
 
     const clone = calls.find((c) => c.command.includes("clone"))!;
     expect(clone.command).toContain("credential.https://github.com.helper=");
-    // The unscoped form is the bug. It must not appear anywhere.
-    expect(clone.command).not.toMatch(/-c\s+credential\.helper=/);
+    // An unscoped helper with a *value* is the bug. The empty one next to it is
+    // the opposite: it clears whatever the container had already put in the
+    // chain, which would otherwise answer first and answer for every host.
+    expect(clone.command).not.toMatch(/-c\s+credential\.helper=\S/);
+    expect(clone.command).toMatch(
+      /-c\s+credential\.helper=\s+-c\s+credential\.https/
+    );
+  });
+
+  /**
+   * The property the previous threat model assumed and did not have.
+   *
+   * Rules about *where the token is written* are all beside the point if the
+   * command holding it runs in a repository the model can configure: git
+   * executes what `.git/config` and `.git/hooks` name, both live in the durable
+   * workspace, and a co-installed shell tool writes them. Verified against real
+   * git before this changed — a planted `core.hooksPath` had `pre-push` print
+   * `$REPO_TOKEN` on an ordinary `repo_push`.
+   *
+   * So the invariant is positional, not textual: a command carrying the token
+   * either creates the repository it runs in (`clone`) or runs in a git dir this
+   * plugin made moments earlier. Never the checkout.
+   */
+  it("runs no credentialed command inside the checkout", async () => {
+    // A fresh clone, a refresh of an existing checkout, and a push — every path
+    // in this plugin that touches the network.
+    const fresh = recorder();
+    await run(tools(fresh.exec), "repo_clone", {
+      url: "https://github.com/o/r"
+    });
+
+    const warm = recorder({
+      "rev-parse --git-dir": { success: true, stdout: ".git" },
+      "rev-list --count": { stdout: "1" }
+    });
+    const set = tools(warm.exec);
+    await run(set, "repo_clone", { url: "https://github.com/o/r" });
+    await run(set, "repo_push", { dir: "/workspace/r", branch: "coder/x" });
+
+    const credentialed = [...fresh.calls, ...warm.calls].filter(
+      (c) => c.options?.env?.["REPO_TOKEN"] !== undefined
+    );
+    // The clone, the refresh's fetch, and the push.
+    expect(credentialed).toHaveLength(3);
+
+    for (const call of credentialed) {
+      const clean = /--git-dir="\$GIT_CLEAN"/.test(call.command);
+      expect(clean || call.command.includes("clone")).toBe(true);
+      // Not merely pointed elsewhere by `--git-dir`: not *run* in the checkout
+      // either, so a `.git` discovered from the working directory cannot stand
+      // in for the one we named.
+      expect(call.options?.cwd).toBe("/workspace");
+      if (clean) {
+        expect(call.options?.env?.["GIT_CLEAN"]).toMatch(
+          /^\/tmp\/looping-repo-[0-9a-f-]{36}\.git$/
+        );
+      }
+      // Hooks are off even so: the dir is fresh, but a template directory in
+      // the image would otherwise seed one into it.
+      expect(call.command).toContain("core.hooksPath=/dev/null");
+      // `core.askPass` runs a program of the config's choosing when a helper
+      // does not answer, and it would run it with this environment.
+      expect(call.options?.env?.["GIT_ASKPASS"]).toBe("/bin/false");
+      expect(call.options?.env?.["GIT_CONFIG_GLOBAL"]).toBe("/dev/null");
+      expect(call.options?.env?.["GIT_CONFIG_SYSTEM"]).toBe("/dev/null");
+    }
+  });
+
+  /**
+   * `depth` makes the checkout shallow, and a clean dir that does not know it
+   * builds a pack on history it does not have: the push is rejected with
+   * `unpacker error`. Copying `.git/shallow` across is what makes a shallow
+   * push behave exactly as it did before this indirection existed.
+   */
+  it("carries the shallow marker into the clean dir", async () => {
+    const { exec, calls } = recorder({
+      "rev-list --count": { stdout: "1" }
+    });
+    await run(tools(exec), "repo_push", { dir: "/w/r", branch: "coder/x" });
+
+    const prep = calls.find((c) => c.command.includes("init -q --bare"))!;
+    expect(prep.command).toContain('"$REPO_DIR/.git/shallow"');
+    expect(prep.command).toContain('"$GIT_CLEAN/shallow"');
+    // The objects come across by reference, not by copy.
+    expect(prep.command).toContain('"$GIT_CLEAN/objects/info/alternates"');
+    expect(prep.options?.env?.["REPO_TOKEN"]).toBeUndefined();
+  });
+
+  /** A clean dir left behind is a clean dir the model gets a second go at. */
+  it("discards the clean dir even when the push fails", async () => {
+    const { exec, calls } = recorder({
+      "rev-list --count": { stdout: "1" },
+      push: { success: false, stdout: "denied" }
+    });
+    const result = await run(tools(exec), "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    expect(result).toMatch(/push failed/i);
+    expect(calls.some((c) => c.command === 'rm -rf "$GIT_CLEAN"')).toBe(true);
   });
 
   it("never lets a credential prompt hang the round", async () => {
@@ -578,7 +681,7 @@ describe("failure logging", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const { exec } = recorder({
-        "rev-parse --verify": { success: true },
+        "rev-parse --verify --quiet": { success: true },
         "rev-list --count": { stdout: "1" },
         push: { success: false, stdout: "fatal: Authentication failed" }
       });

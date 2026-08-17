@@ -162,6 +162,15 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_CWD = "/workspace";
 
 /**
+ * How often the install gate re-reads the install's status.
+ *
+ * An interval rather than a subscription because the status lives in another
+ * Durable Object with no event to wait on. Never slept past the gate itself —
+ * see `awaitInstall`.
+ */
+const INSTALL_POLL_MS = 3_000;
+
+/**
  * The Durable Object the workspace lives in, as this plugin needs to see it.
  *
  * Structural rather than imported: the class is the host's — it owns the
@@ -1052,10 +1061,15 @@ export function buildComputerTools(
       }
     };
 
+    // Clamped to whatever is left of the gate, not the bare interval. A fixed
+    // sleep makes `installGateMs` a floor rather than the ceiling it is
+    // documented to be: at a 100 ms gate the loop still slept the full three
+    // seconds before looking again, so a public timeout overshot by 30×.
     const deadline = Date.now() + gateMs;
     let status = await read();
     while (status?.state === "running" && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      const wait = Math.min(INSTALL_POLL_MS, deadline - Date.now());
+      await new Promise((resolve) => setTimeout(resolve, wait));
       status = await read();
     }
     return installGate(status);
