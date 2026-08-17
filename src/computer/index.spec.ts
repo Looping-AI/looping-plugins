@@ -27,36 +27,70 @@ import {
 function stub(
   seed: Record<string, string> = {},
   /** Make the container unreachable, for the paths that have to survive it. */
-  execThrows?: string
+  execThrows?: string | Error
 ): {
   workspace: () => Promise<WorkspaceClient>;
   execs: Array<{ command: string; options?: unknown }>;
+  readdirs: Array<{ limit?: number }>;
   files: Map<string, string>;
 } {
   const execs: Array<{ command: string; options?: unknown }> = [];
+  const readdirs: Array<{ limit?: number }> = [];
   const files = new Map(Object.entries(seed));
 
   const client = {
     fs: {
-      readFile: async (path: string) => {
+      /**
+       * Honours the byte range, because that is the half of the contract worth
+       * asserting. A stub that ignored `byteOffset`/`byteLength` and returned the
+       * whole file would pass every test below while `sb_read` shipped the entire
+       * file across the boundary — the exact failure the bounded read exists to
+       * prevent, invisible to its own tests.
+       */
+      readFile: async (
+        path: string,
+        options?: string | { byteOffset?: number; byteLength?: number }
+      ) => {
         const content = files.get(path);
         if (content === undefined) throw new Error(`ENOENT: ${path}`);
-        return content;
+        if (typeof options !== "object" || !options) return content;
+        const start = options.byteOffset ?? 0;
+        const end =
+          options.byteLength === undefined
+            ? undefined
+            : start + options.byteLength;
+        return content.slice(start, end);
+      },
+      stat: async (path: string) => {
+        const content = files.get(path);
+        if (content === undefined) throw new Error(`ENOENT: ${path}`);
+        return { size: content.length, isFile: true, isDirectory: false };
       },
       writeFile: async (path: string, content: string) => {
         files.set(path, String(content));
       },
       mkdir: async () => undefined,
       exists: async (path: string) => files.has(path),
-      readdir: async () => [
-        { name: "src", isDirectory: true, isFile: false },
-        { name: "package.json", isDirectory: false, isFile: true }
-      ],
+      readdir: async (_path: string, options?: { limit?: number }) => (
+        readdirs.push(options ?? {}),
+        [
+          { name: "src", isDirectory: true, isFile: false, size: 0 },
+          {
+            name: "package.json",
+            isDirectory: false,
+            isFile: true,
+            size: 2048
+          }
+        ].slice(0, options?.limit)
+      ),
       ls: async () => [...files.keys()]
     },
     runtime: {
       exec: async (command: string, options?: unknown) => {
-        if (execThrows) throw new Error(execThrows);
+        if (execThrows)
+          throw typeof execThrows === "string"
+            ? new Error(execThrows)
+            : execThrows;
         execs.push({ command, options });
         return {
           result: async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
@@ -67,7 +101,7 @@ function stub(
     [Symbol.dispose]: () => {}
   } as unknown as WorkspaceClient;
 
-  return { workspace: async () => client, execs, files };
+  return { workspace: async () => client, execs, readdirs, files };
 }
 
 const config: ComputerConfig = {
@@ -381,6 +415,70 @@ describe("sb_edit", () => {
   });
 });
 
+/**
+ * The budget is enforced where the bytes are read, not after they have all
+ * arrived in the isolate — which is the whole point of the range-addressable
+ * read `@cloudflare/computer` 0.2 added. The stub honours the range, so a
+ * regression to `readFile(path, "utf8")` fails these rather than passing them
+ * with the old memory profile intact.
+ */
+describe("sb_read", () => {
+  const path = "/workspace/repo/big.log";
+
+  it("returns a small file whole", async () => {
+    const { workspace } = stub({ [path]: "const a = 1;\n" });
+    const tools = buildComputerTools(workspace, config);
+
+    expect(await run(tools, "sb_read", { path })).toBe("const a = 1;\n");
+  });
+
+  it("keeps both ends of a large one and says what it dropped", async () => {
+    const body = "HEAD" + "x".repeat(4_000) + "TAIL";
+    const { workspace } = stub({ [path]: body });
+    const tools = buildComputerTools(workspace, {
+      ...config,
+      maxOutputBytes: 400
+    });
+
+    const out = await run(tools, "sb_read", { path });
+    expect(out.startsWith("HEAD")).toBe(true);
+    expect(out.endsWith("TAIL")).toBe(true);
+    expect(out).toContain("bytes omitted from the middle");
+    // The ceiling is real, not advisory: the whole file never lands here.
+    expect(out.length).toBeLessThanOrEqual(400);
+  });
+
+  it("still reports a missing file rather than throwing", async () => {
+    const { workspace } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    expect(await run(tools, "sb_read", { path })).toContain("error reading");
+  });
+});
+
+describe("sb_ls", () => {
+  const path = "/workspace/repo";
+
+  it("bounds the listing at the source instead of trimming the rendered text", async () => {
+    const { workspace, readdirs } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    await run(tools, "sb_ls", { path });
+    // One over the ceiling, which is how the tool detects a cut listing without
+    // asking twice.
+    expect(readdirs[0]?.limit).toBe(1001);
+  });
+
+  it("shows a size for files, so the model can tell a read will be truncated", async () => {
+    const { workspace } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_ls", { path });
+    expect(out).toContain("src/");
+    expect(out).toContain("package.json\t2.0 KB");
+  });
+});
+
 describe("sb_exec", () => {
   it("passes the configured cwd and timeout, and lets the model override cwd", async () => {
     const { workspace, execs } = stub();
@@ -418,6 +516,40 @@ describe("sb_exec", () => {
     expect((execs[0]!.options as { env: Record<string, string> }).env).toEqual({
       SET: "yes"
     });
+  });
+
+  /**
+   * `@cloudflare/computer` 0.2.1 separated "the container was swapped underneath
+   * you" from "your command failed". The raw error reads like the latter, and a
+   * model that believes it goes debugging a command that never ran — so the three
+   * facts it needs are stated instead: nothing completed, the checkout survived,
+   * `node_modules` did not.
+   */
+  it("tells the model a lost execution was the container, not the command", async () => {
+    const lost = Object.assign(
+      new Error(
+        'Execution "e1" was lost when its container runtime was replaced.'
+      ),
+      { name: "WorkspaceExecutionLostError", code: "EEXEC_LOST" }
+    );
+    const { workspace } = stub({}, lost);
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_exec", { command: "npm test" });
+    expect(out).toContain("container was replaced");
+    expect(out).toContain("re-run it");
+    expect(out).toContain("node_modules");
+    // Not dressed up as a command failure, which is what it used to look like.
+    expect(out).not.toContain("error running command");
+  });
+
+  it("still reports an ordinary exec failure as one", async () => {
+    const { workspace } = stub({}, "container unreachable");
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_exec", { command: "npm test" });
+    expect(out).toContain("error running command");
+    expect(out).toContain("container unreachable");
   });
 });
 

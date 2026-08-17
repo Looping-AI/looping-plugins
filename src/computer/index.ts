@@ -120,6 +120,20 @@ export function workspaceNameFromRuntime(runtime: unknown): string | undefined {
  */
 const DEFAULT_MAX_OUTPUT_BYTES = 16_000;
 
+/**
+ * How many directory entries one `sb_ls` returns.
+ *
+ * A bound on the *listing*, not on the rendered text — `maxOutputBytes` still
+ * applies on top. The two used to be the same budget applied in the wrong order:
+ * `readdir` returned every entry, the isolate held all of them, and the byte
+ * ceiling then discarded the tail. A real `node_modules` is 22,470 files, and a
+ * misbehaving build is exactly when someone lists one.
+ *
+ * `@cloudflare/computer` 0.2 gave `readdir` a `limit`, so the bound is applied
+ * where the entries are read instead of after they have all arrived.
+ */
+const DEFAULT_MAX_ENTRIES = 1000;
+
 /** A command that has not finished in this long is a hung command. */
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -308,6 +322,80 @@ export function truncateOutput(text: string, max: number): string {
 }
 
 /**
+ * Read a file without pulling more of it across the boundary than the model will
+ * be shown.
+ *
+ * `readFile(path, "utf8")` materialises the whole file in the isolate and then
+ * `truncateOutput` throws most of it away. That is harmless on a source file and
+ * the wrong shape for the ceiling this plugin already lives under: a Durable
+ * Object gets 128 MB, which is the same limit a `node_modules` push breached at
+ * 429 MB, and `sb_read` is one model decision away from a lockfile, a bundle or a
+ * captured build log. `@cloudflare/computer` 0.2 made the read range-addressable,
+ * so the budget is enforced at the source rather than after the damage.
+ *
+ * Two reads rather than one, because the budget is spent from both ends for the
+ * reason {@link truncateOutput} documents — the first error is at the top of a
+ * file and the summary is at the bottom.
+ *
+ * ## Why `stat` first
+ *
+ * Sizing off the returned string instead would be wrong in a way that hides
+ * itself. `byteLength` counts bytes and `String.length` counts UTF-16 code units,
+ * so a file of two-byte characters comes back *under* a character budget while
+ * still being over the byte budget — and the read would look complete with half
+ * the file missing and no marker saying so. One extra round trip buys the
+ * distinction.
+ *
+ * A slice boundary can land mid-codepoint, which the decoder resolves to a single
+ * replacement character. That is one glyph of noise at a cut that already
+ * announces itself as a cut.
+ */
+async function readBounded(
+  fs: WorkspaceClient["fs"],
+  path: string,
+  maxBytes: number
+): Promise<string> {
+  const { size } = await fs.stat(path);
+  if (size <= maxBytes) return fs.readFile(path, "utf8");
+
+  const marker = (dropped: number) =>
+    `\n\n… [${dropped} bytes omitted from the middle] …\n\n`;
+
+  const half = Math.floor((maxBytes - marker(size).length) / 2);
+  // No budget for two ends plus the marker: keep the head, where the first error
+  // is. The same fallback `truncateOutput` makes at the same ceiling.
+  if (half < 1)
+    return fs.readFile(path, {
+      encoding: "utf8",
+      byteLength: Math.max(0, maxBytes)
+    });
+
+  const [head, tail] = await Promise.all([
+    fs.readFile(path, { encoding: "utf8", byteOffset: 0, byteLength: half }),
+    fs.readFile(path, {
+      encoding: "utf8",
+      byteOffset: size - half,
+      byteLength: half
+    })
+  ]);
+  return head + marker(size - half * 2) + tail;
+}
+
+/**
+ * A byte count in the form a model can act on.
+ *
+ * Worth the eight lines now that `sb_read` truncates: a listing that says a file
+ * is 4.2 MB tells the model the read it is about to do will come back with a hole
+ * in the middle, which is the one thing it cannot infer from the truncated result
+ * itself.
+ */
+function humanBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
  * Whether a path sits under a directory the workspace never receives.
  *
  * Only `node_modules` today, and it is not configurable here because it is not
@@ -356,6 +444,39 @@ async function pathExists(
   return fs.stat(path).then(
     () => true,
     () => false
+  );
+}
+
+/**
+ * The one `sb_exec` failure that is not the command's fault.
+ *
+ * `@cloudflare/computer` 0.2.1 gave container replacement its own error instead
+ * of a transport failure that read like a broken command: operations reconnect to
+ * the new `computerd`, and an execution that was *running* across the swap throws
+ * `EEXEC_LOST`. Without this the model receives `error running command: Error:
+ * Execution "…" was lost when its container runtime was replaced` and has to
+ * guess — and the plausible guesses are all wrong and expensive. It reads like
+ * the command crashed, so the model goes looking at the command.
+ *
+ * What it actually needs is three facts and they are the ones this module keeps
+ * repeating: nothing ran to completion, the checkout survived because the
+ * filesystem is the Durable Object's and not the container's, and `node_modules`
+ * did not because it never was. So: re-run it, and expect the install to be
+ * rebuilding underneath.
+ *
+ * Matched on `code` rather than the message, which is the property the package
+ * sets deliberately (`name` is `WorkspaceExecutionLostError`) and the one that
+ * survives a reworded string.
+ */
+function execLostNote(err: unknown): string | undefined {
+  if ((err as { code?: unknown } | null | undefined)?.code !== "EEXEC_LOST")
+    return undefined;
+  return (
+    "the container was replaced while this command was running, so it was lost — " +
+    "nothing ran to completion and no output survived. This is infrastructure, " +
+    "not your command: re-run it. The checkout is durable and is exactly as you " +
+    "left it, but `node_modules` lived in the old container and is being rebuilt, " +
+    "so anything that needs dependencies may have to wait for that install."
   );
 }
 
@@ -725,23 +846,28 @@ export function buildComputerTools(
           });
           return note(renderResult(result, maxBytes));
         } catch (err) {
+          const lost = execLostNote(err);
           console.warn("[computer] sb_exec failed", {
             command,
             gateMs: gateMsWaited,
             durationMs: Date.now() - startedAtMs - gateMsWaited,
             timeoutMs,
+            // Distinguished in the log for the same reason it is distinguished
+            // for the model: a container replacement and a broken command want
+            // different people looking at them.
+            ...(lost ? { lost: true } : {}),
             err: String(err)
           });
           // Returned, not thrown: a failed command is usually the model's to
           // recover from, and it can only recover from what it is told.
-          return note(`error running command: ${String(err)}`);
+          return note(lost ?? `error running command: ${String(err)}`);
         }
       }
     }),
 
     sb_read: tool({
       description:
-        "Read a file from the workspace. Returns the file's text, or a note if it does not exist. Files under node_modules are not in the workspace — read those with sb_exec.",
+        "Read a file from the workspace. Returns the file's text, or a note if it does not exist. A large file comes back with its middle removed and a marker saying how many bytes are missing — to see a specific part of one, use sb_exec with sed or grep. Files under node_modules are not in the workspace — read those with sb_exec.",
       inputSchema: z.object({
         path: z
           .string()
@@ -751,7 +877,7 @@ export function buildComputerTools(
         if (isContainerOnly(path)) return containerOnlyNote(path, "sb_read");
         try {
           using ws = await workspace();
-          return truncateOutput(await ws.fs.readFile(path, "utf8"), maxBytes);
+          return await readBounded(ws.fs, path, maxBytes);
         } catch (err) {
           return `error reading ${path}: ${String(err)}`;
         }
@@ -813,7 +939,7 @@ export function buildComputerTools(
 
     sb_ls: tool({
       description:
-        "List files in a workspace directory. node_modules is not in the workspace — list it with sb_exec.",
+        "List files in a workspace directory. Directories are shown with a trailing slash, files with their size — check that before reading a large one, since sb_read truncates. node_modules is not in the workspace — list it with sb_exec.",
       inputSchema: z.object({
         path: z.string().describe("Absolute directory path"),
         recursive: z
@@ -826,16 +952,29 @@ export function buildComputerTools(
         try {
           using ws = await workspace();
           if (recursive) {
+            // `ls` takes no bound — it is a prefix scan, not a directory read —
+            // so this arm is still truncate-after-the-fact.
             const paths = await ws.fs.ls(path);
             if (paths.length === 0) return `(${path} is empty)`;
             return truncateOutput(paths.join("\n"), maxBytes);
           }
-          const entries = await ws.fs.readdir(path);
+          // One over the ceiling: enough to know the listing was cut without a
+          // second round trip to find out, and the extra entry is not shown.
+          const entries = await ws.fs.readdir(path, {
+            limit: DEFAULT_MAX_ENTRIES + 1
+          });
           if (entries.length === 0) return `(${path} is empty)`;
+          const overflow = entries.length > DEFAULT_MAX_ENTRIES;
+          const body = entries
+            .slice(0, DEFAULT_MAX_ENTRIES)
+            .map((e) =>
+              e.isDirectory ? `${e.name}/` : `${e.name}\t${humanBytes(e.size)}`
+            )
+            .join("\n");
           return truncateOutput(
-            entries
-              .map((e) => `${e.name}${e.isDirectory ? "/" : ""}`)
-              .join("\n"),
+            overflow
+              ? `${body}\n… listing stopped at ${DEFAULT_MAX_ENTRIES} entries; there are more. Use \`sb_exec\` to narrow it down.`
+              : body,
             maxBytes
           );
         } catch (err) {
