@@ -3,8 +3,12 @@ import type { ToolSet } from "ai";
 import type { WorkspaceClient } from "@cloudflare/computer";
 import {
   buildComputerTools,
+  computer,
   isContainerOnly,
+  isGitInternal,
   needsDependencies,
+  packBlocks,
+  renderGrepMatches,
   renderResult,
   truncateOutput,
   withShell,
@@ -13,6 +17,39 @@ import {
   type ComputerConfig,
   type InstallState
 } from "./index.js";
+
+/** What the stub records off an `fs.grep` call. `@cloudflare/computer` declares
+ * these but does not re-export them, so the shape is restated here. */
+interface GrepOptions extends Page {
+  include?: string;
+  regex?: boolean;
+  ignoreCase?: boolean;
+  context?: number;
+}
+
+/** The paging pair every listing method on the workspace takes. */
+interface Page {
+  limit?: number;
+  offset?: number;
+}
+
+interface FoundEntry {
+  path: string;
+  type: "dir" | "file";
+}
+
+/**
+ * Page a canned array the way the real methods do.
+ *
+ * `offset` is honoured, not just `limit`, and that is deliberate: the whole point
+ * of the raw-index bookkeeping under test is that a filtered page reports an offset
+ * the *source* understands. A stub that ignored `offset` would return page one
+ * forever and every paging assertion below would pass while paging was broken.
+ */
+const page = <T>(items: T[], options?: Page): T[] => {
+  const from = options?.offset ?? 0;
+  return items.slice(from, from + (options?.limit ?? items.length));
+};
 
 /**
  * The computer tools' behaviour under the conditions that actually bite: output
@@ -27,15 +64,24 @@ import {
 function stub(
   seed: Record<string, string> = {},
   /** Make the container unreachable, for the paths that have to survive it. */
-  execThrows?: string | Error
+  execThrows?: string | Error,
+  /** Stand in for a tree whose shape the default canned entries cannot express. */
+  findEntries?: FoundEntry[]
 ): {
   workspace: () => Promise<WorkspaceClient>;
   execs: Array<{ command: string; options?: unknown }>;
-  readdirs: Array<{ limit?: number }>;
+  readdirs: Page[];
+  finds: Array<{ dir: string; pattern?: string } & Page>;
+  greps: Array<{ query: string; path: string } & GrepOptions>;
+  /** Mutable, so a test can assert `ls` was never reached. */
+  calls: { ls: number };
   files: Map<string, string>;
 } {
   const execs: Array<{ command: string; options?: unknown }> = [];
-  const readdirs: Array<{ limit?: number }> = [];
+  const readdirs: Page[] = [];
+  const finds: Array<{ dir: string; pattern?: string } & Page> = [];
+  const greps: Array<{ query: string; path: string } & GrepOptions> = [];
+  const calls = { ls: 0 };
   const files = new Map(Object.entries(seed));
 
   const client = {
@@ -71,19 +117,89 @@ function stub(
       },
       mkdir: async () => undefined,
       exists: async (path: string) => files.has(path),
-      readdir: async (_path: string, options?: { limit?: number }) => (
+      readdir: async (_path: string, options?: Page) => (
         readdirs.push(options ?? {}),
-        [
-          { name: "src", isDirectory: true, isFile: false, size: 0 },
-          {
-            name: "package.json",
-            isDirectory: false,
-            isFile: true,
-            size: 2048
-          }
-        ].slice(0, options?.limit)
+        page(
+          [
+            { name: "src", isDirectory: true, isFile: false, size: 0 },
+            {
+              name: "package.json",
+              isDirectory: false,
+              isFile: true,
+              size: 2048
+            }
+          ],
+          options
+        )
       ),
-      ls: async () => [...files.keys()]
+      ls: async () => ((calls.ls += 1), [...files.keys()]),
+      /**
+       * Entries from `findEntries`, paged by `offset`/`limit`. Both are honoured
+       * exactly: the bound is the whole reason this arm moved off `ls`, and a stub
+       * that ignored the offset would let broken paging pass its own test — which
+       * is the failure mode the raw-index bookkeeping exists to prevent.
+       *
+       * The pattern is reduced to a suffix match, which is emphatically not the
+       * real glob: that one is Cloudflare's, anchored against the relative path,
+       * and reimplementing it here would test their code. This much only exists
+       * so both branches are reachable, since a pattern that matches nothing has
+       * its own message.
+       */
+      find: async (dir: string, pattern?: string, options?: Page) => {
+        finds.push({ dir, pattern, ...options });
+        const entries = findEntries ?? [
+          { path: `${dir}/.git`, type: "dir" as const },
+          { path: `${dir}/.gitignore`, type: "file" as const },
+          { path: `${dir}/src`, type: "dir" as const },
+          { path: `${dir}/src/a.ts`, type: "file" as const },
+          { path: `${dir}/package.json`, type: "file" as const }
+        ];
+        const suffix = pattern?.replace(/^.*\*/, "");
+        return page(
+          suffix ? entries.filter((e) => e.path.endsWith(suffix)) : entries,
+          options
+        );
+      },
+      /**
+       * A real line scan over the seeded files, because the rendering is what
+       * these tests are about — grouping, line numbers, context markers and the
+       * byte budget all need matches that look like matches. `limit` and `offset`
+       * are honoured for the same reason `readFile` honours its byte range: a stub
+       * that ignored them would let an unbounded or mis-paged search pass.
+       */
+      grep: async (query: string, _path: string, options?: GrepOptions) => {
+        greps.push({ query, path: _path, ...options });
+        const context = options?.context ?? 0;
+        const out: Array<{
+          path: string;
+          line: number;
+          text: string;
+          context?: Array<{ line: number; text: string; isMatch: boolean }>;
+        }> = [];
+        for (const [file, content] of files) {
+          const lines = content.split("\n");
+          lines.forEach((text, i) => {
+            if (!text.includes(query)) return;
+            const match: (typeof out)[number] = {
+              path: file,
+              line: i + 1,
+              text
+            };
+            if (context > 0) {
+              const from = Math.max(0, i - context);
+              match.context = lines
+                .slice(from, i + context + 1)
+                .map((line, k) => ({
+                  line: from + k + 1,
+                  text: line,
+                  isMatch: from + k === i
+                }));
+            }
+            out.push(match);
+          });
+        }
+        return page(out, options);
+      }
     },
     runtime: {
       exec: async (command: string, options?: unknown) => {
@@ -101,7 +217,15 @@ function stub(
     [Symbol.dispose]: () => {}
   } as unknown as WorkspaceClient;
 
-  return { workspace: async () => client, execs, readdirs, files };
+  return {
+    workspace: async () => client,
+    execs,
+    readdirs,
+    finds,
+    greps,
+    calls,
+    files
+  };
 }
 
 const config: ComputerConfig = {
@@ -356,8 +480,8 @@ describe("paths the workspace cannot see", () => {
     const tools = buildComputerTools(workspace, config);
     const path = "/workspace/repo/node_modules/zod/package.json";
 
-    for (const name of ["sb_read", "sb_ls", "sb_exists"]) {
-      const out = await run(tools, name, { path });
+    for (const name of ["sb_read", "sb_ls", "sb_exists", "sb_grep"]) {
+      const out = await run(tools, name, { path, query: "x" });
       expect(out).toContain("only in the container");
       expect(out).toContain("sb_exec");
       expect(out).not.toContain("does not exist");
@@ -476,6 +600,634 @@ describe("sb_ls", () => {
     const out = await run(tools, "sb_ls", { path });
     expect(out).toContain("src/");
     expect(out).toContain("package.json\t2.0 KB");
+  });
+
+  /**
+   * The regression this retires. `ls` is a prefix scan with no bound: it returned
+   * every path in the subtree, the isolate held all of them, and the byte ceiling
+   * then discarded most — the same read-everything-then-discard shape the
+   * `readdir` limit was introduced to fix one arm above. `find` takes a limit, so
+   * asserting one arrived is asserting the walk stops early.
+   */
+  it("bounds a recursive listing at the source, and no longer scans the whole subtree", async () => {
+    const { workspace, finds, calls } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    await run(tools, "sb_ls", { path, recursive: true });
+
+    expect(finds[0]?.limit).toBe(1001);
+    // Whole-subtree, so no pattern — but bounded, which `ls` never was.
+    expect(finds[0]?.pattern).toBeUndefined();
+    expect(calls.ls).toBe(0);
+  });
+
+  it("finds files by glob without spending a second tool on it", async () => {
+    const { workspace, finds, readdirs } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    await run(tools, "sb_ls", { path, pattern: "**/*.ts" });
+
+    expect(finds[0]).toMatchObject({ dir: path, pattern: "**/*.ts" });
+    // A pattern searches the subtree on its own; `recursive` is not needed and
+    // the one-level read must not run.
+    expect(readdirs).toHaveLength(0);
+  });
+
+  it("marks directories in a recursive listing the way the one-level listing does", async () => {
+    const { workspace } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_ls", { path, recursive: true });
+    expect(out).toContain(`${path}/src/`);
+    expect(out).toContain(`${path}/src/a.ts`);
+  });
+
+  /**
+   * "Empty directory" and "your glob matched nothing" send the model to different
+   * next moves — one to a different path, the other to a different pattern.
+   */
+  it("says a pattern matched nothing rather than reporting an empty directory", async () => {
+    const { workspace } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_ls", { path, pattern: "**/*.rs" });
+    expect(out).toContain("**/*.rs");
+    expect(out).not.toContain("is empty");
+  });
+});
+
+/**
+ * How a match list reads.
+ *
+ * The budget rules here are deliberately not `truncateOutput`'s. Keeping both ends
+ * and dropping the middle is right for a build log, where the first error and the
+ * final summary are the whole value — and destructive for search results, where the
+ * middle is an entire file's worth of hits that disappear without saying so.
+ */
+describe("renderGrepMatches", () => {
+  const match = (path: string, line: number, text: string) => ({
+    path,
+    line,
+    text
+  });
+
+  it("names each file once and lists its hits under it", () => {
+    const { body } = renderGrepMatches(
+      [
+        match("/workspace/a.ts", 4, "const x = 1;"),
+        match("/workspace/a.ts", 9, "const y = 2;"),
+        match("/workspace/b.ts", 2, "const z = 3;")
+      ],
+      16_000
+    );
+
+    // An absolute path costs more than the line it labels; repeating it per hit
+    // spends the budget on paths rather than code.
+    expect(body.match(/\/workspace\/a\.ts/g)).toHaveLength(1);
+    expect(body).toContain("  4: const x = 1;");
+    expect(body).toContain("  9: const y = 2;");
+    expect(body).toContain("/workspace/b.ts");
+  });
+
+  it("distinguishes the matching line from its context, as grep does", () => {
+    const { body } = renderGrepMatches(
+      [
+        {
+          path: "/workspace/a.ts",
+          line: 5,
+          text: "const x = 1;",
+          context: [
+            { line: 4, text: "// before", isMatch: false },
+            { line: 5, text: "const x = 1;", isMatch: true },
+            { line: 6, text: "// after", isMatch: false }
+          ]
+        }
+      ],
+      16_000
+    );
+
+    // `:` is the hit, `-` is context. Without the distinction the model cannot
+    // tell which line it actually searched for.
+    expect(body).toContain("  5: const x = 1;");
+    expect(body).toContain("  4- // before");
+    expect(body).toContain("  6- // after");
+  });
+
+  /**
+   * The minified-bundle case. One match in `dist/` carries a line of megabytes,
+   * and `text` is the whole line — so without a cap a single hit is the entire
+   * result.
+   */
+  it("shortens a very long line instead of letting it eat the result", () => {
+    const { body, capped } = renderGrepMatches(
+      [
+        match("/workspace/dist/bundle.js", 1, `x${"y".repeat(50_000)}`),
+        match("/workspace/src/a.ts", 3, "readable")
+      ],
+      16_000
+    );
+
+    expect(body.length).toBeLessThan(1_000);
+    expect(body).toContain("chars]");
+    // The point of capping rather than dropping: the later match survives.
+    expect(body).toContain("readable");
+    // Reported once, so the caller can say how to reach the full text without
+    // repeating the advice on every shortened line.
+    expect(capped).toBe(true);
+  });
+
+  it("does not claim a line was shortened when none that shipped was", () => {
+    const { capped } = renderGrepMatches(
+      [match("/workspace/a.ts", 1, "short")],
+      16_000
+    );
+    expect(capped).toBe(false);
+  });
+
+  it("stops at the budget and reports exactly how many it showed", () => {
+    const many = Array.from({ length: 200 }, (_, i) =>
+      match("/workspace/a.ts", i + 1, `line ${i} ${"x".repeat(80)}`)
+    );
+
+    const { body, shown } = renderGrepMatches(many, 2_000);
+
+    expect(body.length).toBeLessThan(2_400);
+    // `shown` is what makes the next offset exact rather than a guess.
+    expect(shown).toBeGreaterThan(0);
+    expect(shown).toBeLessThan(200);
+  });
+
+  it("emits the first match however large, rather than nothing at all", () => {
+    const { body, shown } = renderGrepMatches(
+      [match("/workspace/a.ts", 1, "x".repeat(5_000))],
+      50
+    );
+    expect(body).toContain("/workspace/a.ts");
+    expect(body).toContain("1:");
+    expect(shown).toBe(1);
+  });
+});
+
+/**
+ * The budget rule both list tools share.
+ *
+ * Whole blocks only, because half a match's context reads like a corrupt result —
+ * and an exact `shown`, because that number is what the next page's offset is
+ * computed from. A `shown` that over-reported by one would silently skip an entry
+ * on every subsequent page.
+ */
+describe("packBlocks", () => {
+  it("emits whole blocks and counts them exactly", () => {
+    const { body, shown } = packBlocks(
+      [["a", "b"], ["c"], ["d", "e", "f"]],
+      1_000
+    );
+    expect(body).toBe("a\nb\nc\nd\ne\nf");
+    expect(shown).toBe(3);
+  });
+
+  it("drops a block whole rather than splitting it", () => {
+    const { body, shown } = packBlocks(
+      [["x".repeat(20)], ["y".repeat(20), "z".repeat(20)]],
+      30
+    );
+    expect(shown).toBe(1);
+    expect(body).not.toContain("y");
+    // Not a partial second block: the line that would have fit is absent too.
+    expect(body).not.toContain("z");
+  });
+
+  it("always emits the first block, however far over budget", () => {
+    const { body, shown } = packBlocks([["x".repeat(5_000)], ["y"]], 10);
+    expect(shown).toBe(1);
+    expect(body.length).toBeGreaterThan(10);
+  });
+
+  it("reports nothing shown for no blocks", () => {
+    expect(packBlocks([], 100)).toEqual({ body: "", shown: 0 });
+  });
+});
+
+/**
+ * Search that does not need the container.
+ *
+ * That is the reason this tool exists rather than leaving the model on
+ * `sb_exec("grep -rn …")`: it reads the durable workspace, so it answers during
+ * exactly the window — container being replaced, install still running — when the
+ * shell cannot. The bound at the source is the other half, since `.git` is in the
+ * workspace and an unbounded search reads every loose object before answering.
+ */
+describe("sb_grep", () => {
+  const path = "/workspace/repo/a.ts";
+  const seed = {
+    [path]: "import { z } from 'zod';\nconst a = 1;\nconst b = 2;\n"
+  };
+
+  it("bounds the search at the source", async () => {
+    const { workspace, greps } = stub(seed);
+    const tools = buildComputerTools(workspace, config);
+
+    await run(tools, "sb_grep", { query: "const" });
+    // One over the ceiling, so a cut result is detected without searching twice.
+    expect(greps[0]?.limit).toBe(201);
+  });
+
+  it("searches the configured cwd unless told otherwise", async () => {
+    const { workspace, greps } = stub(seed);
+    const tools = buildComputerTools(workspace, {
+      ...config,
+      cwd: "/workspace"
+    });
+
+    await run(tools, "sb_grep", { query: "const" });
+    expect(greps[0]?.path).toBe("/workspace");
+
+    await run(tools, "sb_grep", { query: "const", path: "/workspace/repo" });
+    expect(greps[1]?.path).toBe("/workspace/repo");
+  });
+
+  it("returns the hits with their line numbers", async () => {
+    const { workspace } = stub(seed);
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_grep", { query: "const" });
+    expect(out).toContain(path);
+    expect(out).toContain("  2: const a = 1;");
+    expect(out).toContain("  3: const b = 2;");
+  });
+
+  /**
+   * The query is a value here, not a fragment of a shell command — which is the
+   * quieter reason to prefer this over `sb_exec`. Through a shell it would pass
+   * `shellQuote` and be re-parsed on the way to `grep`.
+   */
+  it("forwards the search options rather than reinterpreting them", async () => {
+    const { workspace, greps } = stub(seed);
+    const tools = buildComputerTools(workspace, config);
+
+    await run(tools, "sb_grep", {
+      query: "^const",
+      include: "**/*.ts",
+      regex: true,
+      ignoreCase: true,
+      context: 2
+    });
+
+    expect(greps[0]).toMatchObject({
+      query: "^const",
+      include: "**/*.ts",
+      regex: true,
+      ignoreCase: true,
+      context: 2
+    });
+  });
+
+  it("says it found nothing, and what it looked for", async () => {
+    const { workspace } = stub(seed);
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_grep", {
+      query: "nowhere",
+      include: "**/*.ts"
+    });
+    expect(out).toContain("no matches");
+    expect(out).toContain("nowhere");
+    expect(out).toContain("**/*.ts");
+  });
+
+  /**
+   * The gate holds `sb_exec` while dependencies install. Holding this too would
+   * defeat the point — searching is precisely what a subagent can usefully do in
+   * that window, and it needs no container to do it.
+   */
+  it("still searches while a dependency install is in flight", async () => {
+    const { workspace } = stub(seed);
+    const tools = buildComputerTools(
+      workspace,
+      { ...config, installGateMs: 0 },
+      async () => ({
+        state: "running" as const,
+        command: "npm ci",
+        startedAt: Date.now()
+      })
+    );
+
+    const out = await run(tools, "sb_grep", { query: "const" });
+    expect(out).toContain("const a = 1;");
+    expect(out).not.toContain("still running");
+  });
+});
+
+/**
+ * `.git` is off limits, and the reason differs from `node_modules`.
+ *
+ * `node_modules` is *absent* — physics, decided by `computerd`. `.git` is present,
+ * readable, and refused anyway — policy, because a model that edits `.git/HEAD` or
+ * `.git/config` corrupts a checkout in a way that surfaces much later as an
+ * inexplicable git failure. Repository work belongs to the repo tools.
+ */
+describe("paths inside .git", () => {
+  it("matches .git as a whole segment, sparing the dotfiles that merely start with it", () => {
+    expect(isGitInternal("/workspace/repo/.git/config")).toBe(true);
+    expect(isGitInternal("/workspace/repo/.git")).toBe(true);
+    // The trap: these are ordinary tracked files and must stay readable.
+    expect(isGitInternal("/workspace/repo/.gitignore")).toBe(false);
+    expect(isGitInternal("/workspace/repo/.gitattributes")).toBe(false);
+    expect(isGitInternal("/workspace/repo/.github/workflows/ci.yml")).toBe(
+      false
+    );
+    expect(isGitInternal("/workspace/repo/src/git/index.ts")).toBe(false);
+  });
+
+  it("refuses every file tool, and points at the repo tools", async () => {
+    const { workspace, files } = stub();
+    const tools = buildComputerTools(workspace, config);
+    const path = "/workspace/repo/.git/config";
+
+    for (const name of [
+      "sb_read",
+      "sb_ls",
+      "sb_exists",
+      "sb_grep",
+      "sb_edit"
+    ]) {
+      const out = await run(tools, name, {
+        path,
+        query: "x",
+        find: "a",
+        replace: "b"
+      });
+      expect(out).toContain(".git");
+      // A refusal with no destination gets worked around; this one has one.
+      expect(out).toContain("repo_diff");
+    }
+
+    const wrote = await run(tools, "sb_write", { path, content: "x" });
+    expect(wrote).toContain("repo_status");
+    // The half that matters: nothing landed where a later read would find it.
+    expect(files.has(path)).toBe(false);
+  });
+
+  /**
+   * The one prohibition this plugin must never soften. Naming `sb_exec` beside git
+   * would hand back the exact capability the refusal withholds, in the one place
+   * the model is already looking for a way around it — and with the tool's own
+   * authority behind it. Asserted against the rendered strings so a later
+   * well-meaning rewording fails here rather than shipping.
+   */
+  it("never offers sb_exec as a way to reach git", async () => {
+    const { workspace } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    const refusal = await run(tools, "sb_read", {
+      path: "/workspace/repo/.git/HEAD"
+    });
+    expect(refusal).not.toContain("sb_exec");
+
+    const capability = computer({
+      ...config,
+      binding: undefined as unknown as ComputerConfig["binding"]
+    }).capability!;
+    const gitLine = capability
+      .split("\n")
+      .find((line) => line.includes("`.git`"))!;
+    expect(gitLine).toBeDefined();
+    expect(gitLine).not.toContain("sb_exec");
+    // And it still says where to go instead.
+    expect(gitLine).toContain("repo_commit");
+  });
+
+  it("keeps .git out of a search", async () => {
+    const { workspace } = stub({
+      "/workspace/repo/.git/COMMIT_EDITMSG": "fix the parser\n",
+      "/workspace/repo/src/a.ts": "// fix the parser later\n"
+    });
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_grep", { query: "fix the parser" });
+    expect(out).toContain("/workspace/repo/src/a.ts");
+    expect(out).not.toContain("COMMIT_EDITMSG");
+  });
+
+  /**
+   * The round-1 bug this closes. At a repo root `.git` is walked *first* — `.`
+   * sorts before alphanumerics — and holds thousands of objects, so an unfiltered
+   * page is a page of `.git` and nothing else: a recursive listing of a real
+   * checkout returned 1000 object hashes and not one source file.
+   */
+  it("does not let .git consume a whole recursive listing", async () => {
+    const root = "/workspace/repo";
+    const crowded = [
+      ...Array.from({ length: 1500 }, (_, i) => ({
+        path: `${root}/.git/objects/${i}`,
+        type: "file" as const
+      })),
+      { path: `${root}/src/a.ts`, type: "file" as const }
+    ];
+    const { workspace } = stub({}, undefined, crowded);
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_ls", { path: root, recursive: true });
+
+    expect(out).toContain(`${root}/src/a.ts`);
+    expect(out).not.toContain("/.git/");
+  });
+
+  it("says so when a page is nothing but .git, rather than reporting an empty tree", async () => {
+    const root = "/workspace/repo";
+    const { workspace } = stub(
+      {},
+      undefined,
+      Array.from({ length: 9_000 }, (_, i) => ({
+        path: `${root}/.git/objects/${i}`,
+        type: "file" as const
+      }))
+    );
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_ls", { path: root, recursive: true });
+    // Bounded retries, so this terminates — and explains itself instead of
+    // looking like an empty directory.
+    expect(out).toContain(".git");
+    expect(out).not.toContain("is empty");
+  });
+
+  /**
+   * `/repo` runs its git CLI through `computerExec`, not through the tools. A
+   * guard there would break clone and commit outright.
+   */
+  it("does not guard computerExec, which is how /repo runs git", async () => {
+    const { workspace, execs } = stub();
+    const tools = buildComputerTools(workspace, config);
+    // The tool refuses…
+    expect(
+      await run(tools, "sb_read", { path: "/workspace/repo/.git/HEAD" })
+    ).toContain("repo_diff");
+    // …while the shell path stays open, which is what /repo depends on.
+    await run(tools, "sb_exec", { command: "git rev-parse --git-dir" });
+    expect(execs).toHaveLength(1);
+  });
+});
+
+/**
+ * Paging, and the bookkeeping that keeps it honest.
+ *
+ * `offset` counts items at the *source*, while what the model sees is filtered and
+ * then trimmed to a byte budget. So the obvious `offset + shown` is wrong exactly
+ * when `.git` was dropped — and wrong silently, repeating or skipping with nothing
+ * to indicate it.
+ */
+describe("offsets that survive filtering", () => {
+  const root = "/workspace/repo";
+
+  it("reports the source offset of the first entry it did not show", async () => {
+    // Two .git entries first, so a naive `offset + shown` would drift by two.
+    const entries = [
+      { path: `${root}/.git/HEAD`, type: "file" as const },
+      { path: `${root}/.git/config`, type: "file" as const },
+      ...Array.from({ length: 2_000 }, (_, i) => ({
+        path: `${root}/src/f${i}.ts`,
+        type: "file" as const
+      }))
+    ];
+    const { workspace } = stub({}, undefined, entries);
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_ls", { path: root, recursive: true });
+    const next = /offset: (\d+)/.exec(out)?.[1];
+    expect(next).toBeDefined();
+
+    // The reported offset must land on the first unseen entry at the source.
+    const shown = out.split("\n").filter((l) => l.includes("/src/f")).length;
+    expect(Number(next)).toBe(shown + 2);
+  });
+
+  it("continues exactly where the previous page stopped", async () => {
+    const entries = [
+      { path: `${root}/.git/HEAD`, type: "file" as const },
+      ...Array.from({ length: 2_000 }, (_, i) => ({
+        path: `${root}/src/f${i}.ts`,
+        type: "file" as const
+      }))
+    ];
+    const { workspace } = stub({}, undefined, entries);
+    const tools = buildComputerTools(workspace, config);
+
+    const first = await run(tools, "sb_ls", { path: root, recursive: true });
+    const next = Number(/offset: (\d+)/.exec(first)![1]);
+    const second = await run(tools, "sb_ls", {
+      path: root,
+      recursive: true,
+      offset: next
+    });
+
+    const lastOfFirst = first
+      .split("\n")
+      .filter((l) => l.includes("/src/f"))
+      .at(-1)!;
+    const firstOfSecond = second
+      .split("\n")
+      .filter((l) => l.includes("/src/f"))[0]!;
+
+    // No repeat and no gap: consecutive indices across the page boundary.
+    const index = (line: string) => Number(/f(\d+)\.ts/.exec(line)![1]);
+    expect(index(firstOfSecond)).toBe(index(lastOfFirst) + 1);
+  });
+
+  it("forwards an offset to the search and reports the next one", async () => {
+    const seed = Object.fromEntries(
+      Array.from({ length: 400 }, (_, i) => [
+        `${root}/f${i}.ts`,
+        "const hit = 1;\n"
+      ])
+    );
+    const { workspace, greps } = stub(seed);
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_grep", { query: "hit", offset: 50 });
+    expect(greps[0]?.offset).toBe(50);
+    expect(out).toContain("offset:");
+  });
+
+  it("pages a one-level listing too", async () => {
+    const { workspace, readdirs } = stub();
+    const tools = buildComputerTools(workspace, config);
+
+    await run(tools, "sb_ls", { path: root, offset: 25 });
+    expect(readdirs[0]).toMatchObject({ limit: 1001, offset: 25 });
+  });
+});
+
+/**
+ * Reaching a region the default read will not show.
+ *
+ * Before this, a file whose middle was dropped had no route back to it except
+ * `sb_exec` with `sed` — which needs a live container, the exact dependency these
+ * tools exist to remove. The same hole made "narrow it" the advice for a capped
+ * 40,000-character minified line, where narrowing cannot possibly help.
+ */
+describe("sb_read windows", () => {
+  const path = "/workspace/repo/bundle.js";
+  const body = "HEAD" + "x".repeat(4_000) + "TAIL";
+
+  it("returns the requested window and says where it landed", async () => {
+    const { workspace } = stub({ [path]: body });
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_read", { path, offset: 100, length: 50 });
+
+    expect(out).toContain("--- bytes 100–150 of 4008");
+    // Enough to compute the next offset without a second call.
+    expect(out).toContain("3858 bytes after this");
+  });
+
+  it("does not middle-truncate a window the model chose", async () => {
+    const { workspace } = stub({ [path]: body });
+    const tools = buildComputerTools(workspace, {
+      ...config,
+      maxOutputBytes: 400
+    });
+
+    const out = await run(tools, "sb_read", { path, offset: 0, length: 300 });
+    expect(out).not.toContain("omitted from the middle");
+  });
+
+  it("keeps the ceiling even when a larger length is asked for", async () => {
+    const { workspace } = stub({ [path]: body });
+    const tools = buildComputerTools(workspace, {
+      ...config,
+      maxOutputBytes: 200
+    });
+
+    const out = await run(tools, "sb_read", {
+      path,
+      offset: 0,
+      length: 99_999
+    });
+    expect(out).toContain("--- bytes 0–200 of 4008");
+  });
+
+  it("says an offset ran off the end rather than returning nothing", async () => {
+    const { workspace } = stub({ [path]: body });
+    const tools = buildComputerTools(workspace, config);
+
+    const out = await run(tools, "sb_read", { path, offset: 99_999 });
+    expect(out).toContain("past the end");
+  });
+
+  /** An unqualified read is unchanged — the middle-out guess is still the default. */
+  it("leaves the default read alone", async () => {
+    const { workspace } = stub({ [path]: body });
+    const tools = buildComputerTools(workspace, {
+      ...config,
+      maxOutputBytes: 400
+    });
+
+    const out = await run(tools, "sb_read", { path });
+    expect(out.startsWith("HEAD")).toBe(true);
+    expect(out.endsWith("TAIL")).toBe(true);
+    // …but the marker now names the way back to what it dropped.
+    expect(out).toContain("offset:");
   });
 });
 

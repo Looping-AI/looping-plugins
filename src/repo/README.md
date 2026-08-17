@@ -4,9 +4,10 @@ Clone, commit, push a work branch, open a pull request.
 
 ```ts
 import { repo } from "@loopingai/plugins/repo";
+import { computerExec } from "@loopingai/plugins/computer";
 
 repo({
-  exec: (cmd, opts) => sandbox.exec(cmd, opts),
+  exec: computerExec({ binding: env.WORKSPACE, workspaceName: () => name }),
   token: () => env.GITHUB_TOKEN
 });
 ```
@@ -14,9 +15,10 @@ repo({
 Tools: `repo_clone`, `repo_status`, `repo_diff`, `repo_commit`, `repo_push`,
 `repo_open_pr`.
 
-`exec` is injected rather than importing `/sandbox` directly, so the two stay
-independent — a host with its own container can use this against that, and the
-tests need no container at all.
+`exec` is injected rather than importing [`/computer`](../computer/) directly, so
+the two stay independent — a host with its own container can use this against that,
+and the tests need no container at all. `computerExec` is that plugin's side of the
+same seam; anything with the signature above works.
 
 ## Where the token lives
 
@@ -81,5 +83,5 @@ practical one for an agent whose entire view of the work is the diff.
 
 ## Requirements
 
-A `GITHUB_TOKEN` secret with contents + pull-request write, and a sandbox with
+A `GITHUB_TOKEN` secret with contents + pull-request write, and a container with
 `git` on it.

@@ -134,6 +134,27 @@ const DEFAULT_MAX_OUTPUT_BYTES = 16_000;
  */
 const DEFAULT_MAX_ENTRIES = 1000;
 
+/**
+ * How many matches one `sb_grep` returns.
+ *
+ * Bounded at the source like {@link DEFAULT_MAX_ENTRIES}, and for a sharper reason
+ * than a listing: without a `limit`, `fs.grep` reads *every* file under the path
+ * looking for more. `.git` is in the workspace, so an unbounded search of
+ * `/workspace` streams every loose object through the isolate before answering.
+ * The limit is what stops that walk early.
+ */
+const DEFAULT_MAX_MATCHES = 200;
+
+/**
+ * How much of one matching line the model is shown.
+ *
+ * A grep match carries the whole line, and a minified bundle is one line of
+ * megabytes — a single match in `dist/` would otherwise be the entire result. The
+ * head is kept because a match's file and line number are what the model acts on;
+ * it reads the region with `sb_read` next.
+ */
+const MAX_MATCH_LINE_CHARS = 200;
+
 /** A command that has not finished in this long is a hung command. */
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -358,10 +379,14 @@ async function readBounded(
   const { size } = await fs.stat(path);
   if (size <= maxBytes) return fs.readFile(path, "utf8");
 
-  const marker = (dropped: number) =>
-    `\n\n… [${dropped} bytes omitted from the middle] …\n\n`;
+  // Names the way out, rather than only the size of the hole. Before `offset`
+  // existed the honest answer was "use sb_exec with sed", which needs a live
+  // container — the dependency these tools exist to remove.
+  const marker = (dropped: number, at: number) =>
+    `\n\n… [${dropped} bytes omitted from the middle — read them with ` +
+    `\`offset: ${at}\`] …\n\n`;
 
-  const half = Math.floor((maxBytes - marker(size).length) / 2);
+  const half = Math.floor((maxBytes - marker(size, size).length) / 2);
   // No budget for two ends plus the marker: keep the head, where the first error
   // is. The same fallback `truncateOutput` makes at the same ceiling.
   if (half < 1)
@@ -378,7 +403,40 @@ async function readBounded(
       byteLength: half
     })
   ]);
-  return head + marker(size - half * 2) + tail;
+  return head + marker(size - half * 2, half) + tail;
+}
+
+/**
+ * A byte window the model asked for, with its coordinates stated.
+ *
+ * No middle-out here, deliberately: {@link readBounded} guesses at what matters when
+ * nobody said, but an explicit `offset` *is* the model saying. Trimming the middle
+ * of a region it chose would defeat the request and, worse, make the next offset
+ * unknowable.
+ *
+ * The window line is what makes paging work at all — the model needs to know where
+ * it landed and how much is left to compute the next `offset`.
+ */
+async function readWindow(
+  fs: WorkspaceClient["fs"],
+  path: string,
+  offset: number,
+  length: number,
+  maxBytes: number
+): Promise<string> {
+  const { size } = await fs.stat(path);
+  if (offset >= size)
+    return `(offset ${offset} is past the end of ${path}, which is ${size} bytes)`;
+
+  const byteLength = Math.min(length, maxBytes, size - offset);
+  const body = await fs.readFile(path, {
+    encoding: "utf8",
+    byteOffset: offset,
+    byteLength
+  });
+  const end = offset + byteLength;
+  const rest = end < size ? `; ${size - end} bytes after this` : "";
+  return `${body}\n--- bytes ${offset}–${end} of ${size}${rest} ---`;
 }
 
 /**
@@ -393,6 +451,115 @@ function humanBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * One `fs.grep` hit, derived from the client rather than imported.
+ *
+ * `@cloudflare/computer` declares `WorkspaceGrepMatch` but does not re-export it,
+ * so there is no name to import. Reading it back off the method keeps this correct
+ * by construction — the same structural approach {@link readBounded} takes to `fs`.
+ */
+type GrepMatch = Awaited<ReturnType<WorkspaceClient["fs"]["grep"]>>[number];
+
+/** One matching line, bounded — see {@link MAX_MATCH_LINE_CHARS}. */
+function capLine(text: string): string {
+  // A CRLF file leaves the carriage return on every line, since the reader splits
+  // on `\n` alone. Invisible in the output and pure noise in the token count.
+  const line = text.endsWith("\r") ? text.slice(0, -1) : text;
+  return line.length <= MAX_MATCH_LINE_CHARS
+    ? line
+    : `${line.slice(0, MAX_MATCH_LINE_CHARS)}… [+${line.length - MAX_MATCH_LINE_CHARS} chars]`;
+}
+
+/**
+ * Emit whole items until the byte budget is spent, and report exactly how many.
+ *
+ * {@link truncateOutput} is wrong for every list this module produces, and is
+ * deliberately not used by them. It keeps both ends and drops the middle, which is
+ * right for a build log — first error, final summary — and destructive for a match
+ * list or a directory listing, where the middle is a whole file's worth of hits or a
+ * whole subtree that silently vanishes. So the budget is spent item by item, in
+ * order, and the caller learns where it stopped.
+ *
+ * `shown` is the load-bearing return value: it is what makes the next page's offset
+ * exact rather than a guess. A block is committed whole or not at all, because half
+ * a match's context reads like a corrupt result — and the first block always goes
+ * out, so one enormous item cannot produce an empty answer.
+ */
+export function packBlocks(
+  blocks: string[][],
+  maxBytes: number
+): { body: string; shown: number } {
+  const out: string[] = [];
+  let used = 0;
+  let shown = 0;
+
+  for (const block of blocks) {
+    const cost = block.reduce((n, line) => n + line.length + 1, 0);
+    if (shown > 0 && used + cost > maxBytes) break;
+    out.push(...block);
+    used += cost;
+    shown += 1;
+  }
+
+  return { body: out.join("\n"), shown };
+}
+
+/**
+ * Search results, in the shape `grep -n` has trained every model to read.
+ *
+ * ## Grouped by file
+ *
+ * Matches arrive contiguous per file — `fs.grep` walks a generator of files — so
+ * grouping is free, and it is worth taking: an absolute path in this workspace is
+ * ~40 characters, and repeating it on 200 lines spends more of the budget on paths
+ * than on code.
+ *
+ * `:` marks a matching line and `-` a context line, which is `grep`'s own
+ * convention. In the payload the distinction is only `isMatch`, and losing it would
+ * leave the model unable to tell which line it actually searched for.
+ *
+ * Only a *suffix* is ever dropped, so grouping survives the cut: a header is emitted
+ * whenever the path changes, and no earlier block can disappear from under a later
+ * one.
+ *
+ * `capped` reports whether any line was shortened, so the caller can say once — not
+ * once per line — how to reach the full text.
+ */
+export function renderGrepMatches(
+  matches: GrepMatch[],
+  maxBytes: number
+): { body: string; shown: number; capped: boolean } {
+  let path: string | undefined;
+  const blocks: string[][] = [];
+  const hasLongLine: boolean[] = [];
+
+  matches.forEach((match, i) => {
+    const block: string[] = [];
+    // A blank line before every file but the first, so the groups separate.
+    if (match.path !== path)
+      block.push(i === 0 ? match.path : `\n${match.path}`);
+    path = match.path;
+
+    // `context` already contains the matching line, flagged — so it replaces the
+    // bare one rather than being added around it.
+    const body = match.context?.length
+      ? match.context
+      : [{ line: match.line, text: match.text, isMatch: true }];
+
+    hasLongLine.push(body.some((l) => l.text.length > MAX_MATCH_LINE_CHARS));
+    for (const line of body)
+      block.push(
+        `  ${line.line}${line.isMatch ? ":" : "-"} ${capLine(line.text)}`
+      );
+
+    blocks.push(block);
+  });
+
+  const { body, shown } = packBlocks(blocks, maxBytes);
+  // Only a line that actually made it out is worth explaining.
+  return { body, shown, capped: hasLongLine.slice(0, shown).includes(true) };
 }
 
 /**
@@ -418,6 +585,158 @@ function containerOnlyNote(path: string, verb: string): string {
     `${path} is inside node_modules, which lives only in the container and is ` +
     `not part of the durable workspace — ${verb} cannot see it. Use \`sb_exec\` ` +
     `(for example \`cat ${path}\`) to read it through the shell instead.`
+  );
+}
+
+/**
+ * Is this path inside git's internal state?
+ *
+ * The mirror image of {@link isContainerOnly}, and the distinction is worth keeping
+ * rather than merging the two lists. `node_modules` is *absent* — physics, decided
+ * by `computerd`, and the note explains a missing file. `.git` is present and
+ * readable and is refused anyway — policy, decided here, because a model that edits
+ * `.git/HEAD` or `.git/config` corrupts a checkout in a way that surfaces much later
+ * as an inexplicable git failure. Two reasons want two sentences.
+ *
+ * Exact segment rather than substring, so `.gitignore`, `.gitattributes` and
+ * `.github/` are untouched — the same trap `node_modules_old` sets one function up.
+ */
+export function isGitInternal(path: string): boolean {
+  return path.split("/").includes(".git");
+}
+
+/**
+ * The sentence a `.git` path gets.
+ *
+ * Names the route deliberately. A refusal with no destination is a worse tool than
+ * no refusal at all: the model retries, then works around it. So it points at the
+ * repo tools, which is where repository work actually belongs.
+ *
+ * What it must never do is point at `sb_exec`. That would hand back the exact
+ * capability this refusal withholds, in the one place the model is already looking
+ * for a way around it — and it would do so with the tool's own authority behind it.
+ * `sb_exec` is unguarded because a shell takes an opaque command string and
+ * pattern-matching git out of one is neither reliable nor this guard's job; that is
+ * a fact about the implementation, not a route to advertise.
+ */
+function gitInternalNote(path: string, verb: string): string {
+  return (
+    `${path} is inside .git — git's internal state, which ${verb} does not touch. ` +
+    `Reading it tells you less than the repository tools do, and writing it ` +
+    `corrupts the checkout. Repository work goes through the repo tools ` +
+    `(\`repo_status\`, \`repo_diff\`, \`repo_commit\`, \`repo_push\`), which the ` +
+    `main agent holds. If this task needs git state you cannot get that way, say ` +
+    `so in your result rather than reaching into .git yourself.`
+  );
+}
+
+/**
+ * Fetch a page, drop what is off-limits, and keep the source offsets that make the
+ * *next* page exact.
+ *
+ * The subtle part is why `rawIndex` exists at all. `offset` counts items at the
+ * source; the caller renders a filtered, budget-trimmed subset of them. So the
+ * obvious `nextOffset = offset + shown` is wrong — it silently skips or repeats
+ * whenever anything was dropped, which is precisely when `.git` is involved. Keeping
+ * each survivor's source index means the next page starts exactly after the last one
+ * the model actually saw.
+ *
+ * Retries because `.git` can outnumber a whole page on its own: at a repo root it is
+ * walked *first* (`.` sorts before alphanumerics) and holds thousands of objects, so
+ * one fetch can come back entirely excluded. `maxRounds` is the caller's, and the
+ * asymmetry is deliberate — a `find` retry re-walks dirents, which is cheap SQLite
+ * reads, while a `grep` retry re-reads and re-scans every file it already looked at.
+ *
+ * Deliberately no slicing to `want`: the caller needs the extra item to know a next
+ * page exists, and its index to say where.
+ */
+async function collectVisible<T>(
+  fetch: (offset: number, limit: number) => Promise<T[]>,
+  pathOf: (item: T) => string,
+  want: number,
+  offset: number,
+  maxRounds: number
+): Promise<{
+  items: T[];
+  /** Source offset of `items[i]`. */
+  rawIndex: number[];
+  /** Source offset just past everything examined. */
+  rawEnd: number;
+  /** The source ran out; there is no next page. */
+  exhausted: boolean;
+  /** Rounds ran out while excluded paths still dominated. */
+  crowded: boolean;
+}> {
+  const items: T[] = [];
+  const rawIndex: number[] = [];
+  let cursor = offset;
+  let exhausted = false;
+  let rounds = 0;
+
+  // One past `want`, so a next page is detected without a further round trip.
+  while (items.length <= want && rounds < maxRounds) {
+    rounds += 1;
+    const batch = await fetch(cursor, want + 1);
+    batch.forEach((item, i) => {
+      if (isGitInternal(pathOf(item))) return;
+      items.push(item);
+      rawIndex.push(cursor + i);
+    });
+    cursor += batch.length;
+    if (batch.length <= want) {
+      exhausted = true;
+      break;
+    }
+  }
+
+  return {
+    items,
+    rawIndex,
+    rawEnd: cursor,
+    exhausted,
+    crowded: !exhausted && items.length <= want
+  };
+}
+
+/** What a page of a collected listing owes the caller once it knows how much fit. */
+interface VisiblePage {
+  rawIndex: number[];
+  rawEnd: number;
+  exhausted: boolean;
+  crowded: boolean;
+}
+
+/**
+ * The "there is more, here is where" line, with an offset that is actually correct.
+ *
+ * `rawIndex[shown]` rather than `offset + shown`: the first item the model did *not*
+ * see, at its source coordinate. Anything else drifts by however many entries the
+ * `.git` filter removed, and drifts silently — the next page would repeat or skip
+ * with nothing to indicate it had.
+ *
+ * Narrowing is still offered, and still first-class, because it is cheaper than
+ * paging: `offset` does not skip the walk, it only discards its early results. It is
+ * offered as the better option rather than the only one, which is the thing the
+ * previous wording got wrong — "narrow it" is no answer at all when the model wants
+ * the next page of a list it is working through.
+ */
+function listingNote(
+  page: VisiblePage,
+  shown: number,
+  noun: string,
+  narrower: string
+): string {
+  const next =
+    shown < page.rawIndex.length
+      ? page.rawIndex[shown]
+      : page.exhausted
+        ? undefined
+        : page.rawEnd;
+  if (next === undefined) return "";
+  return (
+    `\n\n… showed ${shown} ${noun}; there are more. Continue with ` +
+    `\`offset: ${next}\`, or narrow with ${narrower} — narrowing is cheaper, ` +
+    `since an offset still walks everything it skips.`
   );
 }
 
@@ -867,17 +1186,43 @@ export function buildComputerTools(
 
     sb_read: tool({
       description:
-        "Read a file from the workspace. Returns the file's text, or a note if it does not exist. A large file comes back with its middle removed and a marker saying how many bytes are missing — to see a specific part of one, use sb_exec with sed or grep. Files under node_modules are not in the workspace — read those with sb_exec.",
+        "Read a file from the workspace. Returns the file's text, or a note if it does not exist. " +
+        "A large file comes back with its middle removed and a marker giving the `offset` that reaches the missing part. " +
+        "Pass `offset` (and optionally `length`) to read a specific byte window instead — the result states the window it returned and how many bytes follow, so you can page through a file. Byte offsets, not lines: to see the lines around a match, use sb_grep with `context`. " +
+        "Files under node_modules are not in the workspace — read those with sb_exec.",
       inputSchema: z.object({
         path: z
           .string()
-          .describe("Absolute path, e.g. '/workspace/repo/src/a.ts'")
+          .describe("Absolute path, e.g. '/workspace/repo/src/a.ts'"),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Byte offset to start reading from"),
+        length: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe("Maximum bytes to return from `offset`")
       }),
-      execute: async ({ path }) => {
+      execute: async ({ path, offset, length }) => {
         if (isContainerOnly(path)) return containerOnlyNote(path, "sb_read");
+        if (isGitInternal(path)) return gitInternalNote(path, "sb_read");
         try {
           using ws = await workspace();
-          return await readBounded(ws.fs, path, maxBytes);
+          // Either knob means the model chose a region; only an unqualified read
+          // gets the middle-out guess.
+          return offset === undefined && length === undefined
+            ? await readBounded(ws.fs, path, maxBytes)
+            : await readWindow(
+                ws.fs,
+                path,
+                offset ?? 0,
+                length ?? maxBytes,
+                maxBytes
+              );
         } catch (err) {
           return `error reading ${path}: ${String(err)}`;
         }
@@ -895,6 +1240,7 @@ export function buildComputerTools(
       }),
       execute: async ({ path, content }) => {
         if (isContainerOnly(path)) return containerOnlyNote(path, "sb_write");
+        if (isGitInternal(path)) return gitInternalNote(path, "sb_write");
         try {
           using ws = await workspace();
           const dir = path.slice(0, path.lastIndexOf("/"));
@@ -919,6 +1265,7 @@ export function buildComputerTools(
       }),
       execute: async ({ path, find, replace }) => {
         if (isContainerOnly(path)) return containerOnlyNote(path, "sb_edit");
+        if (isGitInternal(path)) return gitInternalNote(path, "sb_edit");
         try {
           using ws = await workspace();
           const content = await ws.fs.readFile(path, "utf8");
@@ -939,46 +1286,208 @@ export function buildComputerTools(
 
     sb_ls: tool({
       description:
-        "List files in a workspace directory. Directories are shown with a trailing slash, files with their size — check that before reading a large one, since sb_read truncates. node_modules is not in the workspace — list it with sb_exec.",
+        "List files in a workspace directory, or find files by name. Without `pattern` it lists one level: directories with a trailing slash, files with their size — check that before reading a large one, since sb_read truncates. " +
+        "`pattern` is a glob matched against paths relative to `path`, and searches the whole subtree: `*` stays within one path segment, `**/` crosses directories, `?` matches one character. So `*.ts` finds top-level TypeScript files and `**/*.ts` finds them at any depth. " +
+        "A cut listing reports the `offset` that continues it. node_modules is not in the workspace — list it with sb_exec.",
       inputSchema: z.object({
         path: z.string().describe("Absolute directory path"),
         recursive: z
           .boolean()
           .optional()
-          .describe("Recurse into subdirectories")
+          .describe("List the whole subtree rather than one level"),
+        pattern: z
+          .string()
+          .optional()
+          .describe(
+            "Glob relative to path, e.g. '**/*.spec.ts'. Searches the subtree, so `recursive` is not needed with it."
+          ),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Entries to skip — use the offset a cut listing reports")
       }),
-      execute: async ({ path, recursive }) => {
+      execute: async ({ path, recursive, pattern, offset }) => {
         if (isContainerOnly(path)) return containerOnlyNote(path, "sb_ls");
+        if (isGitInternal(path)) return gitInternalNote(path, "sb_ls");
+        const from = offset ?? 0;
         try {
           using ws = await workspace();
-          if (recursive) {
-            // `ls` takes no bound — it is a prefix scan, not a directory read —
-            // so this arm is still truncate-after-the-fact.
-            const paths = await ws.fs.ls(path);
-            if (paths.length === 0) return `(${path} is empty)`;
-            return truncateOutput(paths.join("\n"), maxBytes);
+          if (recursive || pattern) {
+            // `find` rather than `ls`, which took no bound: a prefix scan
+            // returned every path in the subtree and the ceiling then threw most
+            // of them away — the same read-everything-then-discard shape the
+            // `readdir` limit below exists to avoid. Two differences follow from
+            // the swap, both improvements: directories appear (rendered like the
+            // arm below renders them), and order is the walk's — pre-order, by
+            // name — rather than one flat sort.
+            //
+            // Filtered rather than trusted, and this is the arm where it matters
+            // most: at a repo root `.git` is walked *first* and holds thousands
+            // of objects, so an unfiltered page is a page of `.git` and nothing
+            // else. Four rounds because a `find` retry re-walks dirents, which is
+            // cheap SQLite reads rather than file bytes.
+            const page = await collectVisible(
+              (at, limit) => ws.fs.find(path, pattern, { limit, offset: at }),
+              (e) => e.path,
+              DEFAULT_MAX_ENTRIES,
+              from,
+              4
+            );
+            if (page.items.length === 0)
+              return page.crowded
+                ? `(everything under ${path} from offset ${from} is inside .git — try a \`pattern\`, or a \`path\` inside the working tree)`
+                : pattern
+                  ? `(nothing under ${path} matches ${pattern})`
+                  : `(${path} is empty)`;
+
+            const blocks = page.items
+              .slice(0, DEFAULT_MAX_ENTRIES)
+              .map((e) => [e.type === "dir" ? `${e.path}/` : e.path]);
+            const { body, shown } = packBlocks(blocks, maxBytes);
+            return body + listingNote(page, shown, "entries", "`pattern`");
           }
           // One over the ceiling: enough to know the listing was cut without a
           // second round trip to find out, and the extra entry is not shown.
+          // Unfiltered on purpose — `.git/` shows here exactly as `node_modules`
+          // does, because one line naming a directory that is really there is
+          // honest, and it is access rather than existence that is refused.
           const entries = await ws.fs.readdir(path, {
-            limit: DEFAULT_MAX_ENTRIES + 1
+            limit: DEFAULT_MAX_ENTRIES + 1,
+            offset: from
           });
-          if (entries.length === 0) return `(${path} is empty)`;
-          const overflow = entries.length > DEFAULT_MAX_ENTRIES;
-          const body = entries
+          if (entries.length === 0)
+            return from > 0
+              ? `(no entries in ${path} past offset ${from})`
+              : `(${path} is empty)`;
+          const blocks = entries
             .slice(0, DEFAULT_MAX_ENTRIES)
-            .map((e) =>
+            .map((e) => [
               e.isDirectory ? `${e.name}/` : `${e.name}\t${humanBytes(e.size)}`
-            )
-            .join("\n");
-          return truncateOutput(
-            overflow
-              ? `${body}\n… listing stopped at ${DEFAULT_MAX_ENTRIES} entries; there are more. Use \`sb_exec\` to narrow it down.`
-              : body,
-            maxBytes
+            ]);
+          const { body, shown } = packBlocks(blocks, maxBytes);
+          const more = entries.length > shown;
+          return (
+            body +
+            (more
+              ? `\n… showed ${shown} entries; there are more. Continue with \`offset: ${from + shown}\`, or narrow with \`pattern\`.`
+              : "")
           );
         } catch (err) {
           return `error listing ${path}: ${String(err)}`;
+        }
+      }
+    }),
+
+    /**
+     * Search, without the container.
+     *
+     * The tool this replaces is `sb_exec("grep -rn …")`, and the case for a native
+     * one is not that shelling out fails — it is where the search runs. `fs.grep`
+     * reads the Durable Object's SQLite, so it answers while the container is
+     * being replaced or an install is still running, which is exactly the window
+     * the install gate leaves a subagent with nothing to do. It is also why this
+     * tool is not gated: see {@link awaitInstall}.
+     *
+     * Two lesser reasons that still matter. The query arrives as a value rather
+     * than through `shellQuote` and a shell that would re-parse it. And the result
+     * is bounded by a `limit` at the source instead of being middle-truncated
+     * afterwards, which for a match list means losing whole files silently.
+     */
+    sb_grep: tool({
+      description:
+        "Search file contents across the workspace. Returns matching lines grouped by file, each with its line number. " +
+        "The query is matched literally — set `regex` to interpret it as a regular expression. " +
+        "Pass `include` to limit which files are searched, e.g. '**/*.ts' — without it every file under `path` is read, which is slower and rarely what you meant. " +
+        "A cut result reports the `offset` that continues it. Use `context` to see the lines around a match. " +
+        "node_modules is not in the workspace — search it with sb_exec.",
+      inputSchema: z.object({
+        query: z.string().describe("Text to find, e.g. 'buildComputerTools'"),
+        path: z
+          .string()
+          .optional()
+          .describe(`Absolute file or directory to search (default: ${cwd})`),
+        include: z
+          .string()
+          .optional()
+          .describe(
+            "Glob relative to path limiting which files are searched, e.g. '**/*.ts'"
+          ),
+        regex: z
+          .boolean()
+          .optional()
+          .describe("Interpret query as a regular expression"),
+        ignoreCase: z.boolean().optional().describe("Ignore letter case"),
+        context: z
+          .number()
+          .int()
+          .min(0)
+          .max(3)
+          .optional()
+          .describe("Lines of surrounding context to include with each match"),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Matches to skip — use the offset a cut result reports")
+      }),
+      execute: async ({
+        query,
+        path,
+        include,
+        regex,
+        ignoreCase,
+        context,
+        offset
+      }) => {
+        const target = path ?? cwd;
+        if (isContainerOnly(target))
+          return containerOnlyNote(target, "sb_grep");
+        if (isGitInternal(target)) return gitInternalNote(target, "sb_grep");
+        const from = offset ?? 0;
+        try {
+          using ws = await workspace();
+          // Two rounds, not four: a `grep` retry re-reads and re-scans every file
+          // it already looked at, where the `find` retry in `sb_ls` only re-walks
+          // dirents. `.git` is also far less likely to flood a page here — its
+          // bulk is compressed objects, which a text query does not match.
+          const page = await collectVisible(
+            (at, limit) =>
+              ws.fs.grep(query, target, {
+                include,
+                regex,
+                ignoreCase,
+                context,
+                limit,
+                offset: at
+              }),
+            (m) => m.path,
+            DEFAULT_MAX_MATCHES,
+            from,
+            2
+          );
+          if (page.items.length === 0)
+            return page.crowded
+              ? `every match for ${JSON.stringify(query)} from offset ${from} is inside .git, which is not searched. Add \`include\` (e.g. '**/*.ts') to search the working tree instead.`
+              : `no matches for ${JSON.stringify(query)} in ${target}${
+                  include ? ` (${include})` : ""
+                }${from > 0 ? ` past offset ${from}` : ""}`;
+
+          const { body, shown, capped } = renderGrepMatches(
+            page.items.slice(0, DEFAULT_MAX_MATCHES),
+            maxBytes
+          );
+          return (
+            body +
+            listingNote(page, shown, "matches", "`include`") +
+            (capped
+              ? `\n(Some lines were shortened. Read one in full with \`sb_read\` and an \`offset\`.)`
+              : "")
+          );
+        } catch (err) {
+          return `error searching ${target}: ${String(err)}`;
         }
       }
     }),
@@ -988,6 +1497,7 @@ export function buildComputerTools(
       inputSchema: z.object({ path: z.string().describe("Absolute path") }),
       execute: async ({ path }) => {
         if (isContainerOnly(path)) return containerOnlyNote(path, "sb_exists");
+        if (isGitInternal(path)) return gitInternalNote(path, "sb_exists");
         try {
           using ws = await workspace();
           return (await pathExists(ws.fs, path))
@@ -1100,13 +1610,21 @@ export function computer(config: ComputerConfig): AgentPlugin {
       "You have a Linux container with a shell, a package manager and network access:",
       "- `sb_exec` runs any shell command — builds, tests, installs, git.",
       "- `sb_read` / `sb_write` / `sb_edit` work on files; `sb_edit` replaces an exact unique string and is the right tool for a small change.",
-      "- `sb_ls` and `sb_exists` inspect the filesystem.",
+      "- `sb_grep` searches file contents; `sb_ls` lists a directory, or finds files by glob with `pattern`; `sb_exists` checks a path.",
+      // The reason to prefer them is the one thing the model cannot infer from a
+      // tool description: these read the durable workspace directly, so they are
+      // the only tools that still answer while the container is unavailable.
+      "Search with `sb_grep` and `sb_ls` rather than running `grep` or `find` through `sb_exec`. They read the workspace directly, so they keep working while the container is restarting or dependencies are still installing, and they come back with line numbers and a bounded result instead of a wall of text.",
       "Command output is truncated from the middle when large, so run targeted commands and read specific files rather than printing everything.",
       // Both halves of this matter and they pull in opposite directions, which
       // is why they are stated together rather than left for the model to work
       // out from a confusing result.
       "The checkout is durable: it survives between tasks and is still there after the container restarts, so it may already contain work from an earlier task — check before assuming it is empty.",
-      "`node_modules` is the exception. It lives only in the container, so it is rebuilt whenever the container restarts, and the file tools cannot see inside it — use `sb_exec` to read a dependency's source."
+      "`node_modules` is the exception. It lives only in the container, so it is rebuilt whenever the container restarts, and the file tools cannot see inside it — use `sb_exec` to read a dependency's source.",
+      // Stated up front rather than left to a refusal, so the model does not spend
+      // a turn discovering it. The destination matters as much as the rule: a
+      // prohibition with nowhere to go gets worked around.
+      "`.git` is off limits to these tools, and searches and recursive listings skip it. It is git's internal state — reading it tells you less than the repository tools do, and writing it corrupts the checkout. Repository work goes through the repo tools (`repo_status`, `repo_diff`, `repo_commit`, `repo_push`), which the main agent holds; if a task needs git state beyond what you can see in the working tree, say so in your result rather than reaching into `.git` yourself."
     ].join("\n")
   });
 }
