@@ -122,6 +122,7 @@
     "fsevents": false,
     "sharp": false,
     "workerd": false,
-    "core-js-pure": false
+    "core-js-pure": false,
+    "@mongodb-js/zstd": false
   }
 }

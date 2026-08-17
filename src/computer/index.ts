@@ -215,7 +215,9 @@ function openWorkspace(
  * the choice is what this depends on.
  */
 export function withShell(command: string, shell: string | undefined): string {
-  return shell ? `${shell} -o pipefail -c ${shellQuote(command)} 2>&1` : command;
+  return shell
+    ? `${shell} -o pipefail -c ${shellQuote(command)} 2>&1`
+    : command;
 }
 
 export interface ComputerConfig {
@@ -561,7 +563,8 @@ export function needsDependencies(command: string): boolean {
     const head = words[i];
     // `/usr/local/bin/tsc` and `./bin/vitest` are the same program as `tsc` and
     // `vitest`; only the basename identifies it.
-    if (DEPENDENCY_TOOLS.has(head.slice(head.lastIndexOf("/") + 1))) return true;
+    if (DEPENDENCY_TOOLS.has(head.slice(head.lastIndexOf("/") + 1)))
+      return true;
   }
   return false;
 }
