@@ -9,7 +9,11 @@ import { computerExec } from "@loopingai/plugins/computer";
 repo({
   // Runs in the container. Never given a credential.
   exec: computerExec({ binding: env.WORKSPACE, workspaceName: () => name }),
-  // Runs wherever you keep your secret. Clone, fetch and push only.
+  // Yours to implement — this package exports the `RepoGit` type, not a
+  // backing for it, because the token has to live on your side of the
+  // boundary. Clone, fetch and push only; see "Where the token lives" below.
+  // `looping-starter`'s coder does it with isomorphic-git inside the Durable
+  // Object that owns the workspace filesystem.
   git: workspaceGit({ binding: env.WORKSPACE }),
   token: () => env.GITHUB_TOKEN
 });

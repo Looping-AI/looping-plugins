@@ -93,11 +93,17 @@ execution has no caller identity and cannot compute the name itself, so the pare
 `resolveRuntime` puts it on the runtime state and every tool family reads it back.
 
 `computerExec` exports the shell alone, for [`/repo`](../repo/) — so that plugin gets
-git on a real container without either importing the other. It does **not** merge
-`env` into what it runs, deliberately: those commands are another plugin's, they
-carry a forge token, and they pin the git environment they need. A host that wants
-one anyway composes it at the call site, where the merge is visible — see the
-export's own comment.
+git on a real container without either importing the other. What runs through it is
+`/repo`'s **unauthenticated** half: `status`, `diff`, `add`, `commit`, `checkout`. The
+three operations that authenticate — clone, fetch, push — never reach the container,
+so no command here carries a forge token.
+
+It does **not** merge `env` into what it runs, deliberately: those commands are
+another plugin's, and it pins the git environment they need. A host environment
+underneath would let through the keys it does not pin — `GIT_CONFIG_GLOBAL`,
+`GIT_EXEC_PATH` — which change what git reads and which binaries it runs. A host
+that wants one anyway composes it at the call site, where the merge is visible —
+see the export's own comment.
 
 ## wrangler.jsonc
 
