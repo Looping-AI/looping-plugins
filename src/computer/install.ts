@@ -63,37 +63,13 @@ export type InstallState =
       tail?: string;
     };
 
-/**
- * A `package.json#packageManager` pin, parsed.
- *
- * The major is kept because one manager's generations disagree about their own
- * flags — see the yarn rule in {@link DEFAULT_INSTALL_PLAN}. `undefined` when the
- * pin named something with no parseable version, which is not an error: the name
- * alone is still the strongest signal about which manager will run.
- */
-export interface PinnedManager {
-  /** `pnpm`, `yarn`, `npm`, … */
-  name: string;
-  /** Major version, if the pin carried one. */
-  major?: number;
-}
-
 export interface InstallRule {
   /** How `package.json#packageManager` spells this one, e.g. `pnpm`. */
   manager: string;
   /** Lockfiles that select it, checked in this order. */
   lockfiles: readonly string[];
-  /**
-   * What to run, from the checkout directory.
-   *
-   * A function when the command depends on which *generation* of the manager
-   * will run, which is a real problem for exactly one of them today. It is
-   * called with the repository's pin when that pin names this rule's manager,
-   * and with `undefined` otherwise — including when a lockfile selected the rule
-   * and nothing was pinned at all, which is the case worth thinking about,
-   * because that is when the version is whatever the runner defaults to.
-   */
-  command: string | ((pin?: PinnedManager) => string);
+  /** What to run, from the checkout directory. */
+  command: string;
 }
 
 export interface InstallPlan {
@@ -164,29 +140,29 @@ export const DEFAULT_INSTALL_PLAN: InstallPlan = {
       manager: "yarn",
       lockfiles: ["yarn.lock"],
       /**
-       * The one manager whose generations disagree, and the disagreement is
-       * silent rather than loud — which is why this is a function and the other
-       * three are strings.
+       * `--frozen-lockfile`, not `--immutable`, and the reason is measured
+       * rather than inherited from either manual.
        *
-       * Berry took `--immutable` and deprecated `--frozen-lockfile`. Yarn 1 has
-       * only the latter, and does **not** reject the former: measured against
-       * 1.22.22, `yarn install --immutable` on a lockfile that disagreed with
-       * `package.json` exited 0, printed "success Saved lockfile", and rewrote
-       * the lockfile — the exact opposite of what the flag was asked for. An
-       * install that quietly stops being reproducible is worse than one that
-       * fails, because nothing in the tool output says so.
+       * The two generations disagree: Berry took `--immutable` and deprecated
+       * `--frozen-lockfile`; Yarn 1 has only the latter. What decides it is that
+       * the two failure modes are not symmetric. Yarn 1 does **not** reject
+       * `--immutable` — against 1.22.22, on a lockfile that disagreed with
+       * `package.json`, it exited 0, printed "success Saved lockfile" and
+       * rewrote the lockfile, which is the exact opposite of the flag's purpose
+       * and says nothing in the tool output. Berry 4.1.0 given
+       * `--frozen-lockfile` warns `YN0050: deprecated` and then enforces
+       * immutability correctly.
        *
-       * No pin means Yarn 1, deliberately: corepack's own default `yarn` is
-       * 1.22.22, so an unpinned `yarn.lock` — a legacy repository, which is most
-       * of them — is exactly the case that was silently broken. A Berry
-       * repository with no pin would now get the deprecated spelling, which
-       * Berry still honours (it warns YN0050 and enforces immutability anyway),
-       * and Berry writes that pin itself, so the case is rare and recoverable.
+       * So one spelling is silently wrong on one generation and the other is
+       * loudly deprecated on the other. This one is the safe half of that trade,
+       * and it matters most where it is least visible: corepack's own default
+       * `yarn` is 1.22.22, so an unpinned `yarn.lock` — a legacy repository,
+       * which is most of them — ran Yarn 1 with a flag it ignored.
+       *
+       * Revisit if Yarn removes the alias, which would turn this into the loud
+       * kind of wrong on Berry.
        */
-      command: (pin) =>
-        pin?.major !== undefined && pin.major >= 2
-          ? "corepack yarn install --immutable"
-          : "corepack yarn install --frozen-lockfile"
+      command: "corepack yarn install --frozen-lockfile"
     },
     {
       manager: "bun",
@@ -203,36 +179,19 @@ export const DEFAULT_INSTALL_PLAN: InstallPlan = {
   timeoutMs: 20 * 60_000
 };
 
-/** `pnpm@9.1.0+sha512.…` → `{ name: "pnpm", major: 9 }`. */
-function pinnedManager(packageJson: string): PinnedManager | undefined {
+/** `pnpm@9.1.0+sha512.…` → `pnpm`. Undefined for anything unparseable. */
+function pinnedManager(packageJson: string): string | undefined {
   try {
     const pin = (JSON.parse(packageJson) as { packageManager?: unknown })
       .packageManager;
     if (typeof pin !== "string") return undefined;
-    const [rawName, rawVersion] = pin.split("@");
-    const name = rawName?.trim();
-    if (!name) return undefined;
-    // The major only, and only when it is really there. `yarn@stable` and
-    // `yarn@` are both things people write, and a rule reading `major` has to be
-    // able to tell "1" from "no idea".
-    const major = Number.parseInt(rawVersion ?? "", 10);
-    return Number.isNaN(major) ? { name } : { name, major };
+    const name = pin.split("@")[0]?.trim();
+    return name || undefined;
   } catch {
     // A `package.json` that does not parse is the repository's problem, not
     // ours, and the install will surface it far more legibly than we can.
     return undefined;
   }
-}
-
-/**
- * A rule's command, given the pin if the pin is about this rule's manager.
- *
- * The narrowing matters: a repository pinning `pnpm` whose `yarn.lock` selected
- * the yarn rule must not have pnpm's major handed to yarn's command.
- */
-function commandFor(rule: InstallRule, pin?: PinnedManager): string {
-  if (typeof rule.command === "string") return rule.command;
-  return rule.command(pin?.name === rule.manager ? pin : undefined);
 }
 
 /**
@@ -286,13 +245,13 @@ export async function resolveInstallCommand(
   // is the thing corepack will enforce anyway.
   const pinned = pinnedManager(await fs.readFile(at("package.json"), "utf8"));
   if (pinned) {
-    const rule = plan.rules.find((r) => r.manager === pinned.name);
+    const rule = plan.rules.find((r) => r.manager === pinned);
     if (rule) {
       const lockfile = await firstPresent(fs, dir, rule.lockfiles);
       return {
         kind: "run",
-        command: commandFor(rule, pinned),
-        reason: `package.json pins packageManager to ${pinned.name}`,
+        command: rule.command,
+        reason: `package.json pins packageManager to ${pinned}`,
         lockfiles: lockfile ? [lockfile] : []
       };
     }
@@ -306,7 +265,7 @@ export async function resolveInstallCommand(
     if (lockfile) {
       return {
         kind: "run",
-        command: commandFor(rule, pinned),
+        command: rule.command,
         reason: `found ${lockfile}`,
         lockfiles: [lockfile]
       };

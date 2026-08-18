@@ -88,7 +88,7 @@ describe("resolveInstallCommand", () => {
       [at("package-lock.json")]: "{}"
     });
     expect(result).toMatchObject({
-      command: "corepack yarn install --immutable",
+      command: "corepack yarn install --frozen-lockfile",
       reason: "package.json pins packageManager to yarn"
     });
   });
@@ -179,10 +179,12 @@ describe("resolveInstallCommand", () => {
 /**
  * Yarn, whose two generations disagree about their own flags.
  *
- * Measured rather than assumed, because the failure is silent: yarn 1.22.22 does
- * not reject `--immutable`, it ignores it — exit 0, "success Saved lockfile", and
- * a rewritten lockfile. An install that quietly stops being reproducible says
- * nothing in the tool output, so nothing downstream can notice.
+ * Measured rather than assumed, and the measurement is why one spelling is used
+ * for both. Yarn 1.22.22 does not reject `--immutable`, it ignores it — exit 0,
+ * "success Saved lockfile", and a rewritten lockfile. Berry 4.1.0 accepts
+ * `--frozen-lockfile`, warns that it is deprecated, and enforces immutability
+ * anyway. Silently wrong on one generation versus loudly deprecated on the
+ * other is not a close call.
  */
 describe("the yarn generations", () => {
   const yarnFiles = (packageJson: string) => ({
@@ -190,54 +192,19 @@ describe("the yarn generations", () => {
     [at("yarn.lock")]: "# yarn lockfile v1\n"
   });
 
-  it("uses the Berry flag when the pin is Berry", async () => {
-    expect(
-      await resolve(yarnFiles(JSON.stringify({ packageManager: "yarn@4.1.0" })))
-    ).toMatchObject({ command: "corepack yarn install --immutable" });
-  });
-
-  it("uses the Classic flag when the pin is Classic", async () => {
-    expect(
-      await resolve(
-        yarnFiles(JSON.stringify({ packageManager: "yarn@1.22.22" }))
-      )
-    ).toMatchObject({ command: "corepack yarn install --frozen-lockfile" });
-  });
-
   /**
-   * The case that was actually broken, and the reason the default leans Classic:
-   * corepack's own default `yarn` is 1.22.22, so an unpinned `yarn.lock` — a
-   * legacy repository, which is most of them — ran Yarn 1 with a flag it ignored.
+   * The unpinned case is the one that was broken, and it is invisible from the
+   * repository alone: corepack's own default `yarn` is 1.22.22, so a legacy
+   * checkout — which is most of them — ran Yarn 1 with a flag it ignored.
    */
-  it("uses the Classic flag when nothing is pinned", async () => {
-    expect(await resolve(yarnFiles("{}"))).toMatchObject({
-      command: "corepack yarn install --frozen-lockfile",
-      reason: "found yarn.lock"
+  it.each([
+    ["a Berry pin", JSON.stringify({ packageManager: "yarn@4.1.0" })],
+    ["a Classic pin", JSON.stringify({ packageManager: "yarn@1.22.22" })],
+    ["no pin at all", "{}"]
+  ])("asks for a frozen lockfile with %s", async (_case, packageJson) => {
+    expect(await resolve(yarnFiles(packageJson))).toMatchObject({
+      command: "corepack yarn install --frozen-lockfile"
     });
-  });
-
-  it("uses the Classic flag when the pin carries no readable version", async () => {
-    expect(
-      await resolve(
-        yarnFiles(JSON.stringify({ packageManager: "yarn@stable" }))
-      )
-    ).toMatchObject({ command: "corepack yarn install --frozen-lockfile" });
-  });
-
-  /**
-   * The narrowing in `commandFor`, reached the only way it can be: a pin naming
-   * a manager no rule claims falls through to the lockfiles, and `yarn.lock`
-   * then selects yarn. That other manager's major must not answer yarn's
-   * question — without the narrowing, `9 >= 2` picks Berry's flag for a tree
-   * whose lockfile is Classic. (A pin naming a manager that *does* have a rule
-   * never gets here: the pin beats the lockfiles outright.)
-   */
-  it("does not hand one manager's version to another's rule", async () => {
-    expect(
-      await resolve(
-        yarnFiles(JSON.stringify({ packageManager: "turbo@9.0.0" }))
-      )
-    ).toMatchObject({ command: "corepack yarn install --frozen-lockfile" });
   });
 });
 
