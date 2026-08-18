@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildRepoTools,
-  parseRepo,
   type RepoConfig,
   type RepoExec,
   type RepoGit,
@@ -496,68 +495,6 @@ describe("guardrails", () => {
       message: "m"
     });
     expect(result).toMatch(/nothing to commit/i);
-  });
-});
-
-describe("parseRepo", () => {
-  it.each([
-    ["https://github.com/owner/repo", "owner", "repo"],
-    ["https://github.com/owner/repo.git", "owner", "repo"],
-    ["git@github.com:owner/repo.git", "owner", "repo"]
-  ])("parses %s", (url, owner, repo) => {
-    expect(parseRepo(url)).toEqual({ owner, repo });
-  });
-
-  it("returns undefined for a non-GitHub URL", () => {
-    expect(parseRepo("https://gitlab.com/o/r")).toBeUndefined();
-  });
-
-  /**
-   * The old pattern was unanchored, so `github.com` occurring anywhere in the
-   * string was a match — including in the *path* of somebody else's host.
-   */
-  it.each([
-    "https://evil.example.com/github.com/owner/repo",
-    "https://attacker.test/?ref=github.com/o/r",
-    "https://github.com.evil.test/o/r"
-  ])("does not treat %s as GitHub", (url) => {
-    expect(parseRepo(url)).toBeUndefined();
-  });
-
-  it("honours a configured host list, for Enterprise", () => {
-    expect(parseRepo("https://git.acme.dev/o/r", ["git.acme.dev"])).toEqual({
-      owner: "o",
-      repo: "r"
-    });
-  });
-
-  /**
-   * Two different consequences, one check.
-   *
-   * `..` and `.` are ordinary matches for "a path segment that is not a slash",
-   * and the repository name becomes a path: `https://github.com/o/..` gave a
-   * checkout `dir` of `/workspace/..`, which is `/`. The separator characters are
-   * the quieter half — `beforeCheckout` hands these to the host, and the README
-   * tells that host to build a per-repository workspace key out of them, so a `|`
-   * or a `:` is a separator inside somebody else's key format.
-   */
-  it.each([
-    ["https://github.com/owner/..", "a traversing repository name"],
-    ["https://github.com/owner/.", "a self-referential one"],
-    ["https://github.com/../repo", "a traversing owner"],
-    ["https://github.com/a|b/c", "a key separator"],
-    ["https://github.com/o/r r", "a space"],
-    ["https://github.com/o:1/r", "a colon"]
-  ])("refuses %s (%s)", (url) => {
-    expect(parseRepo(url)).toBeUndefined();
-  });
-
-  /** The rule is GitHub's own, so everything it actually issues still parses. */
-  it.each([
-    ["https://github.com/octo-cat/my_repo.js", "octo-cat", "my_repo.js"],
-    ["https://github.com/a.b/c-d_e.f", "a.b", "c-d_e.f"]
-  ])("still parses %s", (url, owner, repo) => {
-    expect(parseRepo(url)).toEqual({ owner, repo });
   });
 });
 

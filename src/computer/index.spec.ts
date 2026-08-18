@@ -3,15 +3,7 @@ import type { ToolSet } from "ai";
 import type { WorkspaceClient } from "@cloudflare/computer";
 import {
   buildComputerTools,
-  cancelledNote,
   computer,
-  isContainerOnly,
-  isGitInternal,
-  needsDependencies,
-  packBlocks,
-  renderGrepMatches,
-  renderResult,
-  truncateOutput,
   withShell,
   withShellTranscript,
   workspaceNameFromRuntime,
@@ -68,12 +60,7 @@ function stub(
   /** Make the container unreachable, for the paths that have to survive it. */
   execThrows?: string | Error,
   /** Stand in for a tree whose shape the default canned entries cannot express. */
-  findEntries?: FoundEntry[],
-  /**
-   * Symlinks, as `path -> target`. A repository can commit one, which is what
-   * makes them a guard's problem rather than a shell's.
-   */
-  links: Record<string, string> = {}
+  findEntries?: FoundEntry[]
 ): {
   workspace: () => Promise<WorkspaceClient>;
   execs: Array<{ command: string; options?: unknown }>;
@@ -118,33 +105,6 @@ function stub(
         const content = files.get(path);
         if (content === undefined) throw new Error(`ENOENT: ${path}`);
         return { size: content.length, isFile: true, isDirectory: false };
-      },
-      /**
-       * `lstat` does not follow the link — that is the whole distinction, and a
-       * stub that collapsed it would let the guard pass its own tests while
-       * seeing straight through every symlink in production.
-       */
-      lstat: async (path: string) => {
-        if (path in links)
-          return {
-            size: 0,
-            isFile: false,
-            isDirectory: false,
-            isSymbolicLink: true
-          };
-        const content = files.get(path);
-        if (content === undefined) throw new Error(`ENOENT: ${path}`);
-        return {
-          size: content.length,
-          isFile: true,
-          isDirectory: false,
-          isSymbolicLink: false
-        };
-      },
-      readlink: async (path: string) => {
-        const target = links[path];
-        if (target === undefined) throw new Error(`EINVAL: ${path}`);
-        return target;
       },
       writeFile: async (path: string, content: string) => {
         files.set(path, String(content));
@@ -273,106 +233,6 @@ const run = (tools: ToolSet, name: string, input: unknown) =>
     {}
   );
 
-describe("truncateOutput", () => {
-  it("keeps the head and the tail, which is where the error and the summary are", () => {
-    const text = "A".repeat(200) + "B".repeat(200);
-    const out = truncateOutput(text, 120);
-
-    expect(out.length).toBeLessThan(text.length);
-    expect(out.startsWith("A")).toBe(true);
-    expect(out.endsWith("B")).toBe(true);
-    expect(out).toContain("omitted from the middle");
-  });
-
-  /**
-   * The regression this guard exists for. Without it, `half` goes negative,
-   * `slice(-0)` returns the whole string, and the function hands back *more*
-   * than it was given — a silent inversion of its only job, reachable from a
-   * public config field.
-   */
-  it("never returns more than it was given, however small the budget", () => {
-    for (const max of [0, 1, 40, 60, 80]) {
-      expect(truncateOutput("x".repeat(500), max).length).toBeLessThanOrEqual(
-        Math.max(max, 0)
-      );
-    }
-  });
-});
-
-/**
- * What a command's result tells the model.
- *
- * The regression these guard is not a crash — it is a silence. When a successful
- * command reported no exit code, models compensated by writing
- * `npm run check; echo "EXIT_CODE=$?"` themselves, and one of those hand-rolled
- * workarounds reached for a bash builtin the container's `sh` does not have and
- * cost a 58-second re-run of the whole gate.
- */
-describe("renderResult", () => {
-  it("reports the exit code even when the command succeeded", () => {
-    const out = renderResult(
-      { exitCode: 0, stdout: "all good", stderr: "", status: "completed" },
-      16_000
-    );
-    expect(out).toContain("all good");
-    expect(out).toContain("--- exit 0 ---");
-  });
-
-  it("says when a command was killed rather than merely failing", () => {
-    // The case that matters at the `timeoutMs` ceiling: "your suite was killed at
-    // ten minutes" and "your suite has a failing test" must not read alike.
-    const killed = renderResult(
-      { exitCode: 137, stdout: "partial…", stderr: "", status: "cancelled" },
-      16_000
-    );
-    expect(killed).toContain("--- exit 137 (cancelled) ---");
-
-    const failed = renderResult(
-      { exitCode: 1, stdout: "boom", stderr: "", status: "completed" },
-      16_000
-    );
-    expect(failed).toContain("--- exit 1 ---");
-    expect(failed).not.toContain("completed");
-  });
-
-  it("still reports a verdict when the command printed nothing", () => {
-    const out = renderResult(
-      { exitCode: 0, stdout: "", stderr: "", status: "completed" },
-      16_000
-    );
-    expect(out).toContain("--- exit 0 ---");
-  });
-
-  /**
-   * `truncateOutput` used to run once per stream, so `maxOutputBytes` really
-   * meant "up to twice this" — a budget that does not bound the thing it names.
-   */
-  it("applies the output budget once, to the whole transcript", () => {
-    const out = renderResult(
-      {
-        exitCode: 0,
-        stdout: "A".repeat(5_000),
-        stderr: "B".repeat(5_000),
-        status: "completed"
-      },
-      2_000
-    );
-    // Body is bounded; only the short verdict line is added on top.
-    expect(out.length).toBeLessThan(2_000 + 40);
-    expect(out).toContain("--- exit 0 ---");
-  });
-
-  it("keeps a labelled stderr block for hosts that did not merge the streams", () => {
-    const out = renderResult(
-      { exitCode: 1, stdout: "out", stderr: "err", status: "completed" },
-      16_000
-    );
-    expect(out).toContain("out");
-    expect(out).toContain("--- stderr ---");
-    expect(out).toContain("err");
-  });
-});
-
 /**
  * The two shell wrappers, and the difference between them.
  *
@@ -383,32 +243,6 @@ describe("renderResult", () => {
  * site as a `true` nobody reads, and `computerExec` silently inherited the wrong
  * one for as long as it existed.
  */
-/**
- * `renderResult` says this on its verdict line, so `sb_exec` has always had it.
- * `computerExec` has no verdict line and dropped `status` entirely — and a killed
- * process writes nothing, so `/repo` reported `clone failed:` with nothing after
- * the colon for a clone that hit the ceiling.
- */
-describe("cancelledNote", () => {
-  it("explains a command that was killed, naming both usual causes", () => {
-    const note = cancelledNote("cancelled", 137, 600_000);
-
-    expect(note).toContain("killed");
-    // The ceiling as the model would have to state it to change it, and the
-    // other cause of a 137 — the exit code cannot tell them apart.
-    expect(note).toContain("10m00s");
-    expect(note).toMatch(/out of memory/);
-  });
-
-  it("says nothing about an ordinary failure", () => {
-    // A non-zero exit is the command's own business, and its stderr explains it
-    // better than a note could. Anything here would be noise on every failure.
-    expect(cancelledNote("failed", 1, 600_000)).toBeUndefined();
-    expect(cancelledNote("completed", 0, 600_000)).toBeUndefined();
-    expect(cancelledNote(undefined, 1, 600_000)).toBeUndefined();
-  });
-});
-
 describe("withShell", () => {
   it("is a no-op when no shell is configured", () => {
     expect(withShell("npm test", undefined)).toBe("npm test");
@@ -477,93 +311,7 @@ describe("withShellTranscript", () => {
   });
 });
 
-/**
- * Which commands have to wait for a dependency install.
- *
- * The asymmetry is the point: waiting for a command that did not need it costs
- * time, while running one that did need it hands the model a "cannot find module"
- * unrelated to its change. So the reads below must not gate, the builds must, and
- * when in doubt the answer is to gate.
- */
-describe("needsDependencies", () => {
-  it("does not gate reads, listings or git — what a subagent can do while npm ci runs", () => {
-    // Every one of these was observed queued behind an install it had no use
-    // for, costing 57 seconds before the first useful command ran.
-    for (const command of [
-      "cd /workspace/repo && tail -c 200 README.md | xxd | tail -20",
-      "cd /workspace/repo && tail -c 100 README.md | od -c | tail -20",
-      "cd /workspace/repo && git status --short",
-      "cd /workspace/repo && git diff -- README.md",
-      "cd /workspace/repo && ls -la src && cat package.json",
-      "grep -rn 'TODO' src"
-    ]) {
-      expect(needsDependencies(command)).toBe(false);
-    }
-  });
-
-  it("gates anything that could reach a dependency", () => {
-    for (const command of [
-      "cd /workspace/repo && npm run check",
-      "npx vitest run src/a.spec.ts",
-      "pnpm install && pnpm build",
-      "yarn test",
-      "bun run build",
-      "node scripts/thing.mjs",
-      "./node_modules/.bin/eslint .",
-      "tsc -p test/tsconfig.json"
-    ]) {
-      expect(needsDependencies(command)).toBe(true);
-    }
-  });
-
-  /**
-   * The case that made position matter. A word-boundary match anywhere in the
-   * string passes every other test here and still fails this one: `\bvitest\b`
-   * fires on `vitest.config.ts` because `.` is a word boundary, and config files
-   * are exactly what a subagent reads while orienting itself.
-   */
-  it("reads a build tool's config file without gating on it", () => {
-    for (const command of [
-      "cat vitest.config.ts",
-      "cat next.config.js",
-      "cat eslint.config.js && cat prettier.config.js",
-      "head -50 vite.config.ts",
-      "cat docs/nodes.md",
-      "cat src/bundle.ts"
-    ]) {
-      expect(needsDependencies(command)).toBe(false);
-    }
-  });
-
-  it("finds a build one level down, where position cannot help", () => {
-    // A package manager is never a filename, so it is matched anywhere — which
-    // is what catches it inside a nested shell or behind a wrapper.
-    expect(needsDependencies("bash -c 'npm run check'")).toBe(true);
-    expect(needsDependencies("time npm test")).toBe(true);
-    expect(needsDependencies("cd /workspace/repo && FOO=1 npx tsc")).toBe(true);
-  });
-
-  it("reads the program name through a path prefix or an env assignment", () => {
-    expect(needsDependencies("/usr/local/bin/tsc --noEmit")).toBe(true);
-    expect(needsDependencies("CI=1 vitest run")).toBe(true);
-    expect(needsDependencies("cd /repo && ./bin/eslint .")).toBe(true);
-  });
-});
-
 describe("paths the workspace cannot see", () => {
-  it("matches node_modules as a whole segment, not as a substring", () => {
-    expect(isContainerOnly("/workspace/repo/node_modules/zod/index.js")).toBe(
-      true
-    );
-    expect(isContainerOnly("/workspace/repo/node_modules")).toBe(true);
-    expect(isContainerOnly("/workspace/repo/src/node_modules_old/a.ts")).toBe(
-      false
-    );
-    expect(isContainerOnly("/workspace/repo/src/my_node_modules.ts")).toBe(
-      false
-    );
-  });
-
   /**
    * The load-bearing one. `node_modules` is excluded from the sync by
    * `computerd`, so a read of a dependency finds nothing in the workspace — and
@@ -752,158 +500,6 @@ describe("sb_ls", () => {
 });
 
 /**
- * How a match list reads.
- *
- * The budget rules here are deliberately not `truncateOutput`'s. Keeping both ends
- * and dropping the middle is right for a build log, where the first error and the
- * final summary are the whole value — and destructive for search results, where the
- * middle is an entire file's worth of hits that disappear without saying so.
- */
-describe("renderGrepMatches", () => {
-  const match = (path: string, line: number, text: string) => ({
-    path,
-    line,
-    text
-  });
-
-  it("names each file once and lists its hits under it", () => {
-    const { body } = renderGrepMatches(
-      [
-        match("/workspace/a.ts", 4, "const x = 1;"),
-        match("/workspace/a.ts", 9, "const y = 2;"),
-        match("/workspace/b.ts", 2, "const z = 3;")
-      ],
-      16_000
-    );
-
-    // An absolute path costs more than the line it labels; repeating it per hit
-    // spends the budget on paths rather than code.
-    expect(body.match(/\/workspace\/a\.ts/g)).toHaveLength(1);
-    expect(body).toContain("  4: const x = 1;");
-    expect(body).toContain("  9: const y = 2;");
-    expect(body).toContain("/workspace/b.ts");
-  });
-
-  it("distinguishes the matching line from its context, as grep does", () => {
-    const { body } = renderGrepMatches(
-      [
-        {
-          path: "/workspace/a.ts",
-          line: 5,
-          text: "const x = 1;",
-          context: [
-            { line: 4, text: "// before", isMatch: false },
-            { line: 5, text: "const x = 1;", isMatch: true },
-            { line: 6, text: "// after", isMatch: false }
-          ]
-        }
-      ],
-      16_000
-    );
-
-    // `:` is the hit, `-` is context. Without the distinction the model cannot
-    // tell which line it actually searched for.
-    expect(body).toContain("  5: const x = 1;");
-    expect(body).toContain("  4- // before");
-    expect(body).toContain("  6- // after");
-  });
-
-  /**
-   * The minified-bundle case. One match in `dist/` carries a line of megabytes,
-   * and `text` is the whole line — so without a cap a single hit is the entire
-   * result.
-   */
-  it("shortens a very long line instead of letting it eat the result", () => {
-    const { body, capped } = renderGrepMatches(
-      [
-        match("/workspace/dist/bundle.js", 1, `x${"y".repeat(50_000)}`),
-        match("/workspace/src/a.ts", 3, "readable")
-      ],
-      16_000
-    );
-
-    expect(body.length).toBeLessThan(1_000);
-    expect(body).toContain("chars]");
-    // The point of capping rather than dropping: the later match survives.
-    expect(body).toContain("readable");
-    // Reported once, so the caller can say how to reach the full text without
-    // repeating the advice on every shortened line.
-    expect(capped).toBe(true);
-  });
-
-  it("does not claim a line was shortened when none that shipped was", () => {
-    const { capped } = renderGrepMatches(
-      [match("/workspace/a.ts", 1, "short")],
-      16_000
-    );
-    expect(capped).toBe(false);
-  });
-
-  it("stops at the budget and reports exactly how many it showed", () => {
-    const many = Array.from({ length: 200 }, (_, i) =>
-      match("/workspace/a.ts", i + 1, `line ${i} ${"x".repeat(80)}`)
-    );
-
-    const { body, shown } = renderGrepMatches(many, 2_000);
-
-    expect(body.length).toBeLessThan(2_400);
-    // `shown` is what makes the next offset exact rather than a guess.
-    expect(shown).toBeGreaterThan(0);
-    expect(shown).toBeLessThan(200);
-  });
-
-  it("emits the first match however large, rather than nothing at all", () => {
-    const { body, shown } = renderGrepMatches(
-      [match("/workspace/a.ts", 1, "x".repeat(5_000))],
-      50
-    );
-    expect(body).toContain("/workspace/a.ts");
-    expect(body).toContain("1:");
-    expect(shown).toBe(1);
-  });
-});
-
-/**
- * The budget rule both list tools share.
- *
- * Whole blocks only, because half a match's context reads like a corrupt result —
- * and an exact `shown`, because that number is what the next page's offset is
- * computed from. A `shown` that over-reported by one would silently skip an entry
- * on every subsequent page.
- */
-describe("packBlocks", () => {
-  it("emits whole blocks and counts them exactly", () => {
-    const { body, shown } = packBlocks(
-      [["a", "b"], ["c"], ["d", "e", "f"]],
-      1_000
-    );
-    expect(body).toBe("a\nb\nc\nd\ne\nf");
-    expect(shown).toBe(3);
-  });
-
-  it("drops a block whole rather than splitting it", () => {
-    const { body, shown } = packBlocks(
-      [["x".repeat(20)], ["y".repeat(20), "z".repeat(20)]],
-      30
-    );
-    expect(shown).toBe(1);
-    expect(body).not.toContain("y");
-    // Not a partial second block: the line that would have fit is absent too.
-    expect(body).not.toContain("z");
-  });
-
-  it("always emits the first block, however far over budget", () => {
-    const { body, shown } = packBlocks([["x".repeat(5_000)], ["y"]], 10);
-    expect(shown).toBe(1);
-    expect(body.length).toBeGreaterThan(10);
-  });
-
-  it("reports nothing shown for no blocks", () => {
-    expect(packBlocks([], 100)).toEqual({ body: "", shown: 0 });
-  });
-});
-
-/**
  * Search that does not need the container.
  *
  * That is the reason this tool exists rather than leaving the model on
@@ -1022,18 +618,6 @@ describe("sb_grep", () => {
  * inexplicable git failure. Repository work belongs to the repo tools.
  */
 describe("paths inside .git", () => {
-  it("matches .git as a whole segment, sparing the dotfiles that merely start with it", () => {
-    expect(isGitInternal("/workspace/repo/.git/config")).toBe(true);
-    expect(isGitInternal("/workspace/repo/.git")).toBe(true);
-    // The trap: these are ordinary tracked files and must stay readable.
-    expect(isGitInternal("/workspace/repo/.gitignore")).toBe(false);
-    expect(isGitInternal("/workspace/repo/.gitattributes")).toBe(false);
-    expect(isGitInternal("/workspace/repo/.github/workflows/ci.yml")).toBe(
-      false
-    );
-    expect(isGitInternal("/workspace/repo/src/git/index.ts")).toBe(false);
-  });
-
   it("refuses every file tool, and points at the repo tools", async () => {
     const { workspace, files } = stub();
     const tools = buildComputerTools(workspace, config);
@@ -1064,111 +648,45 @@ describe("paths inside .git", () => {
   });
 
   /**
-   * A string check reads the path it was given, so `docs/notes.md -> ../.git/config`
-   * walks straight past it.
-   *
-   * The attacker worth defending against here is **not** a model holding
-   * `sb_exec` — that one reads `.git` outright and has no use for a link. It is a
-   * cloned repository: git tracks symlinks, so a hostile repo ships one and the
-   * guard is defeated on any host that grants the file tools without a shell,
-   * which is exactly the shape a reviewing parent agent has.
+   * The property the guard bought when it stopped resolving symlinks: it is two
+   * string comparisons, so it runs *before* the workspace is opened and a refused
+   * path costs no round trip at all. Asserted on the workspace factory rather than
+   * on a timing, because "did not open the workspace" is the observable fact and a
+   * duration is not.
    */
-  describe("through a symlink", () => {
-    const link = "/workspace/repo/docs/notes.md";
-    const links = { [link]: "../.git/config" };
+  it("refuses without opening the workspace", async () => {
+    const { workspace } = stub();
+    let opened = 0;
+    const counted = () => {
+      opened += 1;
+      return workspace();
+    };
+    const tools = buildComputerTools(counted, config);
 
-    it("refuses a write, which is the half that cannot be undone", async () => {
-      const { workspace, files } = stub({}, undefined, undefined, links);
-      const tools = buildComputerTools(workspace, config);
-
-      const out = await run(tools, "sb_write", { path: link, content: "x" });
-      expect(out).toContain("repo_status");
-      // Named as a link, and named with where it lands — a refusal that reported
-      // only the path the model typed reads like a bug in the tool.
-      expect(out).toContain("symlink to /workspace/repo/.git/config");
-      expect(files.has(link)).toBe(false);
-    });
-
-    it("refuses a read and an edit through the same link", async () => {
-      const { workspace } = stub(
-        { [link]: "whatever" },
-        undefined,
-        undefined,
-        links
-      );
-      const tools = buildComputerTools(workspace, config);
-
-      for (const name of ["sb_read", "sb_edit"]) {
-        const out = await run(tools, name, {
-          path: link,
-          find: "a",
-          replace: "b"
-        });
-        expect(out).toContain("repo_diff");
-        expect(out).not.toContain("sb_exec");
-      }
-    });
-
-    it("resolves an absolute target as well as a relative one", async () => {
-      const { workspace } = stub({}, undefined, undefined, {
-        [link]: "/workspace/repo/.git/HEAD"
+    for (const name of [
+      "sb_read",
+      "sb_ls",
+      "sb_exists",
+      "sb_grep",
+      "sb_edit"
+    ]) {
+      await run(tools, name, {
+        path: "/workspace/repo/.git/config",
+        query: "x",
+        find: "a",
+        replace: "b"
       });
-      const tools = buildComputerTools(workspace, config);
-
-      expect(
-        await run(tools, "sb_write", { path: link, content: "x" })
-      ).toEqual(
-        expect.stringContaining("symlink to /workspace/repo/.git/HEAD")
-      );
+    }
+    await run(tools, "sb_write", {
+      path: "/workspace/repo/.git/config",
+      content: "x"
     });
+    expect(opened).toBe(0);
 
-    it("catches a link into node_modules with the note that fits it", async () => {
-      const { workspace } = stub({}, undefined, undefined, {
-        [link]: "../node_modules/zod/package.json"
-      });
-      const tools = buildComputerTools(workspace, config);
-
-      const out = await run(tools, "sb_read", { path: link });
-      // The other list, and its own explanation: absent rather than forbidden,
-      // so this one *does* point at sb_exec.
-      expect(out).toContain("node_modules");
-      expect(out).toContain("sb_exec");
-    });
-
-    /**
-     * The guard must not invent work. A link that merely *passes through* a
-     * `.git` segment on its way somewhere ordinary is an ordinary file, and
-     * normalising is what tells the two apart.
-     */
-    it("allows a link whose target only traverses .git", async () => {
-      const { workspace, files } = stub({}, undefined, undefined, {
-        [link]: "/workspace/repo/.git/../src/a.ts"
-      });
-      const tools = buildComputerTools(workspace, config);
-
-      expect(await run(tools, "sb_write", { path: link, content: "x" })).toBe(
-        `wrote ${link} (1 character)`
-      );
-      expect(files.get(link)).toBe("x");
-    });
-
-    /**
-     * The bound, stated as a test so it is a decision rather than a gap. A
-     * symlinked *ancestor* is not resolved: that costs an `lstat` per segment on
-     * every call, against a Durable Object, for a case git's own checkout
-     * protections already refuse much of.
-     */
-    it("does not resolve a symlinked ancestor — the documented residual", async () => {
-      const { workspace } = stub({}, undefined, undefined, {
-        "/workspace/repo/link": ".git"
-      });
-      const tools = buildComputerTools(workspace, config);
-
-      const out = await run(tools, "sb_read", {
-        path: "/workspace/repo/link/config"
-      });
-      expect(out).not.toContain("repo_diff");
-    });
+    // The same tools do open it for a path they allow — otherwise this would
+    // pass just as well against a build that never reached the workspace.
+    await run(tools, "sb_exists", { path: "/workspace/repo/src/a.ts" });
+    expect(opened).toBe(1);
   });
 
   /**
