@@ -147,6 +147,37 @@ describe("refreshCheckout", () => {
     expect(ran.some((c) => c.startsWith("reset"))).toBe(false);
   });
 
+  /**
+   * The refusal has to be about the repository, not about the spelling.
+   *
+   * `repo_clone` derives `dir` from the parsed repository name, so every one of
+   * these lands in the same directory — and git records whichever spelling it
+   * was handed. Compared literally, a second clone written with a `.git` suffix
+   * is refused as "another repository", and no tool in the plugin can clear it.
+   */
+  it.each([`${url}.git`, `${url}/`, `${url}.git/`, `  ${url}  `])(
+    "recognises its own checkout when the origin reads %s",
+    async (recorded) => {
+      const { plain, ran } = runner({
+        "remote get-url": ok(`${recorded}\n`),
+        "status --porcelain": ok(""),
+        "symbolic-ref": ok("origin/main\n")
+      });
+
+      const out = await refreshCheckout({
+        dir: "/w/r",
+        url,
+        branch: undefined,
+        plain,
+        fetchOrigin
+      });
+
+      expect(out.message).not.toMatch(/another repository/i);
+      expect(out.branch).toBe("main");
+      expect(ran.some((c) => c.startsWith("reset --hard"))).toBe(true);
+    }
+  );
+
   it("refuses a directory holding a different repository", async () => {
     const { plain, ran } = runner({
       "remote get-url": ok("https://github.com/someone/else\n")
@@ -167,7 +198,7 @@ describe("refreshCheckout", () => {
 
   /**
    * A question that went unanswered is not the answer "some other repository".
-   * Empty stdout from a failed `remote get-url` used to produce exactly that
+   * Empty stdout from a failed `remote get-url` reads as exactly that
    * sentence, sending the model to look for a checkout nobody had mentioned.
    */
   it("says the remote could not be read rather than naming a phantom repository", async () => {

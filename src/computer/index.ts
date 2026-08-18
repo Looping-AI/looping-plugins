@@ -31,30 +31,23 @@ import {
 /**
  * `@loopingai/plugins/computer` — a Linux container whose filesystem outlives it.
  *
- * The successor to `@loopingai/plugins/sandbox`, and the difference is where the
- * files live. A `@cloudflare/sandbox` container held its work on a disk that died
- * with the container; keeping anything meant snapshotting to R2, which needed S3
- * credentials a Workers binding cannot supply and failed on every task in
- * production. Here the filesystem **is** a Durable Object's SQLite, mounted into
- * the container over FUSE by `computerd`. Commands see a normal `/workspace`; the
- * Worker reads the same tree over RPC; and when the container is replaced the
- * tree is pushed back into the new one. That last part is measured, not hoped
- * for: a deploy destroyed a live container and the checkout was restored from the
- * object.
+ * The filesystem **is** a Durable Object's SQLite, mounted into the container
+ * over FUSE by `computerd`. Commands see a normal `/workspace`; the Worker reads
+ * the same tree over RPC; and when the container is replaced the tree is pushed
+ * back into the new one.
  *
- * The distinction against `@loopingai/plugins/workspace` still holds — that one
- * is a virtual filesystem with no processes and nothing to run. Install exactly
- * one filesystem plugin. An agent holding two has no way for the model to know
- * which one a path refers to.
+ * Not to be confused with `@loopingai/plugins/workspace`, which is a virtual
+ * filesystem with no processes and nothing to run. Install exactly one
+ * filesystem plugin — an agent holding two gives the model no way to know which
+ * one a path refers to.
  *
  * ## `node_modules` is **not** in the workspace
  *
- * The one thing to internalise before reading further. `computerd` excludes
- * `node_modules` from the sync by design, and the exclusion is right: pushing a
- * real one (429 MB, 22,470 files) into the object reproducibly exceeded the
- * Durable Object's 128 MB isolate memory limit at ~99.7%, leaving the tree
- * silently short — and the reconciliation that followed propagated the shortfall
- * back into the container.
+ * The one thing to internalise before reading further. `computerd` excludes it
+ * from the sync, and the exclusion is right: pushing a real one (429 MB, 22,470
+ * files) into the object exceeds the Durable Object's 128 MB isolate memory
+ * limit, leaving the tree silently short — and the reconciliation that follows
+ * propagates the shortfall back into the container.
  *
  * So dependencies live in the container and die with it, while source and `.git`
  * are durable. Two consequences run through everything below: an install has to
@@ -106,11 +99,11 @@ export { needsDependencies } from "./gate.js";
 /**
  * This plugin's tool-family name, as a recipe's `toolFamilies` lists it.
  *
- * Deliberately still `"sandbox"`. It is a *substrate* that changed, not a
- * capability, and the string appears in recipes, souls and allowlists that have
- * nothing to do with which container SDK is underneath. Renaming it would have
- * `validateRecipe` silently drop the family from every recipe that still says
- * `sandbox` — a subagent with no tools and no error explaining why.
+ * `"sandbox"` names the capability — a shell and a filesystem — rather than the
+ * package providing it, and it appears in recipes, souls and allowlists that
+ * have nothing to do with either. Renaming it would have `validateRecipe`
+ * silently drop the family from every recipe that still says `sandbox`: a
+ * subagent with no tools and no error explaining why.
  */
 export const SANDBOX_FAMILY = "sandbox";
 
@@ -161,13 +154,11 @@ const DEFAULT_MAX_OUTPUT_CHARS = 16_000;
  * How many directory entries one `sb_ls` returns.
  *
  * A bound on the *listing*, not on the rendered text — `maxOutputChars` still
- * applies on top. The two used to be the same budget applied in the wrong order:
- * `readdir` returned every entry, the isolate held all of them, and the byte
- * ceiling then discarded the tail. A real `node_modules` is 22,470 files, and a
- * misbehaving build is exactly when someone lists one.
- *
- * `@cloudflare/computer` 0.2 gave `readdir` a `limit`, so the bound is applied
- * where the entries are read instead of after they have all arrived.
+ * applies on top, and the order matters. Bounding only the text means `readdir`
+ * returns every entry and the isolate holds all of them before the ceiling
+ * discards the tail; a real `node_modules` is 22,470 files, and a misbehaving
+ * build is exactly when someone lists one. `readdir` takes a `limit`, so the
+ * bound is applied where the entries are read.
  */
 const DEFAULT_MAX_ENTRIES = 1000;
 
@@ -246,29 +237,25 @@ function openWorkspace(
  *
  * One quoted argument, not string concatenation: the command is model-authored
  * and routinely contains quotes of its own (`git commit -m "…"`), so anything
- * less than `shellQuote` would re-parse the model's quoting and mangle it.
+ * less than `shellQuote` re-parses the model's quoting and mangles it.
  *
  * ## Why `-o pipefail`
  *
- * Without it, a pipeline's exit status is its **last** stage's. So
- * `npm run check | tail -100` reported `exit 0` for a gate that had failed
- * outright — observed in production, on a run where `npm run check` "passed" in
- * 1.3 seconds because `node_modules` was missing and the failure was swallowed by
- * `tail`. A tool that reports success for a failed build is worse than one that
- * reports nothing, and models pipe into `tail` constantly.
+ * Without it a pipeline's exit status is its **last** stage's, so
+ * `npm run check | tail -100` reports `exit 0` for a gate that failed outright —
+ * and models pipe into `tail` constantly. A tool that reports success for a
+ * failed build is worse than one that reports nothing. It also costs a re-run
+ * every time: a model that cannot trust a piped exit code runs the whole thing
+ * again unpiped to get one.
  *
- * It is also what drove the duplicate 60-second gate runs: the model could not
- * trust a piped exit code, so it re-ran the whole thing unpiped to get one.
+ * The trade is worth stating. `pipefail` surfaces SIGPIPE too, so
+ * `ls big-dir | head -1` reports 141 rather than 0 — noisy, but *visible*, where
+ * the alternative is a failing gate that looks clean. The tool description tells
+ * the model not to pipe into `head`/`tail` at all, since output is already
+ * truncated with both ends kept.
  *
- * The trade is real and worth stating. `pipefail` also surfaces SIGPIPE, so
- * `ls big-dir | head -1` now reports 141 where it used to report 0 — noisy, but
- * *visible*, and the alternative is a failing gate that looks clean. The tool
- * description tells the model not to pipe into `head`/`tail` at all, since output
- * is already truncated with both ends kept.
- *
- * Requires a shell that implements it — `bash`, `zsh`, `ksh`. Not `sh`/dash. A
- * host setting {@link ComputerConfig.shell} is choosing that shell explicitly, and
- * the choice is what this depends on.
+ * Requires a shell that implements it — `bash`, `zsh`, `ksh`, not `sh`/dash. A
+ * host setting {@link ComputerConfig.shell} is choosing that shell explicitly.
  */
 function wrapped(command: string, shell: string): string {
   return `${shell} -o pipefail -c ${shellQuote(command)}`;
@@ -285,12 +272,11 @@ function wrapped(command: string, shell: string): string {
  * and `rev-list --count` and needs the answer alone.
  *
  * Two functions rather than one with a flag, because the difference is a change
- * to the *output contract* and a boolean hides it at the call site — which is
- * exactly how it went wrong. `computerExec` inherited a `2>&1` written for
- * `sb_exec`, so every `/repo` git command came back with an empty `stderr` and a
- * `stdout` that was a transcript rather than an answer. Nothing failed, because
- * the commands `/repo` parses happen to be quiet ones; a single `warning:` from a
- * future git would have skipped the empty-branch guard in silence.
+ * to the *output contract* and a boolean hides it at the call site. Merging the
+ * streams here would give every `/repo` git command an empty `stderr` and a
+ * `stdout` that is a transcript rather than an answer — which fails silently,
+ * since the commands `/repo` parses are quiet ones and a single `warning:` is
+ * enough to skip the empty-branch guard.
  */
 export function withShell(command: string, shell: string | undefined): string {
   return shell ? wrapped(command, shell) : command;
@@ -303,10 +289,10 @@ export function withShell(command: string, shell: string | undefined): string {
  * This is the variant for a caller whose consumer is **a model reading output**.
  * `sb_exec` is that caller. A project's check is a chain — `wrangler types &&
  * prettier && eslint && tsc` — and *which tool spoke last* is how you know which
- * one failed. Handing back a stdout block and a separate stderr block destroys
- * that ordering, and the model noticed before we did: it re-ran a 60-second gate
- * as `npm run check > /tmp/out 2>&1; cat /tmp/out` purely to read the transcript
- * in the order it happened. This is that workaround, done once, for free.
+ * one failed. A stdout block and a separate stderr block destroy that ordering,
+ * and a model that wants it back re-runs the whole gate as
+ * `npm run check > /tmp/out 2>&1; cat /tmp/out`. This is that workaround, done
+ * once, for free.
  *
  * The redirect binds to the wrapper process, so it applies to everything the
  * command writes however deeply nested — and there is no inner brace group or
@@ -348,18 +334,15 @@ export interface ComputerConfig {
    * string goes to the runtime as-is and lands on whatever `/bin/sh` is.
    *
    * Worth setting, because "whatever `/bin/sh` is" is **dash** on Debian and
-   * Ubuntu, and a model writing shell writes *bash*. A production run cost two
-   * minutes to exactly this: the subagent ran `npm run check` (60s), wanted to see
-   * just the tail, re-ran it as `npm run check 2>&1 | tail -40; echo
-   * "EXIT_CODE=${PIPESTATUS[0]}"` — and `PIPESTATUS` is a bash builtin, so dash
-   * failed the whole line with exit 2 after another 58 seconds. The model then
-   * diagnosed it correctly and re-ran a third time under `bash -c`, which is how
-   * we know bash was in the image the entire time.
+   * Ubuntu, and a model writing shell writes *bash*. `${PIPESTATUS[0]}` is the
+   * one that costs most — a bash builtin a model reaches for to read a piped exit
+   * code, which dash fails with exit 2, after the command it wrapped has already
+   * run. It is one member of a family (`[[ ]]`, arrays, `set -o pipefail`,
+   * process substitution), so the fix is the shell rather than a note in a prompt
+   * telling the model to write POSIX.
    *
-   * `PIPESTATUS` is one member of a family — `[[ ]]`, arrays, `set -o pipefail`,
-   * process substitution — so the fix is the shell, not a note in a prompt telling
-   * the model to write POSIX. Set it only if the image actually has that shell: a
-   * missing one fails *every* command rather than the bash-flavoured ones.
+   * Set it only if the image actually has that shell: a missing one fails *every*
+   * command rather than the bash-flavoured ones.
    */
   shell?: string;
   /** Per-command timeout. Defaults to ten minutes. */
@@ -403,31 +386,24 @@ export interface ComputerConfig {
    *
    * ## Put no secret here
    *
-   * Stated first because the previous version of this comment implied the
-   * opposite, and it was wrong in a way that would have leaked a key. It offered
-   * "API keys a build needs" and justified per-command passing as protection from
-   * "a `printenv` it wrote itself" — but *every* command gets this environment,
-   * and `sb_exec`'s command is written by the model. `sb_exec("printenv")` prints
-   * all of it. So does a `postinstall` script in a repository the agent was asked
-   * to clone, which nobody vetted.
+   * *Every* command gets this environment, and `sb_exec`'s command is written by
+   * the model: `sb_exec("printenv")` prints all of it, and so does a
+   * `postinstall` script in a repository the agent was asked to clone, which
+   * nobody vetted.
    *
-   * What per-command passing actually buys is narrower and worth keeping: the
-   * value is not set on the container, so a process started outside these tools —
-   * a dev server left running from an earlier task — does not inherit it, and it
-   * is not sitting in `/proc/1/environ`. That is a real property. It is not
-   * confidentiality from the model.
+   * What per-command passing buys is narrower and worth keeping: the value is not
+   * set on the container, so a process started outside these tools — a dev server
+   * left running from an earlier task — does not inherit it, and it is not in
+   * `/proc/1/environ`. That is a real property. It is not confidentiality from
+   * the model.
    *
    * ## What to do with a secret instead
    *
    * Do not hand the agent the credential; hand it the *action*. Keep the secret
-   * on the Worker side and expose one tool that makes the one call it is for.
-   * `@loopingai/plugins/repo` is the worked example, and it goes all the way:
-   * `repo_open_pr` holds a forge token and calls the API from the Worker, and
-   * the three git operations that need to authenticate — clone, fetch, push —
-   * run on the host's side of the boundary too. **No command in the container is
-   * ever given that token**, not for the length of one command and not scoped to
-   * one origin. It got there by trying the narrower versions first; the module
-   * doc in `@loopingai/plugins/repo` records why each of them leaked.
+   * on the Worker and expose one tool that makes the call it is for.
+   * `@loopingai/plugins/repo` is the worked example: it holds a forge token, calls
+   * the API from the Worker, and runs clone, fetch and push on the host's side of
+   * the boundary. **No command in its container is ever given that token.**
    */
   env?: () => Record<string, string | undefined>;
 }
@@ -450,13 +426,11 @@ export function buildComputerTools(
    * Polled rather than subscribed: the status lives in another Durable Object,
    * there is no event to wait on, and the whole window is under two minutes.
    *
-   * **Only commands that need `node_modules` wait.** The gate used to hold every
-   * command, and the cost of that was not theoretical: a run spent 57 seconds
-   * with `tail -c 200 README.md | xxd` queued behind an `npm ci` it had no use
-   * for, followed by four more `od` / `ls` / `git status` calls that were equally
-   * indifferent to it. Reading a file, inspecting the tree and reading git
-   * history are exactly what a subagent can usefully do *while* an install runs,
-   * which is the whole reason the install was moved out of the round loop.
+   * **Only commands that need `node_modules` wait.** Holding every command means
+   * a `tail -c 200 README.md` queues behind an `npm ci` it has no use for.
+   * Reading a file, inspecting the tree and reading git history are exactly what
+   * a subagent can usefully do *while* an install runs, which is the reason the
+   * install is not in the round loop at all.
    */
   const awaitInstall = async (command: string): Promise<InstallGate> => {
     if (!installStatus) return {};
@@ -508,11 +482,11 @@ export function buildComputerTools(
   /**
    * Open the workspace, run one file operation in it, and own the failure.
    *
-   * Every file tool used to repeat these five lines with only the verb changed,
-   * which is five chances for the seventh tool to be written without them. The
-   * catch is the whole point: a failed file operation is the model's to recover
-   * from, and it can only recover from what it is told, so this returns the
-   * sentence rather than throwing it.
+   * Five lines every file tool would otherwise repeat with only the verb changed
+   * — five chances for the seventh to be written without them. The catch is the
+   * point: a failed file operation is the model's to recover from, and it can
+   * only recover from what it is told, so this returns the sentence rather than
+   * throwing it.
    *
    * `sb_exec` deliberately does not use it. That one recognises `EEXEC_LOST`,
    * logs, and carries an install warning through the failure path — a bespoke
@@ -534,28 +508,20 @@ export function buildComputerTools(
   return {
     sb_exec: tool({
       /**
-       * States what the tool guarantees, which the previous wording did not.
+       * States what the tool guarantees, rather than what it might withhold.
        *
-       * It led with "output is truncated from the middle if it is large" and said
-       * nothing about what survives — so a model was told its transcript might be
-       * lossy and given no exit code to check, which are two independent reasons
-       * to re-run a command and capture the output "properly". That is exactly
-       * what happened, twice, at 60 seconds a go. Truncation was never actually
-       * firing: the gate emits a few hundred characters against a 16,000-character
-       * ceiling.
-       */
-      /**
+       * A description that leads with "output is truncated if it is large" and
+       * gives no exit code hands the model two independent reasons to re-run a
+       * command and capture the output "properly" — at 60 seconds a go on a real
+       * gate, whose few hundred characters were never near the ceiling anyway.
+       *
        * Two of these sentences are only true when a shell is configured, so the
-       * description says whichever is.
-       *
-       * `withShellTranscript` is a no-op without {@link ComputerConfig.shell}:
-       * no `2>&1`, so the streams arrive separate and {@link renderResult}
-       * labels them; no `-o pipefail`, so the runtime's `/bin/sh` reports a
-       * pipeline's *last* stage. Promising an interleaved transcript and
-       * first-failure semantics there would be the same lie this module spends
-       * `wrapped`'s comment explaining the cost of — a model that cannot trust a
-       * piped exit code re-runs the whole gate to get one, and a failed build
-       * that reports success is worse than no answer at all.
+       * description says whichever is. `withShellTranscript` is a no-op without
+       * {@link ComputerConfig.shell}: no `2>&1`, so the streams arrive separate
+       * and {@link renderResult} labels them; no `-o pipefail`, so `/bin/sh`
+       * reports a pipeline's *last* stage. Promising a transcript and
+       * first-failure semantics there would be the lie `wrapped` explains the
+       * cost of.
        */
       description:
         "Run a shell command in the container and return its output. Use this for builds, tests, package installs, git, and anything else a terminal can do. " +
@@ -989,35 +955,27 @@ export function buildComputerTools(
  * not own a container.
  *
  * `@loopingai/plugins/repo` is the reason this exists: it needs `git` on a real
- * shell, but making it depend on this module would weld the two together and
- * stop a host from pointing it at its own container. Structurally typed for the
- * same reason — the two plugins compose without either importing the other, and
- * the signature is deliberately identical to the one `/sandbox` exported, so
- * `/repo` did not change at all when the substrate did.
+ * shell, but depending on this module would weld the two together and stop a
+ * host from pointing it at its own container. Structurally typed for the same
+ * reason — the two plugins compose without either importing the other.
  *
  * ## {@link ComputerConfig.env} is deliberately **not** merged here
  *
- * {@link buildComputerTools} merges it into every command; this does not, and the
- * asymmetry is a decision rather than an oversight.
+ * {@link buildComputerTools} merges it into every command; this does not.
  *
- * What this function hands out is a raw shell to *another plugin*, whose commands
- * this module neither writes nor sees. `/repo` runs its **unauthenticated** git
- * through it — `status`, `diff`, `add`, `commit`, `checkout` — and pins the
- * environment those need, which today is `GIT_TERMINAL_PROMPT=0` plus the
- * model-authored values it passes as variables rather than interpolating.
- * Merging a host environment underneath that would let every key it does *not*
- * pin through: `http_proxy`, `GIT_PROXY_COMMAND`, `GIT_SSL_CAINFO`,
- * `GIT_CONFIG_GLOBAL`, `GIT_EXEC_PATH`. The last two redirect the config git
- * reads and relocate git's own helper binaries.
+ * What this hands out is a raw shell to *another plugin*, whose commands this
+ * module neither writes nor sees. `/repo` runs its unauthenticated git through
+ * it and pins the environment those need — `GIT_TERMINAL_PROMPT=0` plus the
+ * model-authored values it passes as variables. A host environment merged
+ * underneath lets through every key it does *not* pin: `http_proxy`,
+ * `GIT_PROXY_COMMAND`, `GIT_SSL_CAINFO`, `GIT_CONFIG_GLOBAL`, `GIT_EXEC_PATH` —
+ * the last two redirect the config git reads and relocate its helper binaries.
  *
- * No token is at stake — the credentialed operations do not run here at all —
- * and the decision stands anyway: silently changing what git does inside another
- * plugin's commands is not a thing a container plugin's config field should be
- * able to do by accident, from a host that only meant to set a registry.
- *
- * So it is not withheld to be safe from the host — it is withheld so that a host
- * doing it does it *visibly*, at the call site, where the merge is in front of
- * whoever writes it:
+ * No token is at stake, since the credentialed operations do not run here at
+ * all. The point is that changing what git does inside another plugin's commands
+ * should not be something a container plugin's config field does by accident,
+ * from a host that only meant to set a registry. A host that wants it composes
+ * it where the merge is visible:
  *
  * ```ts
  * exec: (command, options) =>
@@ -1026,9 +984,6 @@ export function buildComputerTools(
  *     env: { ...mine, ...options?.env }
  *   });
  * ```
- *
- * Nothing of value is lost by the default, either, because no secret belongs in
- * that field in the first place — see {@link ComputerConfig.env}.
  */
 export function computerExec(config: ComputerConfig): (
   command: string,
@@ -1081,10 +1036,9 @@ export function computerExec(config: ComputerConfig): (
     const killed = cancelledNote(result.status, result.exitCode, timeoutMs);
 
     return {
-      // `/repo` branches on `success`, which `@cloudflare/sandbox` reported and
-      // this runtime does not — it reports `status` and `exitCode`. Derived from
-      // the exit code rather than from `status`, because a command that runs and
-      // fails is `completed` here.
+      // `/repo` branches on `success`, which this runtime does not report — it
+      // has `status` and `exitCode`. Derived from the exit code rather than the
+      // status, because a command that runs and fails is `completed` here.
       success: result.exitCode === 0,
       stdout: result.stdout,
       // Appended rather than substituted: a command killed at the ceiling may

@@ -1,19 +1,21 @@
+import { sameRepoUrl } from "./url.js";
+
 /**
  * The state of a checkout that is already on disk.
  *
  * Kept out of `index.ts` so it can be tested without building a `ToolSet` — the
- * two runners it needs arrive as parameters, which is the whole reason the seam
- * exists. `refreshCheckout` in particular has more refusal paths than any tool in
- * the plugin, and one of them (a dirty tree) guards work nobody can recover.
+ * two runners it needs arrive as parameters, which is the reason the seam exists.
+ * `refreshCheckout` has more refusal paths than any tool in the plugin, and one
+ * of them (a dirty tree) guards work nobody can recover.
  */
 
 /**
  * What a refresh did, split from what the model is told about it.
  *
- * `branch` is set only when this call left a clean tree on a known branch —
- * which is also the only case where `afterCheckout` should fire. Every early
- * return here is a reason *not* to act on the checkout, and returning a bare
- * string made those indistinguishable from success at the call site.
+ * `branch` is set only when this call left a clean tree on a known branch, which
+ * is also the only case where `afterCheckout` should fire. Every early return
+ * here is a reason *not* to act on the checkout, and a bare string would make
+ * those indistinguishable from success at the call site.
  */
 interface RefreshOutcome {
   message: string;
@@ -45,12 +47,11 @@ export interface GitRunners {
     vars?: Record<string, string>
   ) => Promise<GitAnswer>;
   /**
-   * The whole credential-bearing half, as one call rather than a runner.
+   * The credential-bearing half, as a finished operation rather than a runner.
    *
-   * `refreshCheckout` used to be handed a credentialed runner and pointed it at
-   * the checkout. It cannot be, and the reason is the point of this whole file:
-   * a credential never goes anywhere near the container. What it borrows now is
-   * the finished operation, which happens somewhere else entirely.
+   * A runner pointed at the checkout would put the credential in the container,
+   * which is the one thing this plugin does not do. What is borrowed is the
+   * operation, which happens on the host's side.
    */
   fetchOrigin: (dir: string, url: string) => Promise<GitAnswer>;
 }
@@ -86,10 +87,10 @@ export async function resolveDefaultBranch(
 /**
  * Bring an existing checkout back to a clean, current state.
  *
- * `repo_clone` used to assume an empty directory, which stopped being true the
- * moment containers outlived a task: `git clone` fails outright with
- * "destination path already exists and is not an empty directory", and the round
- * has to improvise from an error that reads like a bug.
+ * The workspace outlives the task, so a clone target may already hold one —
+ * where `git clone` fails with "destination path already exists and is not an
+ * empty directory" and the round has to improvise from an error that reads like
+ * a bug.
  *
  * The refusal on a dirty tree is the important half. Uncommitted changes there
  * are a *previous task's work* — possibly the thing a human is waiting on — and
@@ -110,10 +111,9 @@ export async function refreshCheckout({
 }): Promise<RefreshOutcome> {
   const remote = await plain("remote get-url origin", dir);
   // Interrogated, for the same reason the `status` below is: a question that went
-  // unanswered is not the answer "some other repository". Empty stdout from a
-  // command that *failed* used to produce exactly that sentence — so an
-  // unreachable container, or a git dir with no origin at all, sent the model
-  // looking for a checkout of something nobody had mentioned.
+  // unanswered is not the answer "some other repository". Read as one, an
+  // unreachable container or a git dir with no origin sends the model looking for
+  // a checkout of something nobody mentioned.
   if (!remote.success) {
     return {
       message:
@@ -122,7 +122,12 @@ export async function refreshCheckout({
         `Nothing was fetched or reset.`
     };
   }
-  if (remote.stdout.trim() !== url.trim()) {
+  // Compared as repositories, not as strings. `https://host/o/r`, `.../o/r.git`
+  // and `.../o/r/` are one repository written three ways, and `repo_clone` puts
+  // all three at the same `dir` — so a literal comparison refuses a checkout of
+  // the repository that was actually asked for, and no repository tool can clear
+  // the refusal.
+  if (!sameRepoUrl(remote.stdout, url)) {
     return {
       message:
         `${dir} already holds a checkout of ${remote.stdout.trim() || "another repository"}, ` +
@@ -130,12 +135,11 @@ export async function refreshCheckout({
     };
   }
 
-  // Interrogated, not assumed. Empty stdout from a `status` that *failed* is
-  // not a clean tree — it is no answer at all, and the next two commands here
-  // are `fetch` and `reset --hard`. Treating the two as the same thing meant a
-  // permissions error or a half-written index could discard a tree whose
-  // cleanliness had never been established, which is the one loss in this file
-  // that nobody can recover from.
+  // Interrogated, not assumed. Empty stdout from a `status` that *failed* is not
+  // a clean tree, it is no answer at all — and the next two commands are `fetch`
+  // and `reset --hard`. Conflating the two lets a permissions error or a
+  // half-written index discard a tree nobody established was clean, which is the
+  // one loss in this file that cannot be undone.
   const dirty = await plain("status --porcelain", dir);
   if (!dirty.success) {
     return {
@@ -169,9 +173,9 @@ export async function refreshCheckout({
   let target = branch;
   if (!target) {
     const head = await resolveDefaultBranch(plain, dir);
-    // Distinguished here for the first time: a container that never answered is
-    // not a repository without a default branch, and "could not determine" sent
-    // the model looking at the repository either way.
+    // A container that never answered is not a repository without a default
+    // branch, and one sentence for both sends the model to the repository either
+    // way.
     if (head.unreachable)
       return {
         message: `could not read the default branch for ${url}: ${head.unreachable}`
@@ -183,11 +187,10 @@ export async function refreshCheckout({
 
   // The one place in this plugin where a model-authored value lands in git's
   // *operand* position — everywhere else it is prefixed (`origin/…`,
-  // `refs/heads/…`) or is the value of a flag. Quoting is not enough here: it
-  // stops word-splitting, not option parsing, so `--detach` would be read as an
-  // option. `repo_clone` rejects such a name with `UNSAFE_BRANCH` before this
-  // runs, and that is a precondition of calling this function rather than an
-  // accident of the caller.
+  // `refs/heads/…`) or is a flag's value. Quoting is not enough: it stops
+  // word-splitting, not option parsing, so `--detach` reads as an option.
+  // `repo_clone` rejects such a name with `UNSAFE_BRANCH` first, which is a
+  // precondition of calling this rather than an accident of the caller.
   const checkout = await plain(`checkout "$REPO_BRANCH"`, dir, {
     REPO_BRANCH: target
   });

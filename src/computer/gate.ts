@@ -16,23 +16,17 @@ import { humanMs } from "./render.js";
 /**
  * The one `sb_exec` failure that is not the command's fault.
  *
- * `@cloudflare/computer` 0.2.1 gave container replacement its own error instead
- * of a transport failure that read like a broken command: operations reconnect to
- * the new `computerd`, and an execution that was *running* across the swap throws
- * `EEXEC_LOST`. Without this the model receives `error running command: Error:
- * Execution "…" was lost when its container runtime was replaced` and has to
- * guess — and the plausible guesses are all wrong and expensive. It reads like
- * the command crashed, so the model goes looking at the command.
+ * An execution running when the container is replaced throws `EEXEC_LOST`.
+ * Unexplained, the model receives `Execution "…" was lost when its container
+ * runtime was replaced`, reads it as a crash, and goes looking at its command.
  *
- * What it actually needs is three facts and they are the ones this module keeps
- * repeating: nothing ran to completion, the checkout survived because the
- * filesystem is the Durable Object's and not the container's, and `node_modules`
- * did not because it never was. So: re-run it, and expect the install to be
- * rebuilding underneath.
+ * What it needs is three facts: nothing ran to completion, the checkout survived
+ * because the filesystem is the Durable Object's rather than the container's, and
+ * `node_modules` did not because it never was. So re-run, and expect the install
+ * to be rebuilding underneath.
  *
- * Matched on `code` rather than the message, which is the property the package
- * sets deliberately (`name` is `WorkspaceExecutionLostError`) and the one that
- * survives a reworded string.
+ * Matched on `code` rather than the message — the property the package sets
+ * deliberately, and the one that survives a reworded string.
  */
 export function execLostNote(err: unknown): string | undefined {
   if ((err as { code?: unknown } | null | undefined)?.code !== "EEXEC_LOST")
@@ -49,25 +43,21 @@ export function execLostNote(err: unknown): string | undefined {
 /**
  * What the install state means for a command about to run.
  *
- * The distinction between the two fields is the whole point, and getting it
- * wrong deadlocked a production run.
+ * The distinction between the two fields is the whole point:
  *
  * - `block` — the command was **not run**. Only ever set while an install is
  *   genuinely in flight, which is a state that resolves on its own.
  * - `warn` — the command **was run**, with a note prepended saying the tree it
  *   ran against may be incomplete.
  *
- * A failed install used to `block`, which is wrong twice. It is unbounded:
- * nothing clears the record except another checkout, so one failed install
- * disables the shell for the rest of the session — `echo hello` included, which
- * is exactly how it was reported. And it is self-contradictory: the message told
- * the model to "re-run the install yourself with sb_exec" while `sb_exec` was
- * the tool refusing to run. There was no way out of it from inside the task.
+ * A *failed* install must never block, and the reason is that it deadlocks:
+ * nothing clears the record except another checkout, so one failure disables the
+ * shell for the rest of the session — `echo hello` included — while the message
+ * tells the model to re-run the install with the tool that is refusing to run.
  *
  * A failed install is a fact about `node_modules`, not about the shell. The
- * container is fine; `git status`, `ls`, `cat` and the install command itself
- * all work. So it is reported, not enforced — the model gets real output and
- * decides what it means.
+ * container is fine; `git status`, `ls`, `cat` and the install command itself all
+ * work. So it is reported rather than enforced, and the model decides.
  */
 export interface InstallGate {
   /** Set only for an install still in flight: the command did not run. */
@@ -145,13 +135,21 @@ const DEPENDENCY_TOOLS = new Set([
 ]);
 
 /**
- * Package managers, recognised **anywhere**.
+ * Package managers, recognised **anywhere** except in the name of a file that
+ * merely belongs to one.
  *
- * These are safe to match loosely because none of them is plausible as a
- * filename, and matching them loosely is what catches a build hidden one level
- * down — `bash -c 'npm run check'`, `time npm test`, `xargs -n1 npx tsc`.
+ * Matching them loosely is what catches a build hidden one level down —
+ * `bash -c 'npm run check'`, `time npm test`, `xargs -n1 npx tsc` — and no
+ * position check would see any of those.
+ *
+ * The lookahead is what keeps that affordable. `\b` breaks on a hyphen and on a
+ * dot, so a bare loose match also fires on `cat pnpm-lock.yaml`, `cat yarn.lock`
+ * and `cat pnpm-workspace.yaml` — orienting reads, which would then queue behind
+ * an `npm ci` they have no use for. That is the same cost {@link DEPENDENCY_TOOLS}
+ * checks position to avoid, and there is no reason to pay it here instead.
  */
-const PACKAGE_MANAGERS = /\b(?:npm|npx|pnpm|pnpx|yarn|bunx)\b/;
+const PACKAGE_MANAGERS =
+  /\b(?:npm|npx|pnpm|pnpx|yarn|bunx)\b(?!-lock|\.lock|-workspace)/;
 
 /** Splits a command into the pieces the shell would run as separate programs. */
 const SHELL_OPERATORS = /\|\||&&|[;|\n()]/;
@@ -163,12 +161,11 @@ const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
  * Programs that run *another* program, so the name after them is the one that
  * matters.
  *
- * Without these, `time vitest run` and `env CI=1 vitest run` both read as a
- * command called `time` or `env`, neither of which is in
- * {@link DEPENDENCY_TOOLS} — so they skipped the gate and ran against a
- * half-built `node_modules`, which is the expensive half of the asymmetry
- * {@link needsDependencies} documents. Package managers were never affected,
- * because {@link PACKAGE_MANAGERS} matches anywhere in the string.
+ * Without these, `time vitest run` and `env CI=1 vitest run` read as commands
+ * called `time` and `env`, neither of which is in {@link DEPENDENCY_TOOLS} — so
+ * they skip the gate and run against a half-built `node_modules`, the expensive
+ * half of the asymmetry {@link needsDependencies} documents. Package managers are
+ * unaffected, since {@link PACKAGE_MANAGERS} matches anywhere.
  *
  * `sudo` is here because a container image that has it will have a model reach
  * for it, not because it should be needed.

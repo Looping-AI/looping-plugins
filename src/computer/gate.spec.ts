@@ -49,6 +49,41 @@ describe("needsDependencies", () => {
   });
 
   /**
+   * A package manager's own lockfile is a file, not a build.
+   *
+   * The sibling of the config-file case below, and the one a position check
+   * cannot catch: `PACKAGE_MANAGERS` matches anywhere by design, so it needs a
+   * lookahead instead. `\b` breaks on both a hyphen and a dot, which is what
+   * makes `pnpm-lock.yaml` and `yarn.lock` read as their managers.
+   */
+  it("reads a lockfile without gating on it", () => {
+    for (const command of [
+      "cat pnpm-lock.yaml",
+      "cat yarn.lock",
+      "git diff pnpm-lock.yaml",
+      "cat pnpm-workspace.yaml",
+      "wc -l package-lock.json"
+    ]) {
+      expect(needsDependencies(command)).toBe(false);
+    }
+  });
+
+  /**
+   * And the lookahead does not buy that by giving up the loose match, which is
+   * the whole reason the manager list is not position-checked: a build one level
+   * down inside `bash -c` has no recognisable command position at all.
+   */
+  it("still gates a manager named next to a lockfile it reads", () => {
+    for (const command of [
+      "npm ci && cat package-lock.json",
+      "cat yarn.lock && yarn install",
+      "bash -c 'pnpm install --frozen-lockfile'"
+    ]) {
+      expect(needsDependencies(command)).toBe(true);
+    }
+  });
+
+  /**
    * The case that made position matter. A word-boundary match anywhere in the
    * string passes every other test here and still fails this one: `\bvitest\b`
    * fires on `vitest.config.ts` because `.` is a word boundary, and config files

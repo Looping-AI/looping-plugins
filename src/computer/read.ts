@@ -5,25 +5,22 @@ import { isGitInternal } from "./paths.js";
  * Reading the workspace without pulling more of it across the boundary than the
  * model will be shown.
  *
- * Every function here exists because the obvious version reads everything and
- * then throws most of it away — which is the wrong shape against a Durable
- * Object's 128 MB, the same ceiling a `node_modules` push once breached. So the
- * budget is applied at the source, and the offsets handed back are the
- * *source's* rather than the rendered subset's, which is what makes the next
- * page exact instead of a guess.
+ * The obvious version of each function here reads everything and throws most of
+ * it away, which is the wrong shape against a Durable Object's 128 MB. So the
+ * budget is applied at the source, and the offsets handed back are the *source's*
+ * rather than the rendered subset's — which is what makes the next page exact
+ * instead of a guess.
  */
 
 /**
  * Read a file without pulling more of it across the boundary than the model will
  * be shown.
  *
- * `readFile(path, "utf8")` materialises the whole file in the isolate and then
- * `truncateOutput` throws most of it away. That is harmless on a source file and
- * the wrong shape for the ceiling this plugin already lives under: a Durable
- * Object gets 128 MB, which is the same limit a `node_modules` push breached at
- * 429 MB, and `sb_read` is one model decision away from a lockfile, a bundle or a
- * captured build log. `@cloudflare/computer` 0.2 made the read range-addressable,
- * so the budget is enforced at the source rather than after the damage.
+ * `readFile(path, "utf8")` materialises the whole file in the isolate before
+ * `truncateOutput` throws most of it away. Harmless on a source file, and the
+ * wrong shape against a Durable Object's 128 MB — `sb_read` is one model decision
+ * away from a lockfile, a bundle or a captured build log. The read is
+ * range-addressable, so the budget is enforced at the source.
  *
  * Two reads rather than one, because the budget is spent from both ends for the
  * reason {@link truncateOutput} documents — the first error is at the top of a

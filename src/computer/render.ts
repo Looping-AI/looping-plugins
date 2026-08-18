@@ -28,12 +28,11 @@ const MAX_MATCH_LINE_CHARS = 200;
 /**
  * Middle-out truncation, so both the first error and the final summary survive.
  *
- * The guard is not defensive padding. Without it, a `max` at or below the
- * marker's own length makes `half` zero or negative, and `slice(-0)` is
- * `slice(0)` — the *whole* string — so the function returns more than it was
- * given: 500 characters in, 543 out at `max: 80`, and 1023 at `max: 60`. A
- * silent inversion of the one thing it exists to do, reachable from a public
- * config field.
+ * The guard is not defensive padding. Without it a `max` at or below the marker's
+ * own length makes `half` zero or negative, and `slice(-0)` is `slice(0)` — the
+ * *whole* string — so the function returns more than it was given: 500 characters
+ * in, 543 out at `max: 80`. A silent inversion of the one thing it does,
+ * reachable from a public config field.
  */
 export function truncateOutput(text: string, max: number): string {
   if (text.length <= max) return text;
@@ -54,10 +53,9 @@ export function truncateOutput(text: string, max: number): string {
 /**
  * A byte count in the form a model can act on.
  *
- * Worth the eight lines now that `sb_read` truncates: a listing that says a file
- * is 4.2 MB tells the model the read it is about to do will come back with a hole
- * in the middle, which is the one thing it cannot infer from the truncated result
- * itself.
+ * A listing that says a file is 4.2 MB tells the model the read it is about to do
+ * comes back with a hole in the middle — the one thing it cannot infer from the
+ * truncated result itself.
  */
 export function humanBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -187,29 +185,23 @@ export function humanMs(ms: number): string {
  *
  * ## Every command ends with its verdict, including the successful ones
  *
- * This used to print the exit code **only when it was non-zero**, on the theory
- * that a clean run speaks for itself. It does not, and the models said so: across
- * two production runs, all five `npm run check` invocations were written by the
- * model as `npm run check; echo "EXIT_CODE=$?"`. It was appending a shell
- * workaround for a verdict the tool had declined to give it — and one of those
- * workarounds reached for `${PIPESTATUS[0]}`, which dash does not implement, which
- * failed the command, which cost a 58-second re-run of the whole gate.
- *
- * A tool that makes the caller reconstruct its own result is not saving noise.
+ * Printing the exit code only when it is non-zero looks like saving noise and is
+ * not: a model with no verdict appends `; echo "EXIT_CODE=$?"` itself, and
+ * reaches for `${PIPESTATUS[0]}` to read a piped one — which dash does not
+ * implement, so the whole line fails after the command it wrapped has run.
  *
  * ## `status` is not the exit code
  *
- * `WorkspaceRuntimeStatus` is `completed | failed | cancelled`, and it was dropped
- * on the floor here. A command killed at the `timeoutMs` ceiling rendered exactly
- * like one that ran to completion and failed — so "your test suite was killed at
- * ten minutes" and "your test suite has a failing test" arrived identical, and they
- * want opposite responses. Anything other than `completed` is now stated.
+ * `WorkspaceRuntimeStatus` is `completed | failed | cancelled`. Dropping it
+ * renders a command killed at the `timeoutMs` ceiling exactly like one that ran
+ * to completion and failed — "your test suite was killed at ten minutes" and
+ * "your test suite has a failing test", which want opposite responses. Anything
+ * other than `completed` is stated.
  *
  * ## One budget, applied once
  *
- * `truncateOutput` used to run per stream, so `maxOutputChars` was really "up to
- * twice this". It now bounds the rendered transcript, which is the thing that
- * actually reaches the context window.
+ * Truncating per stream makes `maxOutputChars` mean "up to twice this". The bound
+ * is on the rendered transcript, which is what reaches the context window.
  */
 export function renderResult(
   result: {
@@ -237,13 +229,12 @@ export function renderResult(
 /**
  * Why a command has nothing to show for itself.
  *
- * {@link renderResult} states a non-`completed` status on its verdict line, so
- * `sb_exec` has always said this. {@link computerExec} has no verdict line — it
- * hands back the four fields its caller branches on — and `status` was dropped
- * there. That matters because a *killed* process writes nothing: a `git clone`
- * that hit the ten-minute ceiling reached the model through `@loopingai/plugins/repo`
- * as `clone failed:` with an empty reason after it, which reads like a bug in the
- * plugin rather than a limit the model can do something about.
+ * {@link renderResult} states a non-`completed` status on its verdict line;
+ * {@link computerExec} has no verdict line, only the four fields its caller
+ * branches on. A *killed* process writes nothing, so without this a `git clone`
+ * that hit the ten-minute ceiling reaches the model through
+ * `@loopingai/plugins/repo` as `clone failed:` with an empty reason — which reads
+ * like a bug in the plugin rather than a limit it can work within.
  *
  * Only `cancelled`. A `failed` status is an ordinary non-zero exit, where the
  * command's own stderr is the better explanation and this would be noise on top

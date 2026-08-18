@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { parseRepo, PROTECTED_BRANCHES, UNSAFE_BRANCH } from "./url.js";
+import {
+  parseRepo,
+  repoLocation,
+  sameRepoUrl,
+  PROTECTED_BRANCHES,
+  UNSAFE_BRANCH
+} from "./url.js";
 
 /**
  * The parsing, on its own, with nothing injected.
@@ -120,5 +126,69 @@ describe("branch names a push must not act on", () => {
     for (const trunk of ["main", "master", "trunk", "develop"]) {
       expect(PROTECTED_BRANCHES.has(trunk)).toBe(true);
     }
+  });
+});
+
+/**
+ * What a clone URL may carry beyond a host and a path.
+ *
+ * The allowlist reads `hostname`, and everything else in the string travels on
+ * to whichever git the host runs. So the parts this function does not look at
+ * are exactly the parts worth refusing.
+ */
+describe("repoLocation", () => {
+  it.each([
+    ["userinfo", "https://user:ghp_leaked@github.com/o/r"],
+    ["a bare username", "https://user@github.com/o/r"],
+    ["a doubled userinfo", "https://a@b@github.com/o/r"],
+    ["a port", "https://github.com:8443/o/r"]
+  ])("refuses %s", (_why, url) => {
+    expect(repoLocation(url)).toBeUndefined();
+  });
+
+  it("hands back a canonical URL for callers to travel with", () => {
+    // Case-folded, and without the query that means nothing to git — so what
+    // reaches `.git/config` is one spelling rather than whatever was typed.
+    expect(repoLocation("https://GitHub.com/o/r?ref=x#L1")?.url).toBe(
+      "https://github.com/o/r"
+    );
+  });
+});
+
+/**
+ * One repository, written several ways.
+ *
+ * `repo_clone` puts every spelling at the same directory, so a checkout has to
+ * be recognised whichever one a later call uses. A literal comparison refuses
+ * the repository that is actually there, and nothing in the plugin can clear
+ * that refusal.
+ */
+describe("sameRepoUrl", () => {
+  it.each([
+    "https://github.com/o/r",
+    "https://github.com/o/r.git",
+    "https://github.com/o/r/",
+    "https://github.com/o/r.git/",
+    "  https://github.com/o/r  ",
+    "https://GitHub.com/o/r"
+  ])("matches %s against the plain form", (spelling) => {
+    expect(sameRepoUrl(spelling, "https://github.com/o/r")).toBe(true);
+  });
+
+  it.each([
+    ["a different repository", "https://github.com/o/other"],
+    ["a different owner", "https://github.com/other/r"],
+    // The reason this compares URLs rather than `parseRepo` results: two forges
+    // can each hold an `o/r`, and they are not the same checkout.
+    ["a different host", "https://git.acme.dev/o/r"]
+  ])("does not match %s", (_why, other) => {
+    expect(sameRepoUrl(other, "https://github.com/o/r")).toBe(false);
+  });
+
+  it("falls back to the literal string when a side does not parse", () => {
+    // Deciding equality for input it cannot read is the wrong direction to be
+    // wrong in, so an unparseable pair matches only itself.
+    expect(sameRepoUrl("not a url", "not a url")).toBe(true);
+    expect(sameRepoUrl("not a url", "https://github.com/o/r")).toBe(false);
   });
 });

@@ -1,20 +1,20 @@
 /**
  * Working out how a repository installs its dependencies, mechanically.
  *
- * This lives here — in the plugin — because the *procedure* is the same
- * everywhere: look at what the repository actually contains, in a fixed order,
- * and never guess. The **commands** live in the host, because they are a
- * deployment's business: one repository wants `--frozen-lockfile`, another needs
- * a private registry preamble, a third has to build after installing. See
+ * The *procedure* lives here because it is the same everywhere: look at what the
+ * repository actually contains, in a fixed order, and never guess. The
+ * **commands** live in the host, because they are a deployment's business — one
+ * repository wants `--frozen-lockfile`, another needs a private registry
+ * preamble, a third has to build after installing. See
  * {@link InstallPlan.overrides}.
  *
  * ## Why this exists at all
  *
- * The rule used to be a sentence in the subagent's soul — "install dependencies
- * before you do anything else". A production run edited a README, ran
- * `prettier --check` on that one file, and reported the change verified; nothing
- * was installed and the project's gate never ran. A standard with no command
- * attached is one a model satisfies with whichever check is cheapest.
+ * The alternative is a sentence in the subagent's soul — "install dependencies
+ * before you do anything else" — and a standard with no command attached is one a
+ * model satisfies with whichever check is cheapest: edit a README, run
+ * `prettier --check` on that one file, report the change verified, and never run
+ * the project's gate at all.
  *
  * ## Why the order is fixed and written down
  *
@@ -140,27 +140,24 @@ export const DEFAULT_INSTALL_PLAN: InstallPlan = {
       manager: "yarn",
       lockfiles: ["yarn.lock"],
       /**
-       * `--frozen-lockfile`, not `--immutable`, and the reason is measured
-       * rather than inherited from either manual.
+       * `--frozen-lockfile`, not `--immutable`, because the two failure modes are
+       * not symmetric.
        *
-       * The two generations disagree: Berry took `--immutable` and deprecated
-       * `--frozen-lockfile`; Yarn 1 has only the latter. What decides it is that
-       * the two failure modes are not symmetric. Yarn 1 does **not** reject
-       * `--immutable` — against 1.22.22, on a lockfile that disagreed with
-       * `package.json`, it exited 0, printed "success Saved lockfile" and
-       * rewrote the lockfile, which is the exact opposite of the flag's purpose
-       * and says nothing in the tool output. Berry 4.1.0 given
-       * `--frozen-lockfile` warns `YN0050: deprecated` and then enforces
-       * immutability correctly.
+       * The generations disagree: Berry takes `--immutable` and deprecates
+       * `--frozen-lockfile`; Yarn 1 has only the latter. Given `--immutable`,
+       * Yarn 1.22.22 does not reject it — on a lockfile disagreeing with
+       * `package.json` it exits 0, prints "success Saved lockfile" and rewrites
+       * the lockfile, the exact opposite of the flag's purpose, silently. Berry
+       * 4.1.0 given `--frozen-lockfile` warns `YN0050: deprecated` and then
+       * enforces immutability correctly.
        *
-       * So one spelling is silently wrong on one generation and the other is
-       * loudly deprecated on the other. This one is the safe half of that trade,
-       * and it matters most where it is least visible: corepack's own default
-       * `yarn` is 1.22.22, so an unpinned `yarn.lock` — a legacy repository,
-       * which is most of them — ran Yarn 1 with a flag it ignored.
+       * So one spelling is silently wrong on one generation and loudly deprecated
+       * on the other, and this is the safe half. It matters most where it is least
+       * visible: corepack's default `yarn` is 1.22.22, so an unpinned `yarn.lock`
+       * — a legacy repository, which is most of them — runs Yarn 1.
        *
-       * Revisit if Yarn removes the alias, which would turn this into the loud
-       * kind of wrong on Berry.
+       * Revisit if Yarn removes the alias, which would make this the loud kind of
+       * wrong on Berry.
        */
       command: "corepack yarn install --frozen-lockfile"
     },
@@ -347,13 +344,13 @@ async function firstPresent(
  *
  * ## An override is hashed against every lockfile the plan knows
  *
- * An override replaces the whole command, so this layer cannot know which
- * manager it drives or which lockfile it reads. It used to record none, which
- * meant the digest was the command plus `package.json` alone — and a commit that
- * changed only `package-lock.json`, which is what a dependency bump is, matched
- * the stored fingerprint, skipped the install, and left a `node_modules` that
- * was quietly a version behind. So {@link resolveInstallCommand} reports every
- * lockfile the plan names that is present, and all of them are hashed.
+ * An override replaces the whole command, so this layer cannot know which manager
+ * it drives or which lockfile it reads. Recording none would make the digest the
+ * command plus `package.json` alone — so a commit changing only
+ * `package-lock.json`, which is what a dependency bump is, matches the stored
+ * fingerprint, skips the install, and leaves a `node_modules` a version behind.
+ * {@link resolveInstallCommand} reports every lockfile the plan names that is
+ * present, and all of them are hashed.
  *
  * ## And the manager's own configuration
  *

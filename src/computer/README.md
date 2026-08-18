@@ -14,12 +14,10 @@ computer({
 
 Tools: `sb_exec`, `sb_read`, `sb_write`, `sb_edit`, `sb_ls`, `sb_grep`, `sb_exists`.
 
-The successor to `/sandbox`, and the difference is where the files live. A
-`@cloudflare/sandbox` container held its work on a disk that died with it; keeping
-anything meant snapshotting to R2, which needed S3 credentials a Workers binding
-cannot supply. Here the filesystem **is** a Durable Object's SQLite, mounted into the
-container over FUSE. Commands see a normal `/workspace`, the Worker reads the same
-tree over RPC, and when the container is replaced the tree is pushed into the new one.
+The filesystem **is** a Durable Object's SQLite, mounted into the container over
+FUSE. Commands see a normal `/workspace`, the Worker reads the same tree over RPC,
+and when the container is replaced the tree is pushed into the new one — so the
+checkout outlives the container that held it.
 
 Install exactly one filesystem plugin. An agent holding this and
 [`/workspace`](../workspace/) gives the model no way to know which one a path refers
@@ -28,9 +26,8 @@ to.
 ## `node_modules` is not in the workspace
 
 The one thing to internalise. `computerd` excludes it from the sync by design, and the
-exclusion is right: pushing a real one (429 MB, 22,470 files) into the object
-reproducibly exceeded the Durable Object's 128 MB isolate limit, leaving the tree
-silently short.
+exclusion is right: pushing a real one (429 MB, 22,470 files) into the object exceeds
+the Durable Object's 128 MB isolate limit, leaving the tree silently short.
 
 So dependencies live in the container and die with it, while source and `.git` are
 durable. Two consequences: an install has to be re-run on a cold container, and the
@@ -74,6 +71,11 @@ Two consequences worth stating outright:
   containment. Narrowing it to an allowed-host list, with a small classifier for
   the requests that fall outside, is possible future work rather than something
   this plugin does today.
+- **`sb_grep`'s `regex` compiles a model-authored pattern** and runs it over every
+  file under `path`, inside the Durable Object. A catastrophic-backtracking pattern
+  therefore spends that object's CPU budget rather than the container's. The
+  runtime's own limits bound it, and it costs the agent its own turn, but it is the
+  one value a model supplies here that reaches a compiler.
 
 ## The host's Durable Object
 

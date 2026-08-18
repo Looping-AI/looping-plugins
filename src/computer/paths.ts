@@ -1,14 +1,13 @@
 /**
  * Which paths these tools act on, and the sentence a refused one gets.
  *
- * Two lists that look alike and mean opposite things. `node_modules` is
- * *absent* — physics, decided by `computerd` — so its note explains a file that
- * is really there and names the tool that can reach it. `.git` is present,
- * readable, and refused anyway — policy, decided here — so its note names where
- * repository work belongs instead. Two reasons want two sentences, which is why
- * they are not one list.
+ * Two lists that look alike and mean opposite things. `node_modules` is *absent*
+ * — physics, decided by `computerd` — so its note explains a file that is really
+ * there and names the tool that can reach it. `.git` is present, readable, and
+ * refused anyway — policy, decided here — so its note names where repository work
+ * belongs. Two reasons want two sentences, which is why they are not one list.
  *
- * Everything here is a string comparison: no filesystem, no `await`. That is
+ * Everything here is a string comparison: no filesystem, no `await`, which is
  * what lets {@link guardPath} run before a tool opens the workspace at all.
  */
 
@@ -41,12 +40,8 @@ function containerOnlyNote(path: string, verb: string): string {
 /**
  * Is this path inside git's internal state?
  *
- * The mirror image of {@link isContainerOnly}, and the distinction is worth keeping
- * rather than merging the two lists. `node_modules` is *absent* — physics, decided
- * by `computerd`, and the note explains a missing file. `.git` is present and
- * readable and is refused anyway — policy, decided here, because a model that edits
- * `.git/HEAD` or `.git/config` corrupts a checkout in a way that surfaces much later
- * as an inexplicable git failure. Two reasons want two sentences.
+ * Refused because a model that edits `.git/HEAD` or `.git/config` corrupts a
+ * checkout in a way that surfaces much later as an inexplicable git failure.
  *
  * Exact segment rather than substring, so `.gitignore`, `.gitattributes` and
  * `.github/` are untouched — the same trap `node_modules_old` sets one function up.
@@ -58,16 +53,15 @@ export function isGitInternal(path: string): boolean {
 /**
  * The sentence a `.git` path gets.
  *
- * Names the route deliberately. A refusal with no destination is a worse tool than
- * no refusal at all: the model retries, then works around it. So it points at the
- * repo tools, which is where repository work actually belongs.
+ * Names a route deliberately: a refusal with no destination is worse than no
+ * refusal, because the model retries and then works around it.
  *
- * What it must never do is point at `sb_exec`. That would hand back the exact
- * capability this refusal withholds, in the one place the model is already looking
- * for a way around it — and it would do so with the tool's own authority behind it.
- * `sb_exec` is unguarded because a shell takes an opaque command string and
- * pattern-matching git out of one is neither reliable nor this guard's job; that is
- * a fact about the implementation, not a route to advertise.
+ * What it must never name is `sb_exec`. That hands back the exact capability
+ * being withheld, in the one place the model is already looking for a way around
+ * it, with the tool's own authority behind it. `sb_exec` is unguarded because a
+ * shell takes an opaque command string and pattern-matching git out of one is
+ * neither reliable nor this guard's job — a fact about the implementation, not a
+ * route to advertise.
  */
 function gitInternalNote(path: string, verb: string): string {
   return (
@@ -84,43 +78,32 @@ function gitInternalNote(path: string, verb: string): string {
  * The path check every file tool makes, before it opens anything.
  *
  * Returns the sentence to hand back, or `undefined` to proceed. Two string
- * comparisons — no `stat`, no round trip — which is why every one of the six can
- * afford to call it, and why it is called before the workspace is opened rather
- * than after.
+ * comparisons — no `stat`, no round trip — which is why all six tools can afford
+ * to call it before the workspace is opened.
  *
- * ## What this is, and what it is not
+ * ## A redirect, not a boundary
  *
- * It is a **redirect**. `node_modules` is a fact about the substrate and the note
- * names the tool that can see it; `.git` is a rule about where repository work
- * belongs and the note names the tools it belongs to. Both catch the case that
- * actually happens — a model reaching into `.git/HEAD` or `.git/config` to fix a
- * merge, or reading a dependency's source and finding nothing there.
+ * `node_modules` is a fact about the substrate and the note names the tool that
+ * can see it; `.git` is a rule about where repository work belongs and the note
+ * names the tools it belongs to. Both catch the case that actually happens — a
+ * model reaching into `.git/HEAD` to fix a merge, or reading a dependency's
+ * source and finding nothing there.
  *
- * It is not a boundary, and this comment is the only place that is worth saying.
- * `sb_exec` is in the same tool family, granted per family rather than per tool,
- * so every agent holding these six holds a shell that reads and writes `.git`
- * directly; pattern-matching git out of an opaque command string is neither
- * reliable nor this guard's job.
+ * It is not containment, and this is the only place worth saying so. `sb_exec`
+ * is in the same tool family, granted per family rather than per tool, so every
+ * agent holding these six also holds a shell that reads and writes `.git`
+ * directly.
  *
- * This once resolved a final symlink as well, against a cloned repository
- * shipping `docs/notes.md -> ../.git/config`. That only ever mattered for a host
- * granting the file tools *without* the shell, which the family granularity makes
- * unbuildable — so it was deleted rather than extended to the other three tools.
- *
- * ## What would bring it back
- *
- * An agent given these tools *without* `sb_exec` — a reviewing parent, a
- * shell-less reviewer. Then a hostile repository's tracked symlink is live
- * again, and the **write** path is the half worth restoring rather than this
- * one: `.git/config` is an input to the credentialed push, since
- * `@loopingai/plugins/repo` reads the destination out of it with
- * `git remote get-url origin`, and a planted hook still runs under a
- * container-side `repo_commit`. Reading `.git` discloses nothing that is not
- * already readable, which is why the read half is not worth an `lstat` per call.
- *
- * The shape, if it is ever needed: resolve every ancestor rather than only the
- * final component, `lstat`ing the path's prefixes in parallel so it costs one
- * round trip rather than one per segment.
+ * Symlinks are not resolved, for the same reason: a tracked
+ * `docs/notes.md -> ../.git/config` only matters to an agent given these tools
+ * *without* the shell, which the family granularity makes unbuildable. If that
+ * ever becomes buildable, the **write** path is the half to restore —
+ * `.git/config` is an input to the credentialed push, and a planted hook runs
+ * under a container-side `repo_commit`. Reading `.git` discloses nothing that is
+ * not already readable, so the read half is not worth an `lstat` per call. The
+ * shape would be to resolve every ancestor rather than the final component,
+ * `lstat`ing the prefixes in parallel for one round trip rather than one per
+ * segment.
  */
 export function guardPath(path: string, verb: string): string | undefined {
   if (isContainerOnly(path)) return containerOnlyNote(path, verb);

@@ -1125,7 +1125,7 @@ describe("sb_exec", () => {
     expect(out).toContain("container was replaced");
     expect(out).toContain("re-run it");
     expect(out).toContain("node_modules");
-    // Not dressed up as a command failure, which is what it used to look like.
+    // Named as infrastructure, not dressed up as a command failure.
     expect(out).not.toContain("error running command");
   });
 
@@ -1185,16 +1185,12 @@ describe("the install gate on sb_exec", () => {
   });
 
   /**
-   * A failed install **warns and runs**, and this is the regression test for a
-   * production deadlock.
-   *
-   * It used to refuse, like the `running` case above. But `running` resolves on
-   * its own and `failed` does not — nothing clears that record except another
-   * checkout — so one failed install disabled the shell for the rest of the
-   * session. `echo hello` was refused. Worse, the refusal told the model to
-   * "re-run the install yourself with sb_exec", which was the tool doing the
-   * refusing: the advice and the behaviour were in direct contradiction and the
-   * task had no way out.
+   * A failed install **warns and runs**, unlike the `running` case above, and
+   * the asymmetry is what stops a deadlock. `running` resolves on its own;
+   * `failed` does not, since nothing clears that record except another checkout
+   * — so refusing on it disables the shell for the rest of the session, `echo
+   * hello` included, while the refusal tells the model to re-run the install with
+   * the tool that is refusing.
    *
    * A failed install says something about `node_modules`, not about the shell.
    */
@@ -1254,12 +1250,9 @@ describe("the install gate on sb_exec", () => {
   });
 
   /**
-   * `installGateMs` is a ceiling, and it used to be a floor.
-   *
-   * The poll slept a flat three seconds before re-reading, without asking how
-   * much of the gate was left — so a 100 ms gate blocked for about three
-   * seconds, and the one knob a host has for bounding this wait overshot it by
-   * 30×. The sleep is now clamped to whatever remains.
+   * `installGateMs` is a ceiling, and a fixed sleep would make it a floor: a flat
+   * three-second poll blocks a 100 ms gate for about three seconds, overshooting
+   * the one knob a host has by 30×. The sleep is clamped to whatever remains.
    */
   it("gives the turn back within the gate, not within a poll interval", async () => {
     const { tools, execs } = gated(
