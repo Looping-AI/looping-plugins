@@ -106,7 +106,21 @@ function gitInternalNote(path: string, verb: string): string {
  * shipping `docs/notes.md -> ../.git/config`. That only ever mattered for a host
  * granting the file tools *without* the shell, which the family granularity makes
  * unbuildable — so it was deleted rather than extended to the other three tools.
- * R3 in `PLAN.md` records the reasoning and the condition under which it returns.
+ *
+ * ## What would bring it back
+ *
+ * An agent given these tools *without* `sb_exec` — a reviewing parent, a
+ * shell-less reviewer. Then a hostile repository's tracked symlink is live
+ * again, and the **write** path is the half worth restoring rather than this
+ * one: `.git/config` is an input to the credentialed push, since
+ * `@loopingai/plugins/repo` reads the destination out of it with
+ * `git remote get-url origin`, and a planted hook still runs under a
+ * container-side `repo_commit`. Reading `.git` discloses nothing that is not
+ * already readable, which is why the read half is not worth an `lstat` per call.
+ *
+ * The shape, if it is ever needed: resolve every ancestor rather than only the
+ * final component, `lstat`ing the path's prefixes in parallel so it costs one
+ * round trip rather than one per segment.
  */
 export function guardPath(path: string, verb: string): string | undefined {
   if (isContainerOnly(path)) return containerOnlyNote(path, verb);
