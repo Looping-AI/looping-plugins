@@ -51,6 +51,30 @@ a subagent would otherwise be blocked. Both bound their results at the source an
 report the `offset` that continues a cut one; `sb_read` takes a byte range for the
 same reason, so nothing needs a shell to be reached.
 
+## The container is the trust boundary
+
+Two things run in it that nobody reviewed: the commands the model writes, and the
+repository it was asked to clone. `npm ci` executes that repository's lifecycle
+scripts, so "we only ran the install" is still running a stranger's code. Treat
+anything inside the container as reachable by both.
+
+Two consequences worth stating outright:
+
+- **No secret belongs in `ComputerConfig.env`.** It is merged into every command
+  these tools run, and `sb_exec`'s command is model-authored — `sb_exec("printenv")` prints the lot,
+  and so does a `postinstall`. Use it for a registry host or a `CI` flag, not a key.
+  When an agent needs to _act_ with a credential, keep the credential on the Worker
+  and give the agent one tool that makes the call:
+  [`/repo`](../repo/)'s `repo_open_pr` is the worked example, and its token never
+  enters the container at all.
+- **Egress is unrestricted.** `@cloudflare/computer`'s `WorkspaceEgressPolicy` is
+  `mode: "direct"` here, so anything in the container can reach anything on the
+  network. That is deliberate for now — a build needs a registry, and a coding
+  agent needs the web — but it means the two paragraphs above are the whole of the
+  containment. Narrowing it to an allowed-host list, with a small classifier for
+  the requests that fall outside, is possible future work rather than something
+  this plugin does today.
+
 ## The host's Durable Object
 
 `binding` points at a class that owns the workspace and exposes two methods:
@@ -69,7 +93,11 @@ execution has no caller identity and cannot compute the name itself, so the pare
 `resolveRuntime` puts it on the runtime state and every tool family reads it back.
 
 `computerExec` exports the shell alone, for [`/repo`](../repo/) — so that plugin gets
-git on a real container without either importing the other.
+git on a real container without either importing the other. It does **not** merge
+`env` into what it runs, deliberately: those commands are another plugin's, they
+carry a forge token, and they pin the git environment they need. A host that wants
+one anyway composes it at the call site, where the merge is visible — see the
+export's own comment.
 
 ## wrangler.jsonc
 

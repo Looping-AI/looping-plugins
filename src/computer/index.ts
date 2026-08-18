@@ -215,26 +215,11 @@ function openWorkspace(
 }
 
 /**
- * Wrap a command so it runs under {@link ComputerConfig.shell} with its two output
- * streams merged, or hand it back untouched when no shell is configured.
+ * The shell wrapper both variants share, minus the choice they differ on.
  *
  * One quoted argument, not string concatenation: the command is model-authored
  * and routinely contains quotes of its own (`git commit -m "…"`), so anything
  * less than `shellQuote` would re-parse the model's quoting and mangle it.
- *
- * ## Why `2>&1`
- *
- * A project's check is a chain — `wrangler types && prettier && eslint && tsc` —
- * and *which tool spoke last* is how you know which one failed. Handing back a
- * stdout block and a separate stderr block destroys that ordering, and the model
- * noticed before we did: it re-ran a 60-second gate as
- * `npm run check > /tmp/out 2>&1; cat /tmp/out` purely to read the transcript in
- * the order it happened. This is that workaround, done once, for free.
- *
- * The redirect binds to the wrapper process, so it applies to everything the
- * command writes however deeply nested — and there is no inner brace group or
- * subshell to mis-parse a command that already contains `&&`, quotes or redirects
- * of its own.
  *
  * ## Why `-o pipefail`
  *
@@ -258,10 +243,60 @@ function openWorkspace(
  * host setting {@link ComputerConfig.shell} is choosing that shell explicitly, and
  * the choice is what this depends on.
  */
+function wrapped(command: string, shell: string): string {
+  return `${shell} -o pipefail -c ${shellQuote(command)}`;
+}
+
+/**
+ * Run a command under {@link ComputerConfig.shell} with its two output streams
+ * left as they are, or hand it back untouched when no shell is configured.
+ *
+ * This is the variant for a caller that **reads the result in code**: `stdout` is
+ * a data channel it compares or parses, and `stderr` is a separate diagnostic.
+ * {@link computerExec} is that caller, on behalf of `@loopingai/plugins/repo`,
+ * which asks git questions like `symbolic-ref --short refs/remotes/origin/HEAD`
+ * and `rev-list --count` and needs the answer alone.
+ *
+ * Two functions rather than one with a flag, because the difference is a change
+ * to the *output contract* and a boolean hides it at the call site — which is
+ * exactly how it went wrong. `computerExec` inherited a `2>&1` written for
+ * `sb_exec`, so every `/repo` git command came back with an empty `stderr` and a
+ * `stdout` that was a transcript rather than an answer. Nothing failed, because
+ * the commands `/repo` parses happen to be quiet ones; a single `warning:` from a
+ * future git would have skipped the empty-branch guard in silence.
+ */
 export function withShell(command: string, shell: string | undefined): string {
-  return shell
-    ? `${shell} -o pipefail -c ${shellQuote(command)} 2>&1`
-    : command;
+  return shell ? wrapped(command, shell) : command;
+}
+
+/**
+ * Run a command under {@link ComputerConfig.shell} with its two output streams
+ * merged into one transcript, in the order they were written.
+ *
+ * This is the variant for a caller whose consumer is **a model reading output**.
+ * `sb_exec` is that caller. A project's check is a chain — `wrangler types &&
+ * prettier && eslint && tsc` — and *which tool spoke last* is how you know which
+ * one failed. Handing back a stdout block and a separate stderr block destroys
+ * that ordering, and the model noticed before we did: it re-ran a 60-second gate
+ * as `npm run check > /tmp/out 2>&1; cat /tmp/out` purely to read the transcript
+ * in the order it happened. This is that workaround, done once, for free.
+ *
+ * The redirect binds to the wrapper process, so it applies to everything the
+ * command writes however deeply nested — and there is no inner brace group or
+ * subshell to mis-parse a command that already contains `&&`, quotes or redirects
+ * of its own.
+ *
+ * With no shell configured there is no wrapper process to redirect, so the
+ * command goes to the runtime untouched and the two streams arrive separate.
+ * That is not a gap: {@link renderResult} renders them as a labelled
+ * `--- stderr ---` block for exactly this case. The transcript is the better
+ * answer, not the only supported one.
+ */
+export function withShellTranscript(
+  command: string,
+  shell: string | undefined
+): string {
+  return shell ? `${wrapped(command, shell)} 2>&1` : command;
 }
 
 export interface ComputerConfig {
@@ -315,12 +350,39 @@ export interface ComputerConfig {
    */
   installGateMs?: number;
   /**
-   * Environment merged into every command — API keys a build needs, proxy
-   * settings. Host-supplied and never model input.
+   * Environment merged into every command **these tools** run — a registry host,
+   * a `CI` flag, proxy settings. Host-supplied and never model input.
    *
-   * Passed per-command rather than set on the container, deliberately: a value
-   * set on the container is readable by anything the model later runs, including
-   * a `printenv` it wrote itself.
+   * "These tools" is exact: {@link computerExec} deliberately does not merge it,
+   * so a proxy set here does not reach the git that `@loopingai/plugins/repo`
+   * runs through that export. The reasoning, and how a host opts in explicitly,
+   * is written up there.
+   *
+   * ## Put no secret here
+   *
+   * Stated first because the previous version of this comment implied the
+   * opposite, and it was wrong in a way that would have leaked a key. It offered
+   * "API keys a build needs" and justified per-command passing as protection from
+   * "a `printenv` it wrote itself" — but *every* command gets this environment,
+   * and `sb_exec`'s command is written by the model. `sb_exec("printenv")` prints
+   * all of it. So does a `postinstall` script in a repository the agent was asked
+   * to clone, which nobody vetted.
+   *
+   * What per-command passing actually buys is narrower and worth keeping: the
+   * value is not set on the container, so a process started outside these tools —
+   * a dev server left running from an earlier task — does not inherit it, and it
+   * is not sitting in `/proc/1/environ`. That is a real property. It is not
+   * confidentiality from the model.
+   *
+   * ## What to do with a secret instead
+   *
+   * Do not hand the agent the credential; hand it the *action*. Keep the secret
+   * on the Worker side and expose one tool that makes the one call it is for.
+   * `@loopingai/plugins/repo` is the worked example: `repo_open_pr` holds a forge
+   * token that can write to the repository and calls the API from the Worker, so
+   * that token never crosses into the container at all — and the one command that
+   * genuinely needs a credential in the container gets it for the duration of
+   * that command, scoped to a single origin.
    */
   env?: () => Record<string, string | undefined>;
 }
@@ -640,6 +702,102 @@ function gitInternalNote(path: string, verb: string): string {
 }
 
 /**
+ * `/workspace/repo/docs/../.git/config` → `/workspace/repo/.git/config`.
+ *
+ * Needed in both directions, which is the part worth stating. It catches a target
+ * that *reaches* `.git` through `..`, and it clears a path that only *passes*
+ * through — `/workspace/repo/.git/../src/a.ts` names `.git` as a segment while
+ * pointing at ordinary source, and refusing that would be a guard inventing work
+ * for the model.
+ */
+function normalizePath(path: string): string {
+  const out: string[] = [];
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    // Popping an empty stack is right for an absolute path: `/..` is `/`.
+    if (segment === "..") out.pop();
+    else out.push(segment);
+  }
+  return `/${out.join("/")}`;
+}
+
+/**
+ * Where a path really points, when its last component is a symlink.
+ *
+ * {@link isGitInternal} and {@link isContainerOnly} read the string they are
+ * given, so `docs/notes.md -> ../.git/config` walks straight past both. The
+ * attacker that matters here is **not** a model holding `sb_exec` — that one can
+ * read `.git` outright and has no use for a link. It is a *cloned repository*:
+ * git tracks symlinks, so a hostile repo ships one and the guard is defeated on
+ * any host that hands out the file tools without a shell, which is precisely the
+ * shape a reviewing parent agent has.
+ *
+ * Writing through such a link is the half that is not recoverable, and is the
+ * vector the repo plugin's clean-room work closed by another door: a `.git/config`
+ * or a `.git/hooks/pre-commit` planted once is read by every later git command.
+ *
+ * ## Only the last component
+ *
+ * A symlinked *ancestor* — `link/ -> .git`, then `link/config` — is not caught.
+ * Resolving every component costs an `lstat` per segment on every file-tool call,
+ * against a Durable Object, and git's own checkout protections already refuse
+ * much of that case. The bound is deliberate; the residual is real.
+ *
+ * A path that does not resolve returns `undefined` rather than throwing: the tool
+ * is about to fail on it anyway, and its own error names the path and the
+ * operation far better than a guard could.
+ */
+async function linkTarget(
+  fs: WorkspaceClient["fs"],
+  path: string
+): Promise<string | undefined> {
+  try {
+    const info = await fs.lstat(path);
+    if (!info.isSymbolicLink) return undefined;
+    const target = await fs.readlink(path);
+    return normalizePath(
+      target.startsWith("/")
+        ? target
+        : `${path.slice(0, path.lastIndexOf("/"))}/${target}`
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The whole path check for the tools that write or read a single file: the string
+ * the model gave, and then what it turns out to point at.
+ *
+ * Returns the sentence to hand back, or `undefined` to proceed. One helper rather
+ * than six repetitions because the pair of checks has to stay in step — a tool
+ * that grew one and forgot the other is the failure this shape prevents.
+ *
+ * `sb_ls`, `sb_grep` and `sb_exists` still do the string checks inline. They are
+ * disclosure rather than corruption, and moving every tool onto one guard is the
+ * wider cleanup tracked in `PLAN.md` — noted here so the asymmetry reads as
+ * pending rather than as an oversight.
+ */
+async function guardPath(
+  fs: WorkspaceClient["fs"],
+  path: string,
+  verb: string
+): Promise<string | undefined> {
+  if (isContainerOnly(path)) return containerOnlyNote(path, verb);
+  if (isGitInternal(path)) return gitInternalNote(path, verb);
+
+  const target = await linkTarget(fs, path);
+  if (target === undefined) return undefined;
+  // Named with the path the model used *and* the one it resolves to. A refusal
+  // naming only the link reads like a bug in the tool.
+  if (isContainerOnly(target))
+    return containerOnlyNote(`${path} (a symlink to ${target})`, verb);
+  if (isGitInternal(target))
+    return gitInternalNote(`${path} (a symlink to ${target})`, verb);
+  return undefined;
+}
+
+/**
  * Fetch a page, drop what is off-limits, and keep the source offsets that make the
  * *next* page exact.
  *
@@ -928,6 +1086,39 @@ export function renderResult(
 }
 
 /**
+ * Why a command has nothing to show for itself.
+ *
+ * {@link renderResult} states a non-`completed` status on its verdict line, so
+ * `sb_exec` has always said this. {@link computerExec} has no verdict line — it
+ * hands back the four fields its caller branches on — and `status` was dropped
+ * there. That matters because a *killed* process writes nothing: a `git clone`
+ * that hit the ten-minute ceiling reached the model through `@loopingai/plugins/repo`
+ * as `clone failed:` with an empty reason after it, which reads like a bug in the
+ * plugin rather than a limit the model can do something about.
+ *
+ * Only `cancelled`. A `failed` status is an ordinary non-zero exit, where the
+ * command's own stderr is the better explanation and this would be noise on top
+ * of it.
+ *
+ * Both plausible causes are named because the exit code cannot separate them:
+ * 137 is SIGKILL, which is what the timeout sends *and* what the kernel sends a
+ * container that ran out of memory.
+ */
+export function cancelledNote(
+  status: WorkspaceRuntimeStatus | undefined,
+  exitCode: number,
+  timeoutMs: number
+): string | undefined {
+  if (status !== "cancelled") return undefined;
+  return (
+    `the command was killed rather than exiting on its own (exit ${exitCode}), so ` +
+    `anything it had not yet written is gone. The two usual causes are the ` +
+    `per-command time limit — ${humanMs(timeoutMs)} here — and the container ` +
+    `running out of memory.`
+  );
+}
+
+/**
  * Programs that read `node_modules`, recognised **in command position only**.
  *
  * Position is what makes this usable rather than merely cautious. Matching these
@@ -1156,14 +1347,20 @@ export function buildComputerTools(
 
         try {
           using ws = await workspace();
+          // Read once per command. This is the *host's* thunk, so calling it
+          // twice in the construction of one command's options is two chances to
+          // disagree — the check and the value would come from different reads.
+          const commandEnv = definedEnv();
           const options = {
             cwd: overrideCwd ?? cwd,
             encoding: "utf8" as const,
             timeoutMs,
-            ...(definedEnv() ? { env: definedEnv() } : {})
+            ...(commandEnv ? { env: commandEnv } : {})
           };
+          // Transcript, not two streams: this result goes to a model, which
+          // reads it as a terminal session rather than parsing it.
           using handle = await ws.runtime.exec(
-            withShell(command, config.shell),
+            withShellTranscript(command, config.shell),
             options
           );
           const result = await handle.result();
@@ -1222,10 +1419,13 @@ export function buildComputerTools(
           .describe("Maximum bytes to return from `offset`")
       }),
       execute: async ({ path, offset, length }) => {
-        if (isContainerOnly(path)) return containerOnlyNote(path, "sb_read");
-        if (isGitInternal(path)) return gitInternalNote(path, "sb_read");
         try {
           using ws = await workspace();
+          // Inside the workspace rather than before it, because the guard now
+          // asks the filesystem where a symlink points. One extra round trip on
+          // a path that was about to be refused anyway.
+          const refusal = await guardPath(ws.fs, path, "sb_read");
+          if (refusal) return refusal;
           // Either knob means the model chose a region; only an unqualified read
           // gets the middle-out guess.
           return offset === undefined && length === undefined
@@ -1253,14 +1453,21 @@ export function buildComputerTools(
           .describe("Full file content (overwrites any existing file)")
       }),
       execute: async ({ path, content }) => {
-        if (isContainerOnly(path)) return containerOnlyNote(path, "sb_write");
-        if (isGitInternal(path)) return gitInternalNote(path, "sb_write");
         try {
           using ws = await workspace();
+          const refusal = await guardPath(ws.fs, path, "sb_write");
+          if (refusal) return refusal;
           const dir = path.slice(0, path.lastIndexOf("/"));
           if (dir) await ws.fs.mkdir(dir, { recursive: true });
           await ws.fs.writeFile(path, content);
-          return `wrote ${path} (${content.length} bytes)`;
+          // Characters, not bytes. `String.length` counts UTF-16 code units — the
+          // distinction `readBounded` documents at length — so calling them bytes
+          // was simply wrong for anything outside ASCII. The exact byte count
+          // would cost a `TextEncoder` pass over the whole content for a number
+          // nobody does arithmetic with, and "characters" is already this module's
+          // word for the same count in `truncateOutput`'s omission marker.
+          const written = content.length;
+          return `wrote ${path} (${written} character${written === 1 ? "" : "s"})`;
         } catch (err) {
           return `error writing ${path}: ${String(err)}`;
         }
@@ -1278,10 +1485,10 @@ export function buildComputerTools(
         replace: z.string().describe("Replacement text")
       }),
       execute: async ({ path, find, replace }) => {
-        if (isContainerOnly(path)) return containerOnlyNote(path, "sb_edit");
-        if (isGitInternal(path)) return gitInternalNote(path, "sb_edit");
         try {
           using ws = await workspace();
+          const refusal = await guardPath(ws.fs, path, "sb_edit");
+          if (refusal) return refusal;
           const content = await ws.fs.readFile(path, "utf8");
           const occurrences = content.split(find).length - 1;
           // Refusing an ambiguous edit is the whole value of this tool over
@@ -1535,6 +1742,37 @@ export function buildComputerTools(
  * same reason — the two plugins compose without either importing the other, and
  * the signature is deliberately identical to the one `/sandbox` exported, so
  * `/repo` did not change at all when the substrate did.
+ *
+ * ## {@link ComputerConfig.env} is deliberately **not** merged here
+ *
+ * {@link buildComputerTools} merges it into every command; this does not, and the
+ * asymmetry is a decision rather than an oversight.
+ *
+ * What this function hands out is a raw shell to *another plugin*, whose commands
+ * this module neither writes nor sees. `/repo` uses it to run credential-bearing
+ * git, and it controls that environment exactly — `GIT_CONFIG_GLOBAL`,
+ * `GIT_ASKPASS` and `GIT_TERMINAL_PROMPT` are pinned per command precisely so
+ * nothing else decides what git reads. Merging a host environment underneath that
+ * would let every key it does *not* pin through: `http_proxy`,
+ * `GIT_PROXY_COMMAND`, `GIT_SSL_CAINFO`, `GIT_EXEC_PATH`. The last one relocates
+ * git's own helper binaries. Redirecting those inside a command holding a forge
+ * token is not a thing a container plugin's config field should be able to do by
+ * accident, from a host that only meant to set a registry.
+ *
+ * So it is not withheld to be safe from the host — it is withheld so that a host
+ * doing it does it *visibly*, at the call site, where the merge is in front of
+ * whoever writes it:
+ *
+ * ```ts
+ * exec: (command, options) =>
+ *   computerExec(config)(command, {
+ *     ...options,
+ *     env: { ...mine, ...options?.env }
+ *   });
+ * ```
+ *
+ * Nothing of value is lost by the default, either, because no secret belongs in
+ * that field in the first place — see {@link ComputerConfig.env}.
  */
 export function computerExec(config: ComputerConfig): (
   command: string,
@@ -1568,13 +1806,23 @@ export function computerExec(config: ComputerConfig): (
         )
       : undefined;
 
+    // Named rather than inlined, because the note below has to state it: a
+    // ceiling the model cannot see is one it cannot work within.
+    const timeoutMs =
+      options?.timeout ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    // `withShell`, never `withShellTranscript`: the caller reads this result in
+    // code. `/repo` compares `stdout` against a URL, tests it for emptiness to
+    // decide a tree is clean, and reads a sha out of it to push — all of which
+    // need `stdout` to carry the answer alone, with git's diagnostics on the
+    // channel git put them on.
     using handle = await ws.runtime.exec(withShell(command, config.shell), {
       cwd: options?.cwd ?? config.cwd ?? DEFAULT_CWD,
       encoding: "utf8",
-      timeoutMs: options?.timeout ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      timeoutMs,
       ...(env ? { env } : {})
     });
     const result = await handle.result();
+    const killed = cancelledNote(result.status, result.exitCode, timeoutMs);
 
     return {
       // `/repo` branches on `success`, which `@cloudflare/sandbox` reported and
@@ -1583,7 +1831,13 @@ export function computerExec(config: ComputerConfig): (
       // fails is `completed` here.
       success: result.exitCode === 0,
       stdout: result.stdout,
-      stderr: result.stderr,
+      // Appended rather than substituted: a command killed at the ceiling may
+      // well have written plenty first, and that output is the more useful half.
+      // This is the only field the note can travel on — `stdout` is a data
+      // channel the caller parses, and the four fields are the whole contract.
+      stderr: killed
+        ? [result.stderr, killed].filter(Boolean).join("\n")
+        : result.stderr,
       exitCode: result.exitCode
     };
   };

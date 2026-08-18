@@ -3,6 +3,7 @@ import type { ToolSet } from "ai";
 import type { WorkspaceClient } from "@cloudflare/computer";
 import {
   buildComputerTools,
+  cancelledNote,
   computer,
   isContainerOnly,
   isGitInternal,
@@ -12,6 +13,7 @@ import {
   renderResult,
   truncateOutput,
   withShell,
+  withShellTranscript,
   workspaceNameFromRuntime,
   WORKSPACE_RUNTIME_KEY,
   type ComputerConfig,
@@ -66,7 +68,12 @@ function stub(
   /** Make the container unreachable, for the paths that have to survive it. */
   execThrows?: string | Error,
   /** Stand in for a tree whose shape the default canned entries cannot express. */
-  findEntries?: FoundEntry[]
+  findEntries?: FoundEntry[],
+  /**
+   * Symlinks, as `path -> target`. A repository can commit one, which is what
+   * makes them a guard's problem rather than a shell's.
+   */
+  links: Record<string, string> = {}
 ): {
   workspace: () => Promise<WorkspaceClient>;
   execs: Array<{ command: string; options?: unknown }>;
@@ -111,6 +118,33 @@ function stub(
         const content = files.get(path);
         if (content === undefined) throw new Error(`ENOENT: ${path}`);
         return { size: content.length, isFile: true, isDirectory: false };
+      },
+      /**
+       * `lstat` does not follow the link — that is the whole distinction, and a
+       * stub that collapsed it would let the guard pass its own tests while
+       * seeing straight through every symlink in production.
+       */
+      lstat: async (path: string) => {
+        if (path in links)
+          return {
+            size: 0,
+            isFile: false,
+            isDirectory: false,
+            isSymbolicLink: true
+          };
+        const content = files.get(path);
+        if (content === undefined) throw new Error(`ENOENT: ${path}`);
+        return {
+          size: content.length,
+          isFile: true,
+          isDirectory: false,
+          isSymbolicLink: false
+        };
+      },
+      readlink: async (path: string) => {
+        const target = links[path];
+        if (target === undefined) throw new Error(`EINVAL: ${path}`);
+        return target;
       },
       writeFile: async (path: string, content: string) => {
         files.set(path, String(content));
@@ -340,20 +374,55 @@ describe("renderResult", () => {
 });
 
 /**
- * The shell wrapper. Two jobs: pick the shell the model actually writes for, and
- * merge the streams so a chained `a && b && c` reads in the order it ran.
+ * The two shell wrappers, and the difference between them.
+ *
+ * Both pick the shell the model actually writes for and both ask for `pipefail`.
+ * They differ on one thing — whether the result is a *transcript* or two separate
+ * streams — and that difference is the output contract, which is why it is two
+ * named functions rather than one with a flag. A flag put the choice at the call
+ * site as a `true` nobody reads, and `computerExec` silently inherited the wrong
+ * one for as long as it existed.
  */
+/**
+ * `renderResult` says this on its verdict line, so `sb_exec` has always had it.
+ * `computerExec` has no verdict line and dropped `status` entirely — and a killed
+ * process writes nothing, so `/repo` reported `clone failed:` with nothing after
+ * the colon for a clone that hit the ceiling.
+ */
+describe("cancelledNote", () => {
+  it("explains a command that was killed, naming both usual causes", () => {
+    const note = cancelledNote("cancelled", 137, 600_000);
+
+    expect(note).toContain("killed");
+    // The ceiling as the model would have to state it to change it, and the
+    // other cause of a 137 — the exit code cannot tell them apart.
+    expect(note).toContain("10m00s");
+    expect(note).toMatch(/out of memory/);
+  });
+
+  it("says nothing about an ordinary failure", () => {
+    // A non-zero exit is the command's own business, and its stderr explains it
+    // better than a note could. Anything here would be noise on every failure.
+    expect(cancelledNote("failed", 1, 600_000)).toBeUndefined();
+    expect(cancelledNote("completed", 0, 600_000)).toBeUndefined();
+    expect(cancelledNote(undefined, 1, 600_000)).toBeUndefined();
+  });
+});
+
 describe("withShell", () => {
   it("is a no-op when no shell is configured", () => {
     expect(withShell("npm test", undefined)).toBe("npm test");
   });
 
-  it("merges stderr into stdout on the wrapper process", () => {
-    const wrapped = withShell("npm run check", "bash");
-    expect(wrapped.startsWith("bash -o pipefail -c ")).toBe(true);
-    // Bound to the wrapper, not nested inside it — so it applies to everything
-    // the command spawns, however deep, with no brace group to mis-parse.
-    expect(wrapped.endsWith(" 2>&1")).toBe(true);
+  /**
+   * The property `/repo` depends on. It asks git questions whose answer is the
+   * whole of stdout — a URL to compare, a sha to push, a count to test against
+   * "0" — so a diagnostic merged into that channel is a wrong answer, not noise.
+   */
+  it("leaves the two streams alone, so stdout carries the answer only", () => {
+    const command = withShell("git rev-list --count origin/main..HEAD", "bash");
+    expect(command.startsWith("bash -o pipefail -c ")).toBe(true);
+    expect(command).not.toContain("2>&1");
   });
 
   /**
@@ -376,9 +445,35 @@ describe("withShell", () => {
    * corruption, not an error.
    */
   it("survives a command that contains its own quotes", () => {
-    const wrapped = withShell(`git commit -m "add a line"`, "bash");
-    expect(wrapped).toContain("add a line");
-    expect(wrapped.endsWith(" 2>&1")).toBe(true);
+    expect(withShell(`git commit -m "add a line"`, "bash")).toContain(
+      "add a line"
+    );
+  });
+});
+
+describe("withShellTranscript", () => {
+  it("is a no-op when no shell is configured", () => {
+    expect(withShellTranscript("npm test", undefined)).toBe("npm test");
+  });
+
+  it("merges stderr into stdout on the wrapper process", () => {
+    const command = withShellTranscript("npm run check", "bash");
+    expect(command.startsWith("bash -o pipefail -c ")).toBe(true);
+    // Bound to the wrapper, not nested inside it — so it applies to everything
+    // the command spawns, however deep, with no brace group to mis-parse.
+    expect(command.endsWith(" 2>&1")).toBe(true);
+  });
+
+  it("keeps pipefail, which is not the half that differs", () => {
+    expect(withShellTranscript("npm run check | tail -100", "bash")).toContain(
+      "-o pipefail"
+    );
+  });
+
+  it("survives a command that contains its own quotes", () => {
+    const command = withShellTranscript(`git commit -m "add a line"`, "bash");
+    expect(command).toContain("add a line");
+    expect(command.endsWith(" 2>&1")).toBe(true);
   });
 });
 
@@ -969,6 +1064,114 @@ describe("paths inside .git", () => {
   });
 
   /**
+   * A string check reads the path it was given, so `docs/notes.md -> ../.git/config`
+   * walks straight past it.
+   *
+   * The attacker worth defending against here is **not** a model holding
+   * `sb_exec` — that one reads `.git` outright and has no use for a link. It is a
+   * cloned repository: git tracks symlinks, so a hostile repo ships one and the
+   * guard is defeated on any host that grants the file tools without a shell,
+   * which is exactly the shape a reviewing parent agent has.
+   */
+  describe("through a symlink", () => {
+    const link = "/workspace/repo/docs/notes.md";
+    const links = { [link]: "../.git/config" };
+
+    it("refuses a write, which is the half that cannot be undone", async () => {
+      const { workspace, files } = stub({}, undefined, undefined, links);
+      const tools = buildComputerTools(workspace, config);
+
+      const out = await run(tools, "sb_write", { path: link, content: "x" });
+      expect(out).toContain("repo_status");
+      // Named as a link, and named with where it lands — a refusal that reported
+      // only the path the model typed reads like a bug in the tool.
+      expect(out).toContain("symlink to /workspace/repo/.git/config");
+      expect(files.has(link)).toBe(false);
+    });
+
+    it("refuses a read and an edit through the same link", async () => {
+      const { workspace } = stub(
+        { [link]: "whatever" },
+        undefined,
+        undefined,
+        links
+      );
+      const tools = buildComputerTools(workspace, config);
+
+      for (const name of ["sb_read", "sb_edit"]) {
+        const out = await run(tools, name, {
+          path: link,
+          find: "a",
+          replace: "b"
+        });
+        expect(out).toContain("repo_diff");
+        expect(out).not.toContain("sb_exec");
+      }
+    });
+
+    it("resolves an absolute target as well as a relative one", async () => {
+      const { workspace } = stub({}, undefined, undefined, {
+        [link]: "/workspace/repo/.git/HEAD"
+      });
+      const tools = buildComputerTools(workspace, config);
+
+      expect(
+        await run(tools, "sb_write", { path: link, content: "x" })
+      ).toEqual(
+        expect.stringContaining("symlink to /workspace/repo/.git/HEAD")
+      );
+    });
+
+    it("catches a link into node_modules with the note that fits it", async () => {
+      const { workspace } = stub({}, undefined, undefined, {
+        [link]: "../node_modules/zod/package.json"
+      });
+      const tools = buildComputerTools(workspace, config);
+
+      const out = await run(tools, "sb_read", { path: link });
+      // The other list, and its own explanation: absent rather than forbidden,
+      // so this one *does* point at sb_exec.
+      expect(out).toContain("node_modules");
+      expect(out).toContain("sb_exec");
+    });
+
+    /**
+     * The guard must not invent work. A link that merely *passes through* a
+     * `.git` segment on its way somewhere ordinary is an ordinary file, and
+     * normalising is what tells the two apart.
+     */
+    it("allows a link whose target only traverses .git", async () => {
+      const { workspace, files } = stub({}, undefined, undefined, {
+        [link]: "/workspace/repo/.git/../src/a.ts"
+      });
+      const tools = buildComputerTools(workspace, config);
+
+      expect(await run(tools, "sb_write", { path: link, content: "x" })).toBe(
+        `wrote ${link} (1 character)`
+      );
+      expect(files.get(link)).toBe("x");
+    });
+
+    /**
+     * The bound, stated as a test so it is a decision rather than a gap. A
+     * symlinked *ancestor* is not resolved: that costs an `lstat` per segment on
+     * every call, against a Durable Object, for a case git's own checkout
+     * protections already refuse much of.
+     */
+    it("does not resolve a symlinked ancestor — the documented residual", async () => {
+      const { workspace } = stub({}, undefined, undefined, {
+        "/workspace/repo/link": ".git"
+      });
+      const tools = buildComputerTools(workspace, config);
+
+      const out = await run(tools, "sb_read", {
+        path: "/workspace/repo/link/config"
+      });
+      expect(out).not.toContain("repo_diff");
+    });
+  });
+
+  /**
    * The one prohibition this plugin must never soften. Naming `sb_exec` beside git
    * would hand back the exact capability the refusal withholds, in the one place
    * the model is already looking for a way around it — and with the tool's own
@@ -1251,6 +1454,32 @@ describe("sb_exec", () => {
   });
 
   /**
+   * The seam, asserted where it actually is.
+   *
+   * `withShell` and `withShellTranscript` are tested above in isolation, which
+   * proves they differ but not that each caller picked the right one — and
+   * picking the wrong one is the whole defect. `sb_exec` writes for a model, so
+   * it wants the transcript; `computerExec` hands its result to `/repo`, which
+   * compares `stdout` against a URL, tests it for emptiness to call a tree clean,
+   * and reads a sha out of it to push. Merging there turns every one of those
+   * into a question git's diagnostics can answer wrongly.
+   */
+  it("sends a transcript, while computerExec sends two streams", async () => {
+    const { workspace, execs } = stub();
+    const tools = buildComputerTools(workspace, { ...config, shell: "bash" });
+
+    await run(tools, "sb_exec", { command: "npm run check" });
+
+    expect(execs[0]!.command).toContain("bash -o pipefail -c ");
+    expect(execs[0]!.command.endsWith(" 2>&1")).toBe(true);
+    // The other half of the seam. `computerExec` builds its command with the
+    // same `config.shell` and must not come back with the redirect on it.
+    expect(withShell("git rev-list --count main..HEAD", "bash")).not.toContain(
+      "2>&1"
+    );
+  });
+
+  /**
    * A config thunk that reads straight off `env` hands back `undefined` for
    * anything unset, and `RuntimeExecOptions.env` is `Record<string, string>` —
    * so an unfiltered pass-through arrives in the container as the literal
@@ -1268,6 +1497,28 @@ describe("sb_exec", () => {
     expect((execs[0]!.options as { env: Record<string, string> }).env).toEqual({
       SET: "yes"
     });
+  });
+
+  /**
+   * The thunk is the host's, and it is a thunk precisely so a rotated value is
+   * picked up per command. Calling it twice while building *one* command's
+   * options is two reads that can disagree — the one that decides whether `env`
+   * is set, and the one that becomes its value.
+   */
+  it("reads the host's env thunk once per command", async () => {
+    const { workspace } = stub();
+    let reads = 0;
+    const tools = buildComputerTools(workspace, {
+      ...config,
+      env: () => {
+        reads += 1;
+        return { SET: "yes" };
+      }
+    });
+
+    await run(tools, "sb_exec", { command: "printenv" });
+
+    expect(reads).toBe(1);
   });
 
   /**

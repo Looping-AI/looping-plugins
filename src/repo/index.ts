@@ -36,9 +36,18 @@ import type { AgentPlugin } from "@loopingai/core";
  *    URL-specific `http.<url>.sslVerify=false` in the repository's own config,
  *    because specificity outranks precedence. So the credential-bearing
  *    commands moved out of the checkout entirely, into a bare git dir created
- *    per operation whose whole config is what `git init` wrote — see
- *    {@link cleanConfig}. The checkout's objects are reached through an
- *    alternates file, so nothing is copied and nothing is slower.
+ *    per operation whose whole config is what we write on the command line and
+ *    into the dir itself — see {@link cleanConfig}. The checkout's objects are
+ *    reached through an alternates file, so nothing is copied and nothing is
+ *    slower.
+ *
+ *    That dir is built, configured and used inside **one** command. Splitting
+ *    those steps left a window: the model has a root shell on the same
+ *    filesystem, so between creating the dir and using it, a `config` could be
+ *    planted in it — and a URL-specific `http.<url>.proxy` there beats a `-c`
+ *    override for the same specificity reason. So the credentialed command
+ *    writes the dir's entire configuration itself, immediately before git reads
+ *    it, rather than trusting what it finds.
  * 1. **The token never appears in a command string.** It goes through `exec`'s
  *    per-command `env`, because a command line is echoed into stdout, into
  *    stderr on failure, into shell history, and into any VCR cassette a test
@@ -61,13 +70,18 @@ import type { AgentPlugin } from "@loopingai/core";
  * the container's process environment for the duration of one command, scoped to
  * one origin, in a git dir that has no hooks and no configuration of its own.
  *
- * It is not zero. The model has a root shell in the same filesystem, so it can
- * still race a write against the clean dir between the command that creates it
- * and the command that uses it. What rule 0 removes is the durable version of
- * that attack — plant once, collect on every future push — and it leaves one
- * that has to win a race inside a single turn. The complete fix is to stop doing
- * authenticated git in the container at all, which means pushing from the Worker
- * over the forge's API; that is a larger change than this file.
+ * It is not zero, and the residual is worth naming precisely rather than waving
+ * at. Rule 0 removes the durable form of the attack — plant once in the
+ * checkout, collect on every future push — and folding each operation into a
+ * single command removes the window between building the isolated dir and using
+ * it. What is left is a race *inside* one command, against a path named from the
+ * Worker that the attacker has to discover first. The complete fix is to stop
+ * doing authenticated git in the container at all, which means pushing from the
+ * Worker over the forge's API; that is a larger change than this file.
+ *
+ * A separate limit, and not one this plugin can close: the allowlist bounds the
+ * *host*, never the repository. Whatever the token can reach, an agent talked
+ * into naming it can reach. See the README — the token wants to be fine-grained.
  */
 
 /** This plugin's tool-family name, as a recipe's `toolFamilies` lists it. */
@@ -165,6 +179,11 @@ export interface RepoConfig {
    * sensible thing to do with it is record a selection, which is why it returns
    * nothing and cannot be awaited — a host that needs to do I/O here has the
    * ordering wrong.
+   *
+   * A throw **fails the clone**, unlike {@link RepoConfig.afterCheckout}, whose
+   * throw is caught and logged. A host that cannot choose a workspace has not
+   * chosen one, and cloning into whichever was already open is worse than not
+   * cloning.
    */
   beforeCheckout?: (target: {
     url: string;
@@ -182,8 +201,14 @@ export interface RepoCheckout {
   url: string;
   /** Host it came from, lowercase. */
   host: string;
-  /** `owner/repo`, when the URL parsed into one. */
-  repo?: string;
+  /**
+   * `owner/repo`.
+   *
+   * Always present: a URL that does not parse into one is refused before any git
+   * runs, so a host keying anything per repository can rely on this rather than
+   * inventing a fallback for a case that no longer reaches it.
+   */
+  repo: string;
   /** Branch the checkout is on. */
   branch: string;
   /** True for a first clone, false when an existing tree was refreshed. */
@@ -198,6 +223,14 @@ const DEFAULT_AUTHOR = {
   email: "coder@looping.invalid"
 };
 const DEFAULT_MAX_OUTPUT_BYTES = 16_000;
+/**
+ * Ceiling on the one call this plugin makes that is not a container command.
+ *
+ * Not configurable, because it is not a tuning knob: it exists so that an API
+ * which stops answering costs a round rather than the task. Opening a pull
+ * request is a single small POST, and thirty seconds is already generous for one.
+ */
+const PR_TIMEOUT_MS = 30_000;
 
 /**
  * Middle-out truncation, so both the head of a diff and its tail survive.
@@ -339,6 +372,30 @@ function repoLocation(url: string): { host: string; path: string } | undefined {
 }
 
 /**
+ * A name a forge would actually issue — and, more to the point, one that is safe
+ * to use as a path segment and as a key.
+ *
+ * GitHub's own rule for both an owner and a repository is alphanumerics, `-`,
+ * `_` and `.`, so nothing legitimate is turned away by insisting on it. What it
+ * turns away is the reason it exists: `..` and `.` are valid matches for "a path
+ * segment that is not a slash", and {@link buildRepoTools} builds a checkout
+ * directory out of the repository name — so `https://github.com/o/..` produced a
+ * `dir` of `/workspace/..`, which is `/`.
+ *
+ * The key half matters as much and is less visible. `beforeCheckout` hands
+ * `owner` and `repo` to the host, and this plugin's README tells that host to
+ * derive a per-repository workspace name from them. A name carrying `|`, `:` or
+ * a space is then a separator in somebody else's key format, which is how two
+ * callers end up sharing one workspace.
+ */
+const FORGE_NAME = /^[A-Za-z0-9._-]+$/;
+
+function isForgeName(name: string): boolean {
+  // `.` and `..` pass the character class and are exactly the two that must not.
+  return name !== "." && name !== ".." && FORGE_NAME.test(name);
+}
+
+/**
  * `owner/repo` out of a GitHub URL, or `undefined` if it is not one.
  *
  * Anchored on the parsed **host**, which the previous unanchored regex was not:
@@ -346,6 +403,14 @@ function repoLocation(url: string): { host: string; path: string } | undefined {
  * `https://evil.example.com/github.com/owner/repo` parsed as that owner and
  * repo. Nothing gated on this at the time, which is exactly why it was worth
  * fixing before something did.
+ *
+ * Both names are then checked against {@link isForgeName}, so a name that could
+ * traverse a path or split somebody else's key never gets as far as being one.
+ *
+ * `undefined` is a refusal at every caller. `repo_clone` used to treat it as
+ * "clone anyway, into `${workdir}/repo`, without telling the host which
+ * repository this is" — which put the checkout in whichever workspace was
+ * already open. It now says so and stops.
  */
 export function parseRepo(
   url: string,
@@ -356,7 +421,64 @@ export function parseRepo(
 
   const match = /^\/?([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(location.path);
   if (!match) return undefined;
-  return { owner: match[1]!, repo: match[2]! };
+
+  const [, owner, repo] = match as unknown as [string, string, string];
+  if (!isForgeName(owner) || !isForgeName(repo)) return undefined;
+  return { owner, repo };
+}
+
+/**
+ * What one container command produced — plus one bit the container did not.
+ *
+ * `exec` does not only *return* failures, it throws them: `@cloudflare/computer`
+ * throws `EEXEC_LOST` when a container is replaced mid-command, and any call to a
+ * Durable Object can fail outright. None of that used to be caught anywhere in
+ * this file, so it left as a tool error carrying
+ * `Execution "…" was lost when its container runtime was replaced` — a sentence
+ * whose plausible readings are all wrong and all expensive.
+ *
+ * It is caught at the seam instead ({@link buildRepoTools}'s `run`) and turned
+ * into a failed result, because every tool here already has a `!success` branch
+ * that says what it was doing at the time. "could not read the status of /w/r: …"
+ * is a better sentence than anything a wrapper one level up could write, and a
+ * seventh tool calling `plain` gets it without being told.
+ *
+ * `unreachable` is for the branches that must tell the two apart. A command that
+ * ran and failed has answered the question it was asked; a command that never ran
+ * has answered nothing, and three places here read a failure as an answer.
+ */
+type RunResult = Awaited<ReturnType<RepoExec>> & { unreachable?: true };
+
+/**
+ * What to tell the model when the plumbing, not the command, is the problem.
+ *
+ * A sibling of the computer plugin's `execLostNote` rather than an import, for
+ * the same reason {@link truncateOutput} is a copy: `npm run verify:exports`
+ * fails any subpath whose module graph reaches a sibling's, and installing `repo`
+ * must not drag `computer` in behind it. The wording differs anyway, and the
+ * difference is the point — that plugin cannot know the lost command was git, and
+ * this one does. What a model needs after a lost `git push` is not "re-run it"
+ * but whether re-running it is *safe*.
+ */
+function unreachableNote(err: unknown): string {
+  if ((err as { code?: unknown } | null | undefined)?.code === "EEXEC_LOST") {
+    return (
+      "the container was replaced while this command was running, so nothing here " +
+      "is known to have finished. This is infrastructure — not git, and not what " +
+      "you asked for. The checkout is durable and is exactly as you left it. " +
+      "Retry, and read what the retry says rather than assuming it starts from " +
+      "nothing: a command that had already reached the forge may have taken " +
+      "effect. Retrying is safe either way — these commands push one specific " +
+      "commit and never force."
+    );
+  }
+  return (
+    `the command could not be run: ${String(err)}. This is the plumbing — the ` +
+    `container, the transport to it, or the host's own configuration — rather ` +
+    `than git or anything you passed, and nothing is known to have completed. ` +
+    `Retry once; if it happens again, say so in your result rather than working ` +
+    `around it.`
+  );
 }
 
 /**
@@ -422,6 +544,19 @@ async function refreshCheckout({
   host: string;
 }): Promise<RefreshOutcome> {
   const remote = await plain("remote get-url origin", dir);
+  // Interrogated, for the same reason the `status` below is: a question that went
+  // unanswered is not the answer "some other repository". Empty stdout from a
+  // command that *failed* used to produce exactly that sentence — so an
+  // unreachable container, or a git dir with no origin at all, sent the model
+  // looking for a checkout of something nobody had mentioned.
+  if (!remote.success) {
+    return {
+      message:
+        `could not read which repository ${dir} holds: ` +
+        `${remote.stderr || remote.stdout || "git remote get-url origin failed"}\n` +
+        `Nothing was fetched or reset.`
+    };
+  }
   if (remote.stdout.trim() !== url.trim()) {
     return {
       message:
@@ -555,7 +690,18 @@ export function buildRepoTools(
     tool: string,
     detail: { exitCode?: number; stderr?: string; stdout?: string }
   ): void => {
-    const token = config.token();
+    // Read defensively, because this now runs on the path where the plumbing
+    // failed — and a `GITHUB_TOKEN` the host cannot resolve is one of the
+    // likelier reasons to be here. A thunk that throws would throw out of the
+    // handler written to stop throws escaping, which is the one thing this must
+    // never do. Nothing to scrub is not a problem; nothing gets logged either
+    // way except what a command produced.
+    let token: string;
+    try {
+      token = config.token();
+    } catch {
+      token = "";
+    }
     const scrub = (text: string | undefined) =>
       token && text ? text.split(token).join("«token»") : text;
     console.warn(`[repo] ${tool} failed`, {
@@ -618,14 +764,60 @@ export function buildRepoTools(
    * allowlist check, so the origin the credential is bound to is always one the
    * host configured.
    */
+  /**
+   * Every container command this plugin runs, and the only place `exec` is
+   * allowed to throw.
+   *
+   * `options` is a thunk rather than a value so that everything it reads — the
+   * token above all — is read here, inside the `try` and at the moment the queue
+   * actually dequeues this command. Building it at the call site would put a
+   * rotated secret's lookup, and any throw from it, outside the one handler.
+   */
+  const run = (
+    command: string,
+    options: () => Parameters<RepoExec>[1]
+  ): Promise<RunResult> =>
+    serialised(async () => {
+      try {
+        return await config.exec(command, options());
+      } catch (err) {
+        // Logged here as well as by the tool's own failure branch: the two say
+        // different things, and this is the one that names the command. The
+        // command string is safe to log — that it never carries the token is the
+        // invariant this whole file is built on, and it has a test.
+        console.warn("[repo] command could not run", {
+          command: truncateOutput(command, 500),
+          err: String(err)
+        });
+        return {
+          success: false,
+          stdout: "",
+          stderr: unreachableNote(err),
+          exitCode: -1,
+          unreachable: true
+        };
+      }
+    });
+
   const credentialed = (
     host: string,
     args: string,
     cwd: string,
-    vars: Record<string, string> = {}
+    vars: Record<string, string> = {},
+    /**
+     * Shell run in the *same* command, immediately before the git invocation.
+     *
+     * This is how the isolated dir gets built and its configuration re-asserted
+     * with no gap for anything to be planted in between. Everything a caller
+     * puts here must be a plain file operation or a git command against the room
+     * — never git inside the checkout, which is the one place the token must not
+     * reach. Chained with `&&`, so a failure stops before the credential is used.
+     */
+    prelude?: string
   ) =>
-    serialised(() =>
-      config.exec(`git ${cleanConfig(host)} ${args}`, {
+    run(
+      `${prelude ? `${prelude} && ` : ""}git ${cleanConfig(host)} ${args}`,
+      () => ({
         cwd,
         runtime,
         env: {
@@ -642,13 +834,11 @@ export function buildRepoTools(
     cwd: string,
     vars: Record<string, string> = {}
   ) =>
-    serialised(() =>
-      config.exec(script, {
-        cwd,
-        runtime,
-        env: { GIT_TERMINAL_PROMPT: "0", ...vars }
-      })
-    );
+    run(script, () => ({
+      cwd,
+      runtime,
+      env: { GIT_TERMINAL_PROMPT: "0", ...vars }
+    }));
 
   const plain = (
     args: string,
@@ -657,84 +847,173 @@ export function buildRepoTools(
   ) => shell(`git ${args}`, cwd, vars);
 
   /**
-   * A git dir the model has never had the chance to configure.
+   * Create a git dir the model has never had the chance to configure.
    *
    * Named from the Worker rather than by `mktemp`, for two reasons. The path is
    * then unguessable *and* it is not something the container told us — a path
    * read back from a command's stdout is model-controlled, and this one is later
    * handed to `rm -rf`.
+   */
+  const CREATE_ROOM = [
+    'rm -rf "$GIT_ROOM"',
+    'git -c init.templateDir= init -q --bare "$GIT_ROOM"'
+  ].join(" && ");
+
+  /**
+   * Write the room's entire on-disk configuration, in the same command that is
+   * about to read it.
    *
-   * The checkout's objects arrive through an alternates **file** rather than
-   * `GIT_ALTERNATE_OBJECT_DIRECTORIES`. That is not a style choice: the last
-   * step of a refresh has the checkout fetch *from* this dir, which spawns an
+   * This is what closes the window creating it left open. The model has a root
+   * shell on the same filesystem, so between the command that made the room and
+   * the command that uses it there was a gap in which `$GIT_ROOM/config` could
+   * be given an `http.<url>.proxy` and an `sslVerify=false` — and a URL-specific
+   * key in a repository's own config beats a `-c` override, which is the whole
+   * reason the room exists. Rewriting the file rather than trusting it means the
+   * attacker has to win a race *inside* one process instead of between two.
+   *
+   * The three files are every channel that survives into a credentialed command:
+   * `config`, the alternates that decide which objects are reachable, and
+   * `shallow`. Hooks are the fourth and are dealt with on the command line by
+   * {@link cleanConfig}, which no file can override.
+   *
+   * `bare = true` and format 0 are what `git init --bare` itself writes, and we
+   * created this dir two steps ago, so restating them is exact rather than a
+   * guess.
+   *
+   * The alternates arrive as a **file** rather than through
+   * `GIT_ALTERNATE_OBJECT_DIRECTORIES`. That is not a style choice: a refresh
+   * ends with the checkout fetching *from* this dir, which spawns an
    * `upload-pack` inside it that does not inherit our environment. With the
    * variable and not the file, that fetch dies on `bad pack header`.
    *
    * `shallow` is copied when it exists, and it is load-bearing for `depth`:
-   * without it the clean dir believes it has history it does not have, builds a
-   * pack on that belief, and the push is rejected with `unpacker error`.
+   * without it the room believes it has history it does not have, builds a pack
+   * on that belief, and the push is rejected with `unpacker error`.
+   *
+   * Note what this does *not* do: run git inside the checkout. Every line is a
+   * plain file operation on a path, which is what makes it safe to put in the
+   * same command as the token.
    */
-  const openCleanRoom = async (room: string, dir: string) =>
-    shell(
-      [
-        'rm -rf "$GIT_CLEAN"',
-        'git -c init.templateDir= init -q --bare "$GIT_CLEAN"',
-        `printf '%s\\n' "$REPO_DIR/.git/objects" > "$GIT_CLEAN/objects/info/alternates"`,
-        '{ [ ! -f "$REPO_DIR/.git/shallow" ] || cp "$REPO_DIR/.git/shallow" "$GIT_CLEAN/shallow"; }'
-      ].join(" && "),
-      workdir,
-      { GIT_CLEAN: room, REPO_DIR: dir }
-    );
+  const ASSERT_ROOM = [
+    `printf '[core]\\n\\trepositoryformatversion = 0\\n\\tbare = true\\n' > "$GIT_ROOM/config"`,
+    `printf '%s\\n' "$REPO_DIR/.git/objects" > "$GIT_ROOM/objects/info/alternates"`,
+    '{ [ ! -f "$REPO_DIR/.git/shallow" ] || cp "$REPO_DIR/.git/shallow" "$GIT_ROOM/shallow"; }'
+  ].join(" && ");
+
+  /**
+   * Which step a chained script reached, so a failure still names itself.
+   *
+   * Folding the steps into one command costs the thing separate commands gave
+   * for free: a return value per step. A marker per stage buys it back, and it
+   * goes to stdout because the message a caller renders reads `stderr` first —
+   * so on the failing path git's own diagnostic still wins and these stay out of
+   * it.
+   */
+  const stage = (name: string) => `echo "[stage:${name}]"`;
+
+  const lastStage = (out: string): string | undefined =>
+    [...out.matchAll(/\[stage:(\w+)\]/g)].pop()?.[1];
+
+  /**
+   * Turn a failed room script into a sentence that says where it stopped.
+   *
+   * A success passes through untouched — the stage markers are diagnostics for
+   * the path that failed, and rewriting `stderr` on a command that worked would
+   * put a sentence about failure into a result that had none.
+   *
+   * `run` means the setup finished and git itself failed, which is the ordinary
+   * case: the caller wants git's own message, not ours.
+   */
+  const roomFailure = <
+    T extends {
+      success: boolean;
+      stdout: string;
+      stderr: string;
+      unreachable?: true;
+    }
+  >(
+    result: T
+  ): T => {
+    if (result.success) return result;
+    // A command that never ran stopped at no stage at all. "stopped at start"
+    // would be true only in the sense that nothing happened, and it would point
+    // at the room script for something the container did.
+    if (result.unreachable) return result;
+    const stopped = lastStage(result.stdout);
+    if (stopped === "run") return result;
+    return {
+      ...result,
+      stderr:
+        `could not prepare an isolated git dir (stopped at ${stopped ?? "start"}): ` +
+        `${result.stderr || result.stdout}`
+    };
+  };
 
   const closeCleanRoom = (room: string) =>
-    shell('rm -rf "$GIT_CLEAN"', workdir, { GIT_CLEAN: room });
+    shell('rm -rf "$GIT_ROOM"', workdir, { GIT_ROOM: room });
 
   const cleanRoomPath = () => `/tmp/looping-repo-${crypto.randomUUID()}.git`;
 
   /**
    * Fetch `origin` without any of the checkout's configuration applying.
    *
-   * Three steps, and the middle one is the only one holding the token:
+   * Three commands, and only the middle one holds the token. The split is not
+   * cosmetic: the first has to run `git` **inside the checkout** to read its
+   * refs, and a git command in the checkout is precisely what must never carry
+   * the credential — that repository's config and hooks are model-writable, and
+   * git executes what they name. So the seed goes in its own command with no
+   * token, and the credentialed fetch re-asserts the room's own configuration
+   * before using it rather than trusting what it finds.
    *
-   * 1. seed the clean dir with the checkout's refs, so the fetch has a
-   *    negotiation base. Skip it and git has nothing to say it already has,
-   *    and re-downloads the entire history on every refresh.
-   * 2. fetch from the forge into the clean dir.
+   * 1. build the room and seed it with the checkout's refs, so the fetch has a
+   *    negotiation base. Skip it and git has nothing to say it already has, and
+   *    re-downloads the entire history on every refresh.
+   * 2. re-assert the room's config, then fetch from the forge into it.
    * 3. move the updated remote refs into the checkout, over the local
    *    transport, with no credential anywhere near it.
    */
   const fetchOrigin = async (dir: string, url: string, host: string) => {
     const room = cleanRoomPath();
-    const prepared = await openCleanRoom(room, dir);
-    if (!prepared.success) {
-      return {
-        ...prepared,
-        stderr: `could not prepare an isolated git dir: ${prepared.stderr || prepared.stdout}`
-      };
-    }
+
+    const prepared = await shell(
+      [
+        stage("create"),
+        CREATE_ROOM,
+        // The alternates have to exist *before* the seed, not only before the
+        // fetch. `update-ref` refuses a ref whose object it cannot reach, so
+        // without them every ref fails with "nonexistent object", the seed
+        // quietly does nothing, and the fetch that follows re-downloads the
+        // whole history — the exact cost the seed exists to avoid, and silent
+        // because the seed is best-effort.
+        stage("assert"),
+        ASSERT_ROOM,
+        stage("seed"),
+        // Best effort: a failure here costs a full history download, not
+        // correctness, and a repository with no refs to seed is a fresh one.
+        // Wrapped so it cannot fail the chain — `pipefail` would otherwise make
+        // an empty ref list stop everything.
+        '{ git -C "$REPO_DIR" for-each-ref --format="update %(refname) %(objectname)"' +
+          ' | git --git-dir="$GIT_ROOM" update-ref --stdin || true; }'
+      ].join(" && "),
+      workdir,
+      { GIT_ROOM: room, REPO_DIR: dir }
+    );
+    if (!prepared.success) return roomFailure(prepared);
 
     try {
-      // Best effort: a failure here costs a full history download, not
-      // correctness, and a repository with no refs to seed is a fresh one.
-      await shell(
-        'git -C "$REPO_DIR" for-each-ref --format="update %(refname) %(objectname)"' +
-          ' | git --git-dir="$GIT_CLEAN" update-ref --stdin',
-        workdir,
-        { REPO_DIR: dir, GIT_CLEAN: room }
-      );
-
       const fetched = await credentialed(
         host,
-        `--git-dir="$GIT_CLEAN" fetch --prune "$REPO_URL" "+refs/heads/*:refs/remotes/origin/*"`,
+        `--git-dir="$GIT_ROOM" fetch --prune "$REPO_URL" "+refs/heads/*:refs/remotes/origin/*"`,
         workdir,
-        { GIT_CLEAN: room, REPO_URL: url }
+        { GIT_ROOM: room, REPO_DIR: dir, REPO_URL: url },
+        [stage("assert"), ASSERT_ROOM, stage("run")].join(" && ")
       );
-      if (!fetched.success) return fetched;
+      if (!fetched.success) return roomFailure(fetched);
 
       return await shell(
-        'git -C "$REPO_DIR" fetch --prune "$GIT_CLEAN" "+refs/remotes/origin/*:refs/remotes/origin/*"',
+        'git -C "$REPO_DIR" fetch --prune "$GIT_ROOM" "+refs/remotes/origin/*:refs/remotes/origin/*"',
         workdir,
-        { REPO_DIR: dir, GIT_CLEAN: room }
+        { REPO_DIR: dir, GIT_ROOM: room }
       );
     } finally {
       await closeCleanRoom(room);
@@ -757,29 +1036,39 @@ export function buildRepoTools(
     sha: string
   ) => {
     const room = cleanRoomPath();
-    const prepared = await openCleanRoom(room, dir);
-    if (!prepared.success) {
-      return {
-        ...prepared,
-        stderr: `could not prepare an isolated git dir: ${prepared.stderr || prepared.stdout}`
-      };
-    }
-
     try {
-      const staged = await shell(
-        'git --git-dir="$GIT_CLEAN" update-ref "refs/heads/$REPO_BRANCH" "$REPO_SHA"',
-        workdir,
-        { GIT_CLEAN: room, REPO_BRANCH: branch, REPO_SHA: sha }
-      );
-      if (!staged.success) return staged;
-
-      // No leading `+`, so this stays a non-force push — the same guarantee the
-      // old `push origin <branch>` gave, now stated in the refspec.
-      return await credentialed(
-        host,
-        `--git-dir="$GIT_CLEAN" push "$REPO_URL" "refs/heads/$REPO_BRANCH:refs/heads/$REPO_BRANCH"`,
-        workdir,
-        { GIT_CLEAN: room, REPO_URL: url, REPO_BRANCH: branch }
+      // One command, start to finish, and the push is the only part that needed
+      // splitting up before. Nothing here runs git inside the checkout — the
+      // room is created in /tmp, its files are written with `printf` and `cp`,
+      // and the ref is staged from a sha the caller already resolved. So the
+      // token can be present throughout without ever entering a repository
+      // whose config and hooks the model can write, and there is no window
+      // between building the room and using it for anything to be planted in.
+      //
+      // No leading `+` on the refspec, so this stays a non-force push — the same
+      // guarantee the old `push origin <branch>` gave, now stated outright.
+      return roomFailure(
+        await credentialed(
+          host,
+          `--git-dir="$GIT_ROOM" push "$REPO_URL" "refs/heads/$REPO_BRANCH:refs/heads/$REPO_BRANCH"`,
+          workdir,
+          {
+            GIT_ROOM: room,
+            REPO_DIR: dir,
+            REPO_URL: url,
+            REPO_BRANCH: branch,
+            REPO_SHA: sha
+          },
+          [
+            stage("create"),
+            CREATE_ROOM,
+            stage("assert"),
+            ASSERT_ROOM,
+            stage("stage"),
+            'git --git-dir="$GIT_ROOM" update-ref "refs/heads/$REPO_BRANCH" "$REPO_SHA"',
+            stage("run")
+          ].join(" && ")
+        )
       );
     } finally {
       await closeCleanRoom(room);
@@ -795,15 +1084,24 @@ export function buildRepoTools(
    */
   const origin = async (
     dir: string
-  ): Promise<{ host: string; url: string } | undefined> => {
-    const remote = await plain("remote get-url origin", dir);
-    if (!remote.success) return undefined;
-    const url = remote.stdout.trim();
+  ): Promise<{
+    /** Set when the checkout names an origin on an allowed host. */
+    remote?: { host: string; url: string };
+    /** Set when git never answered, so "no origin" would be a guess. */
+    unreachable?: string;
+  }> => {
+    const result = await plain("remote get-url origin", dir);
+    // Two different nothings. `repo_push`'s answer to "no origin here" is to
+    // tell the model to clone the repository first — advice that is actively
+    // wrong when the truth is that no command ran at all.
+    if (result.unreachable) return { unreachable: result.stderr };
+    if (!result.success) return {};
+    const url = result.stdout.trim();
     const location = repoLocation(url);
-    if (!location || !allowedHosts.includes(location.host)) return undefined;
+    if (!location || !allowedHosts.includes(location.host)) return {};
     // The URL as well as the host: the credentialed commands run in a dir with
     // no remotes, so `origin` means nothing there and the URL has to be passed.
-    return { host: location.host, url };
+    return { remote: { host: location.host, url } };
   };
 
   return {
@@ -835,24 +1133,74 @@ export function buildRepoTools(
         }
         const { host } = location;
 
+        // Refused rather than worked around. A URL that passes the host check but
+        // names no repository is what a model copies out of a browser —
+        // `.../tree/main`, `.../pull/4` — and this used to carry on with a `dir`
+        // of `${workdir}/repo` and no `beforeCheckout` at all. A host keying its
+        // filesystem per repository therefore never switched, so the clone landed
+        // in whichever repository's workspace happened to be active, and the
+        // error the model finally saw was git's, about the wrong thing, in the
+        // wrong place.
+        //
+        // Not silently trimmed to the first two segments either, tempting as it
+        // is: that also reads `.../orgs/x/repositories` as the repository `x`,
+        // and quietly reinterpreting the target is the wrong instinct for the one
+        // tool that offers a credential to a host on the model's say-so. A
+        // refusal costs one turn and says exactly what to send instead.
         const parsed = parseRepo(url, allowedHosts);
-        const dir = `${workdir}/${parsed?.repo ?? "repo"}`;
+        if (!parsed) {
+          return (
+            `refusing to clone "${url}" — it does not name a repository. ` +
+            `A clone URL is https://<host>/<owner>/<repo>, so if this came out of ` +
+            `a browser, drop everything after the repository name (the /tree/…, ` +
+            `/pull/… or /blob/… part) and try again.`
+          );
+        }
+        const dir = `${workdir}/${parsed.repo}`;
 
         // Before anything runs, and before `dir` is touched: a host keying its
         // filesystem per repository needs to have switched by now. See
         // `beforeCheckout` for why this cannot wait for the clone to finish.
-        if (parsed) {
+        //
+        // A throw here stops the clone, which is the exact opposite of how
+        // `afterCheckout` is treated — and the asymmetry is the point rather than
+        // an inconsistency. This hook *chooses the workspace*; carrying on past a
+        // failed one would put the checkout wherever the last task left the
+        // selection, which is the failure the hook exists to prevent. By the time
+        // `afterCheckout` runs there is a checkout on disk and the model needs to
+        // be told about it, so that one is caught and logged.
+        try {
           config.beforeCheckout?.({
             url,
             host,
             owner: parsed.owner,
             repo: parsed.repo
           });
+        } catch (err) {
+          console.error("[repo] beforeCheckout failed", {
+            url,
+            repo: `${parsed.owner}/${parsed.repo}`,
+            err: String(err)
+          });
+          return (
+            `could not select a workspace for ${parsed.owner}/${parsed.repo}: ` +
+            `${String(err)}\nNothing was cloned — going ahead would have put the ` +
+            `checkout in whichever workspace was already open.`
+          );
         }
 
         // The workspace outlives the task, so this path may already hold the
         // checkout a previous task left — see `refreshCheckout`.
         const existing = await plain("rev-parse --git-dir", dir);
+        // A failed probe means "nothing here, clone it" — but only when git
+        // answered. A command that never ran means nothing, and the distinction
+        // is not academic: a replaced container is precisely the case where this
+        // call fails and the *next* one lands on a working replacement. Read as
+        // "empty", it points `git clone` at a directory that already holds the
+        // checkout — which fails with `destination path already exists` and skips
+        // the refresh that was the right answer all along.
+        if (existing.unreachable)
+          return bounded(`could not clone ${url}: ${existing.stderr}`);
         if (existing.success) {
           const refreshed = await refreshCheckout({
             dir,
@@ -867,7 +1215,7 @@ export function buildRepoTools(
               dir,
               url,
               host,
-              ...(parsed ? { repo: `${parsed.owner}/${parsed.repo}` } : {}),
+              repo: `${parsed.owner}/${parsed.repo}`,
               branch: refreshed.branch,
               fresh: false
             });
@@ -927,7 +1275,7 @@ export function buildRepoTools(
           dir,
           url,
           host,
-          ...(parsed ? { repo: `${parsed.owner}/${parsed.repo}` } : {}),
+          repo: `${parsed.owner}/${parsed.repo}`,
           branch: landed,
           fresh: true
         });
@@ -1052,13 +1400,22 @@ export function buildRepoTools(
           "symbolic-ref --short refs/remotes/origin/HEAD",
           dir
         );
+        // A failed read here means "this repository has no `origin/HEAD`, so
+        // there is no default branch to protect" — the guards below then stand
+        // down. That is a fair reading of an answer and a terrible reading of
+        // silence, so a command that never ran stops here instead: the same rule
+        // as the two probes further down.
+        if (head.unreachable)
+          return bounded(`could not push "${branch}": ${head.stderr}`);
         const defaultBranch = head.success
           ? head.stdout.trim().replace(/^origin\//, "")
           : undefined;
         if (defaultBranch && defaultBranch === branch)
           return `refusing to push to "${branch}" — it is this repository's default branch; push a work branch and open a pull request`;
 
-        const remote = await origin(dir);
+        const { remote, unreachable } = await origin(dir);
+        if (unreachable)
+          return bounded(`could not push "${branch}": ${unreachable}`);
         if (!remote)
           return `${dir} has no origin on an allowed host — clone it with repo_clone first`;
 
@@ -1078,6 +1435,10 @@ export function buildRepoTools(
           dir,
           { REPO_BRANCH: branch }
         );
+        // Same reasoning as the probe in `repo_clone`: `!success` means "no such
+        // branch, create it" only when git was there to say so.
+        if (exists.unreachable)
+          return bounded(`could not push "${branch}": ${exists.stderr}`);
         const checkout = await plain(
           exists.success
             ? `checkout "$REPO_BRANCH"`
@@ -1149,14 +1510,37 @@ export function buildRepoTools(
         // here because the push no longer happens in this repository, and a
         // subagent that reaches for a bare `git push` in the shell should still
         // find the branch tracking something.
-        await plain(`config "branch.$REPO_BRANCH.remote" origin`, dir, {
-          REPO_BRANCH: branch
-        });
-        await plain(
+        //
+        // Checked, but *reported* rather than raised: this is the one place in
+        // the plugin where a failed command is genuinely not a failed operation.
+        // The push has landed by now — saying so is the important half — and all
+        // that is lost is the convenience these two keys buy. Firing them and
+        // forgetting was the other extreme, in a file whose whole theme is that
+        // an unchecked command is a claim nobody made.
+        const remoteSet = await plain(
+          `config "branch.$REPO_BRANCH.remote" origin`,
+          dir,
+          { REPO_BRANCH: branch }
+        );
+        const mergeSet = await plain(
           `config "branch.$REPO_BRANCH.merge" "refs/heads/$REPO_BRANCH"`,
           dir,
           { REPO_BRANCH: branch }
         );
+        const untracked = [remoteSet, mergeSet].find((r) => !r.success);
+        if (untracked) {
+          // Named apart from the push, which succeeded — a log line reading
+          // "repo_push failed" next to a branch that is on the remote is worse
+          // than no log line.
+          logFailure("repo_push (upstream tracking)", untracked);
+          return bounded(
+            `pushed ${branch}, but could not record what it tracks: ` +
+              `${untracked.stderr || untracked.stdout}\n` +
+              `The push itself landed. The only consequence is local: a bare ` +
+              `\`git push\` from the shell will not know where to send this ` +
+              `branch, and needs \`git push -u origin ${branch}\` once.`
+          );
+        }
         return `pushed ${branch}`;
       }
     }),
@@ -1189,9 +1573,16 @@ export function buildRepoTools(
         // Deliberately from the Worker, not the container: this is the only
         // credential that can write to the repository through the API, and it
         // never crosses into the container.
-        const response = await fetch(
-          `${apiBase}/repos/${owner}/${repo}/pulls`,
-          {
+        //
+        // Bounded and caught, which the rest of this plugin got for free from
+        // `exec` and this call did not. An API that never answers otherwise holds
+        // the round open until something further out gives up, and a rejected
+        // `fetch` left as a tool error tells the model less than it needs — the
+        // one thing it must know is that a POST that timed out may have been
+        // received anyway.
+        let response: Response;
+        try {
+          response = await fetch(`${apiBase}/repos/${owner}/${repo}/pulls`, {
             method: "POST",
             headers: {
               authorization: `Bearer ${config.token()}`,
@@ -1199,19 +1590,33 @@ export function buildRepoTools(
               "content-type": "application/json",
               "user-agent": "looping-coder"
             },
-            body: JSON.stringify({ title, head, base, body })
-          }
-        );
+            body: JSON.stringify({ title, head, base, body }),
+            signal: AbortSignal.timeout(PR_TIMEOUT_MS)
+          });
+        } catch (err) {
+          logFailure("repo_open_pr", { stderr: String(err) });
+          return (
+            `could not reach ${apiBase} to open the pull request: ${String(err)}\n` +
+            `The request may have been received anyway — check whether the pull ` +
+            `request already exists before retrying, or the retry will open a ` +
+            `second one alongside it.`
+          );
+        }
 
         if (!response.ok) {
-          const detail = await response.text();
+          // `.catch` rather than a bare await: this is the error path already,
+          // and a body that will not read must not replace the status that
+          // explains the failure.
+          const detail = await response.text().catch(() => "");
           logFailure("repo_open_pr", {
             exitCode: response.status,
             stderr: detail
           });
           return `could not open the pull request (${response.status}): ${detail.slice(0, 500)}`;
         }
-        const pr = (await response.json()) as { html_url?: string };
+        const pr = (await response.json().catch(() => ({}))) as {
+          html_url?: string;
+        };
         return (
           pr.html_url ?? "pull request opened, but the response carried no URL"
         );

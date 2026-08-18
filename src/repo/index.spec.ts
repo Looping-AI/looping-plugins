@@ -26,7 +26,24 @@ type Recorded = {
   };
 };
 
-type Stubbed = Partial<Record<string, { stdout?: string; success?: boolean }>>;
+type Stubbed = Partial<
+  Record<
+    string,
+    {
+      stdout?: string;
+      success?: boolean;
+      /**
+       * Thrown instead of returned. This is what `exec` actually does when the
+       * container is replaced mid-command or the Durable Object cannot be
+       * reached — a case the tools have to answer rather than propagate.
+       */
+      throws?: unknown;
+    }
+  >
+>;
+
+/** Matches every command: `String.includes("")` is true of anything. */
+const ANY = "";
 
 /**
  * What git reports when a test does not say otherwise.
@@ -59,6 +76,7 @@ function recorder(results: Stubbed = {}): {
     // A test's own stubs win over the defaults, so a case can still describe a
     // dirty tree or a missing remote.
     const match = find(results, command) ?? find(GIT_DEFAULTS, command);
+    if (match?.throws) throw match.throws;
     return {
       success: match?.success ?? true,
       stdout: match?.stdout ?? "",
@@ -251,6 +269,24 @@ describe("guardrails", () => {
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
   });
 
+  /**
+   * "There is no origin here" and "nobody answered" both used to arrive as
+   * `undefined`, and the answer to the first is advice — go and clone it — that
+   * is actively wrong for the second.
+   */
+  it("sends the model to clone when the checkout has no allowed origin", async () => {
+    const { exec, calls } = recorder({
+      "remote get-url origin": { stdout: "https://gitlab.com/o/r" }
+    });
+    const result = await run(tools(exec), "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    expect(result).toContain("no origin on an allowed host");
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+  });
+
   it("still pushes an ordinary work branch", async () => {
     const { exec, calls } = recorder();
     const result = await run(tools(exec), "repo_push", {
@@ -260,6 +296,35 @@ describe("guardrails", () => {
 
     expect(result).toBe("pushed coder/add-json-flag");
     expect(calls.some((c) => c.command.includes("push"))).toBe(true);
+  });
+
+  /**
+   * The one command in this plugin whose failure is genuinely not a failed
+   * operation — and it was the one nobody checked. `--set-upstream` is written
+   * by hand now, because the push happens in a git dir that is not this
+   * repository, and firing the two `config` calls unchecked was the same
+   * "success nobody claimed" the rest of the file exists to prevent.
+   */
+  it("reports a push that landed but did not record its upstream", async () => {
+    const { exec } = recorder({
+      'config "branch.': {
+        success: false,
+        stdout: "error: could not lock config file .git/config"
+      }
+    });
+    const result = await run(tools(exec), "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    // Order of the two facts matters: the branch is on the remote, and that is
+    // the sentence the model acts on. What failed is local convenience.
+    expect(result).toContain("pushed coder/x");
+    expect(result).toContain("could not record what it tracks");
+    expect(result).toContain("could not lock config file");
+    // Actionable rather than merely reported: the only thing that breaks is a
+    // bare `git push` from a subagent's shell, and this is its one-line fix.
+    expect(result).toContain("git push -u origin coder/x");
   });
 
   /**
@@ -385,6 +450,35 @@ describe("parseRepo", () => {
       repo: "r"
     });
   });
+
+  /**
+   * Two different consequences, one check.
+   *
+   * `..` and `.` are ordinary matches for "a path segment that is not a slash",
+   * and the repository name becomes a path: `https://github.com/o/..` gave a
+   * checkout `dir` of `/workspace/..`, which is `/`. The separator characters are
+   * the quieter half — `beforeCheckout` hands these to the host, and the README
+   * tells that host to build a per-repository workspace key out of them, so a `|`
+   * or a `:` is a separator inside somebody else's key format.
+   */
+  it.each([
+    ["https://github.com/owner/..", "a traversing repository name"],
+    ["https://github.com/owner/.", "a self-referential one"],
+    ["https://github.com/../repo", "a traversing owner"],
+    ["https://github.com/a|b/c", "a key separator"],
+    ["https://github.com/o/r r", "a space"],
+    ["https://github.com/o:1/r", "a colon"]
+  ])("refuses %s (%s)", (url) => {
+    expect(parseRepo(url)).toBeUndefined();
+  });
+
+  /** The rule is GitHub's own, so everything it actually issues still parses. */
+  it.each([
+    ["https://github.com/octo-cat/my_repo.js", "octo-cat", "my_repo.js"],
+    ["https://github.com/a.b/c-d_e.f", "a.b", "c-d_e.f"]
+  ])("still parses %s", (url, owner, repo) => {
+    expect(parseRepo(url)).toEqual({ owner, repo });
+  });
 });
 
 /**
@@ -471,14 +565,20 @@ describe("credential scoping", () => {
     expect(credentialed).toHaveLength(3);
 
     for (const call of credentialed) {
-      const clean = /--git-dir="\$GIT_CLEAN"/.test(call.command);
+      const clean = /--git-dir="\$GIT_ROOM"/.test(call.command);
       expect(clean || call.command.includes("clone")).toBe(true);
       // Not merely pointed elsewhere by `--git-dir`: not *run* in the checkout
       // either, so a `.git` discovered from the working directory cannot stand
       // in for the one we named.
       expect(call.options?.cwd).toBe("/workspace");
+      // The sharp edge of folding the room's setup into this same command: a
+      // `git -C "$REPO_DIR"` anywhere in it would be git running inside the
+      // checkout with the token in its environment, which is the entire thing
+      // this arrangement exists to prevent. Plain file operations on paths
+      // under the checkout are fine — they execute nothing.
+      expect(call.command).not.toContain('git -C "$REPO_DIR"');
       if (clean) {
-        expect(call.options?.env?.["GIT_CLEAN"]).toMatch(
+        expect(call.options?.env?.["GIT_ROOM"]).toMatch(
           /^\/tmp\/looping-repo-[0-9a-f-]{36}\.git$/
         );
       }
@@ -507,10 +607,87 @@ describe("credential scoping", () => {
 
     const prep = calls.find((c) => c.command.includes("init -q --bare"))!;
     expect(prep.command).toContain('"$REPO_DIR/.git/shallow"');
-    expect(prep.command).toContain('"$GIT_CLEAN/shallow"');
+    expect(prep.command).toContain('"$GIT_ROOM/shallow"');
     // The objects come across by reference, not by copy.
-    expect(prep.command).toContain('"$GIT_CLEAN/objects/info/alternates"');
-    expect(prep.options?.env?.["REPO_TOKEN"]).toBeUndefined();
+    expect(prep.command).toContain('"$GIT_ROOM/objects/info/alternates"');
+  });
+
+  /**
+   * The window the isolated dir used to leave open.
+   *
+   * Creating it in one command and using it in the next left a gap, and the
+   * model has a root shell on the same filesystem: a `$GIT_ROOM/config` planted
+   * in that gap could set `http.<url>.proxy` and `sslVerify=false`, and a
+   * URL-specific key in a repository's own config beats a `-c` override — which
+   * is the whole reason the dir exists. So the credentialed command builds and
+   * re-asserts the dir itself, and an attacker has to win a race inside one
+   * process rather than between two.
+   */
+  it("builds and re-asserts the clean dir in the command that uses it", async () => {
+    const { exec, calls } = recorder({
+      "rev-list --count": { stdout: "1" }
+    });
+    await run(tools(exec), "repo_push", { dir: "/w/r", branch: "coder/x" });
+
+    const push = calls.find((c) => c.command.includes(" push "))!;
+    expect(push.options?.env?.["REPO_TOKEN"]).toBeDefined();
+    // Everything the dir is, stated in the same command that reads it.
+    expect(push.command).toContain("init -q --bare");
+    expect(push.command).toContain('> "$GIT_ROOM/config"');
+    expect(push.command).toContain('"$GIT_ROOM/objects/info/alternates"');
+    // Chained, so a failure anywhere in the setup stops before the credential
+    // is ever offered.
+    expect(push.command.indexOf("init -q --bare")).toBeLessThan(
+      push.command.indexOf(" push ")
+    );
+    // And nothing else ran in between: one command, not three.
+    expect(
+      calls.filter((c) => c.command.includes("init -q --bare"))
+    ).toHaveLength(1);
+  });
+
+  /**
+   * The refresh cannot collapse the same way, and the reason is worth pinning
+   * down: seeding the dir means reading the checkout's refs, which is `git -C`
+   * *inside* the checkout — the one command that must never carry the token. So
+   * it stays separate and unauthenticated, and the credentialed fetch re-asserts
+   * the dir rather than trusting what the seed left.
+   */
+  it("seeds the clean dir without the token, then re-asserts it with one", async () => {
+    const { exec, calls } = recorder({
+      "rev-parse --git-dir": { success: true, stdout: ".git" }
+    });
+    await run(tools(exec), "repo_clone", { url: "https://github.com/o/r" });
+
+    const seed = calls.find((c) => c.command.includes("for-each-ref"))!;
+    expect(seed.options?.env?.["REPO_TOKEN"]).toBeUndefined();
+    expect(seed.command).toContain('git -C "$REPO_DIR"');
+
+    const fetch = calls.find((c) => c.command.includes(" fetch --prune "))!;
+    expect(fetch.options?.env?.["REPO_TOKEN"]).toBeDefined();
+    expect(fetch.command).toContain('> "$GIT_ROOM/config"');
+  });
+
+  /**
+   * Ordering inside the seed command, and it is not cosmetic.
+   *
+   * `update-ref` refuses a ref whose object it cannot reach, and the objects are
+   * reachable only through the alternates file. Write it after the seed and
+   * every ref fails with "nonexistent object", the seed does nothing, and the
+   * fetch re-downloads the entire history — silently, because the seed is
+   * deliberately best-effort. Measured against real git, which is the only
+   * reason this is a test rather than a comment.
+   */
+  it("writes the alternates before seeding, not after", async () => {
+    const { exec, calls } = recorder({
+      "rev-parse --git-dir": { success: true, stdout: ".git" }
+    });
+    await run(tools(exec), "repo_clone", { url: "https://github.com/o/r" });
+
+    const seed = calls.find((c) => c.command.includes("for-each-ref"))!;
+    expect(seed.command.indexOf("objects/info/alternates")).toBeLessThan(
+      seed.command.indexOf("for-each-ref")
+    );
   });
 
   /** A clean dir left behind is a clean dir the model gets a second go at. */
@@ -525,7 +702,7 @@ describe("credential scoping", () => {
     });
 
     expect(result).toMatch(/push failed/i);
-    expect(calls.some((c) => c.command === 'rm -rf "$GIT_CLEAN"')).toBe(true);
+    expect(calls.some((c) => c.command === 'rm -rf "$GIT_ROOM"')).toBe(true);
   });
 
   it("never lets a credential prompt hang the round", async () => {
@@ -548,6 +725,274 @@ describe("credential scoping", () => {
     expect(calls.find((c) => c.command.includes("clone"))!.command).toContain(
       "credential.https://git.acme.dev.helper="
     );
+  });
+});
+
+/**
+ * The container is not a given, and nothing here used to admit that.
+ *
+ * `exec` does not only return failures — it throws them. `@cloudflare/computer`
+ * throws `EEXEC_LOST` when a container is replaced mid-command, and a call to a
+ * Durable Object can fail outright. Neither was caught anywhere in this plugin,
+ * so both left as a tool error carrying a sentence about an "execution runtime"
+ * that reads exactly like the command crashed — and the model went debugging a
+ * command that never ran.
+ */
+describe("a container that is not there", () => {
+  /** The shape `@cloudflare/computer` throws; `code` is what it sets deliberately. */
+  const lost = Object.assign(
+    new Error(
+      'Execution "e1" was lost when its container runtime was replaced'
+    ),
+    { code: "EEXEC_LOST" }
+  );
+
+  it("explains a replaced container in git's terms, not the runtime's", async () => {
+    const { exec } = recorder({ [ANY]: { throws: lost } });
+    const result = await run(tools(exec), "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    expect(result).toContain("container was replaced");
+    // The checkout is a Durable Object's, so it survived — the model's most
+    // expensive wrong guess is that its work is gone.
+    expect(result).toMatch(/durable/i);
+    // And the fact the computer plugin's version of this note cannot give,
+    // because it does not know the lost command was git: whether running it
+    // again is safe.
+    expect(result).toMatch(/never force/);
+    expect(result).not.toContain("was lost when its container runtime");
+  });
+
+  it("returns the failure from every tool rather than throwing it", async () => {
+    const { exec } = recorder({
+      [ANY]: { throws: new Error("workspace gone") }
+    });
+    const set = tools(exec);
+
+    // Every tool, because a throw out of `execute` reaches the model as a tool
+    // error — which reads as the tool being broken rather than as a condition
+    // there is something to do about.
+    for (const [name, input] of [
+      ["repo_clone", { url: "https://github.com/o/r" }],
+      ["repo_status", { dir: "/w/r" }],
+      ["repo_diff", { dir: "/w/r" }],
+      ["repo_commit", { dir: "/w/r", message: "wip" }],
+      ["repo_push", { dir: "/w/r", branch: "coder/x" }]
+    ] as const) {
+      const result = await run(set, name, input);
+      expect(result, name).toContain("could not be run");
+    }
+  });
+
+  it("does not mistake an unreachable container for an empty directory", async () => {
+    const { exec, calls } = recorder({
+      "rev-parse --git-dir": { throws: lost }
+    });
+    const result = await run(tools(exec), "repo_clone", {
+      url: "https://github.com/o/r"
+    });
+
+    expect(result).toContain("container was replaced");
+    // The dangerous reading. A failed probe means "nothing here, clone it" — and
+    // a replaced container is precisely when the *next* command lands on a
+    // working replacement, so the clone would get as far as a directory that
+    // already holds the checkout and fail on that instead.
+    expect(calls.some((c) => c.command.includes("clone"))).toBe(false);
+  });
+
+  it("does not report an unreadable checkout as somebody else's repository", async () => {
+    const { exec } = recorder({
+      "rev-parse --git-dir": { stdout: ".git" },
+      "remote get-url origin": { throws: lost }
+    });
+    const result = await run(tools(exec), "repo_clone", {
+      url: "https://github.com/o/r"
+    });
+
+    expect(result).toContain("could not read which repository");
+    expect(result).not.toContain("another repository");
+  });
+
+  it("lets the push failure through, not the cleanup that followed it", async () => {
+    // Ordered deliberately: the push command *contains* the room's own
+    // `rm -rf`, so the more specific fragment has to be found first.
+    const { exec, calls } = recorder({
+      'push "$REPO_URL"': { throws: lost },
+      "rm -rf": { throws: new Error("cleanup could not run either") }
+    });
+    const result = await run(tools(exec), "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    // A throw out of a `finally` replaces the exception it interrupts. With the
+    // room cleanup able to throw, the model was told about the `rm -rf` and
+    // never about the push it was cleaning up after.
+    expect(result).toContain("container was replaced");
+    expect(result).not.toContain("cleanup could not run");
+    // And the room is still discarded on the way out.
+    expect(calls.some((c) => c.command.startsWith("rm -rf"))).toBe(true);
+  });
+
+  it("does not blame the isolated git dir for the container", async () => {
+    const { exec } = recorder({ 'push "$REPO_URL"': { throws: lost } });
+    const result = await run(tools(exec), "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    // The stage markers exist to attribute a failure inside the room script. A
+    // command that never ran reached no stage at all, and "stopped at start"
+    // would point at the script for something the container did.
+    expect(result).not.toContain("isolated git dir");
+  });
+
+  it("reports a token the host cannot resolve instead of throwing it", async () => {
+    const { exec, calls } = recorder();
+    const set = buildRepoTools({
+      exec,
+      token: () => {
+        throw new Error("GITHUB_TOKEN is not set");
+      }
+    });
+
+    const result = await run(set, "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    expect(result).toContain("GITHUB_TOKEN is not set");
+    // Nothing was sent: the token is read while building the command's
+    // environment, inside the same handler. The failure logger reads it too, to
+    // scrub it out of what it writes — unguarded, that would have thrown out of
+    // the handler written to stop throws escaping.
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+  });
+
+  it("warns that a pull request may exist when the API never answers", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(
+        new DOMException("The operation was aborted", "TimeoutError")
+      );
+    const { exec } = recorder();
+
+    const result = await run(tools(exec), "repo_open_pr", {
+      url: "https://github.com/o/r",
+      head: "coder/x",
+      base: "main",
+      title: "t",
+      body: "b"
+    });
+
+    // The one thing the model has to know before it acts: a POST that timed out
+    // may have been received, and a retry that assumes otherwise opens a second
+    // pull request on the same branch.
+    expect(result).toContain("may have been received");
+    expect(result).toMatch(/before retrying/);
+    fetchSpy.mockRestore();
+  });
+
+  it("bounds the pull request call", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ html_url: "https://github.com/o/r/pull/7" }),
+        {
+          status: 201
+        }
+      )
+    );
+    const { exec } = recorder();
+
+    await run(tools(exec), "repo_open_pr", {
+      url: "https://github.com/o/r",
+      head: "coder/x",
+      base: "main",
+      title: "t",
+      body: "b"
+    });
+
+    // Every other call this plugin makes is a container command, which `exec`
+    // bounds for it. This one is a `fetch`, and an API that stops answering
+    // would otherwise hold the round open.
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    fetchSpy.mockRestore();
+  });
+});
+
+/**
+ * What a model copies out of a browser is not a clone URL, and this used to
+ * proceed anyway: a `dir` of `/workspace/repo` and no `beforeCheckout` at all, so
+ * a host keying its filesystem per repository never switched and the checkout
+ * landed in whichever repository's workspace was already open.
+ */
+describe("a clone URL that names no repository", () => {
+  it.each([
+    ["https://github.com/o/r/tree/main", "a branch page"],
+    ["https://github.com/o/r/pull/4", "a pull request page"],
+    ["https://github.com/o/r/blob/main/README.md", "a file page"],
+    ["https://github.com/o/..", "a traversing name"]
+  ])("refuses %s (%s) without running anything", async (url) => {
+    const chosen: string[] = [];
+    const { exec, calls } = recorder();
+    const result = await run(
+      tools(exec, { beforeCheckout: ({ repo }) => chosen.push(repo) }),
+      "repo_clone",
+      { url }
+    );
+
+    expect(result).toMatch(/does not name a repository/);
+    expect(calls).toHaveLength(0);
+    // The hook picks the workspace the clone lands in. Firing it for a URL about
+    // to be refused would move a host that keys per repository onto one that
+    // does not exist.
+    expect(chosen).toEqual([]);
+  });
+
+  it("says what to send instead", async () => {
+    const { exec } = recorder();
+    const result = await run(tools(exec), "repo_clone", {
+      url: "https://github.com/o/r/tree/main"
+    });
+
+    expect(result).toContain("https://<host>/<owner>/<repo>");
+  });
+
+  it("still clones an ordinary URL, telling the host the repository first", async () => {
+    const chosen: Array<{ owner: string; repo: string }> = [];
+    const { exec } = recorder({ "rev-parse --abbrev-ref": { stdout: "main" } });
+    const result = await run(
+      tools(exec, {
+        beforeCheckout: ({ owner, repo }) => chosen.push({ owner, repo })
+      }),
+      "repo_clone",
+      { url: "https://github.com/o/r" }
+    );
+
+    expect(chosen).toEqual([{ owner: "o", repo: "r" }]);
+    expect(result).toBe("cloned to /workspace/r on branch main");
+  });
+
+  it("stops the clone when the host cannot choose a workspace", async () => {
+    const { exec, calls } = recorder();
+    const result = await run(
+      tools(exec, {
+        beforeCheckout: () => {
+          throw new Error("no workspace for that repository");
+        }
+      }),
+      "repo_clone",
+      { url: "https://github.com/o/r" }
+    );
+
+    expect(result).toContain("could not select a workspace");
+    // Deliberately the opposite of `afterCheckout`, whose throw is logged and
+    // swallowed because by then there is a checkout to tell the model about.
+    // Cloning past *this* one puts the tree in whichever workspace was open.
+    expect(calls).toHaveLength(0);
   });
 });
 

