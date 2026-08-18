@@ -162,7 +162,8 @@ clone` at a checkout that is already there.
 
 ## Output is bounded
 
-Every tool truncates from the middle at `maxOutputBytes` (16 KB by default), the
+Every tool truncates from the middle at `maxOutputChars` (16,000 characters by
+default), the
 same way `sb_exec` does. `repo_diff` also takes `stat: true` for a per-file
 changed-line summary — the right first call on a large change, and the only
 practical one for an agent whose entire view of the work is the diff.

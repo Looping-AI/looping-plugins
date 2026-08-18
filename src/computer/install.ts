@@ -287,6 +287,28 @@ export async function resolveInstallCommand(
   };
 }
 
+/**
+ * Files that change what an install produces without changing what it installs.
+ *
+ * A lockfile says which versions; these say how they are laid out, where they
+ * come from, and what is patched on the way in. pnpm's `node-linker=hoisted` in
+ * `.npmrc` produces a completely different `node_modules` from the same
+ * lockfile, a registry line points the whole install somewhere else, and a
+ * workspace manifest changes which packages are part of it at all.
+ *
+ * Fixed rather than declared per rule, deliberately. These are small, there are
+ * few of them, and hashing one a repository does not use costs nothing — where a
+ * per-rule `inputs` field would be public API for a list that is the same
+ * everywhere, in a file that just gave up API for the same reason.
+ */
+const INSTALL_CONFIG_FILES = [
+  ".npmrc",
+  ".yarnrc",
+  ".yarnrc.yml",
+  "pnpm-workspace.yaml",
+  "bunfig.toml"
+] as const;
+
 async function firstPresent(
   fs: InstallProbe,
   dir: string,
@@ -333,6 +355,14 @@ async function firstPresent(
  * was quietly a version behind. So {@link resolveInstallCommand} reports every
  * lockfile the plan names that is present, and all of them are hashed.
  *
+ * ## And the manager's own configuration
+ *
+ * {@link INSTALL_CONFIG_FILES} is hashed too, for the same reason `package.json`
+ * is: a lockfile says which versions, and `.npmrc` says how they are laid out.
+ * Flipping pnpm's `node-linker` to `hoisted` produces a different
+ * `node_modules` from a byte-identical lockfile, and a warm container would
+ * otherwise skip the reinstall that change requires.
+ *
  * The residual is worth stating because it cannot be closed here: an override
  * that *builds* — `npm ci && npm run build`, the documented example — is not
  * fingerprinted on the sources it builds from, because hashing `package.json`
@@ -356,10 +386,15 @@ export async function installFingerprint(
 ): Promise<string | null> {
   if (resolution.kind !== "run") return null;
 
-  // Either file being absent is ordinary — a bare `package.json` is a
-  // repository, and a `noLockfile` install has no lock by definition — so only
-  // the whole set being absent means there is nothing to fingerprint at all.
-  const names = ["package.json", ...resolution.lockfiles];
+  // Any of these being absent is ordinary — a bare `package.json` is a
+  // repository, a `noLockfile` install has no lock by definition, and most
+  // repositories configure none of the rest — so only the whole set being absent
+  // means there is nothing to fingerprint at all.
+  const names = [
+    "package.json",
+    ...resolution.lockfiles,
+    ...INSTALL_CONFIG_FILES
+  ];
 
   // Names as well as contents. Two lockfiles will not collide on content in
   // practice, but a digest that cannot say *which* file it read is one that

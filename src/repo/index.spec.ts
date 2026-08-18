@@ -1130,7 +1130,7 @@ describe("bounded output", () => {
     const huge = "x".repeat(50_000);
     const { exec } = recorder({ diff: { stdout: huge } });
     const result = await run(
-      tools(exec, { maxOutputBytes: 1_000 }),
+      tools(exec, { maxOutputChars: 1_000 }),
       "repo_diff",
       { dir: "/w/r" }
     );
@@ -1149,7 +1149,7 @@ describe("bounded output", () => {
       "status --short": { stdout: "y".repeat(9_000) }
     });
     const result = await run(
-      tools(exec, { maxOutputBytes: 500 }),
+      tools(exec, { maxOutputChars: 500 }),
       "repo_status",
       { dir: "/w/r" }
     );

@@ -29,6 +29,23 @@ import { isGitInternal } from "./paths.js";
  * reason {@link truncateOutput} documents — the first error is at the top of a
  * file and the summary is at the bottom.
  *
+ * ## The one place the budget is spent in bytes
+ *
+ * `maxChars` is a character ceiling everywhere else — see
+ * {@link ComputerConfig.maxOutputChars} — and here it is spent against
+ * `byteOffset`/`byteLength`, which are the only units the transport has. That is
+ * deliberate and it is safe in the direction that matters: a UTF-8 byte is never
+ * more than one UTF-16 code unit, so *N* bytes decode to at most *N* characters.
+ * Reading the character budget as bytes therefore always honours the ceiling,
+ * and errs low on a file that is mostly non-ASCII — a CJK source file is cut at
+ * about a third of the characters it could have shown. The alternative is a
+ * second round trip to measure what the first one returned, on every read, to
+ * recover a bound the marker already announces.
+ *
+ * The other reason it cannot be characters is the one this function exists for:
+ * bounding the *transport*. A byte range is what stops a 4 MB lockfile being
+ * materialised in a 128 MB isolate before anything is thrown away.
+ *
  * ## Why `stat` first
  *
  * Sizing off the returned string instead would be wrong in a way that hides
@@ -45,10 +62,10 @@ import { isGitInternal } from "./paths.js";
 export async function readBounded(
   fs: WorkspaceClient["fs"],
   path: string,
-  maxBytes: number
+  maxChars: number
 ): Promise<string> {
   const { size } = await fs.stat(path);
-  if (size <= maxBytes) return fs.readFile(path, "utf8");
+  if (size <= maxChars) return fs.readFile(path, "utf8");
 
   // Names the way out, rather than only the size of the hole. Before `offset`
   // existed the honest answer was "use sb_exec with sed", which needs a live
@@ -57,13 +74,13 @@ export async function readBounded(
     `\n\n… [${dropped} bytes omitted from the middle — read them with ` +
     `\`offset: ${at}\`] …\n\n`;
 
-  const half = Math.floor((maxBytes - marker(size, size).length) / 2);
+  const half = Math.floor((maxChars - marker(size, size).length) / 2);
   // No budget for two ends plus the marker: keep the head, where the first error
   // is. The same fallback `truncateOutput` makes at the same ceiling.
   if (half < 1)
     return fs.readFile(path, {
       encoding: "utf8",
-      byteLength: Math.max(0, maxBytes)
+      byteLength: Math.max(0, maxChars)
     });
 
   const [head, tail] = await Promise.all([
@@ -93,13 +110,13 @@ export async function readWindow(
   path: string,
   offset: number,
   length: number,
-  maxBytes: number
+  maxChars: number
 ): Promise<string> {
   const { size } = await fs.stat(path);
   if (offset >= size)
     return `(offset ${offset} is past the end of ${path}, which is ${size} bytes)`;
 
-  const byteLength = Math.min(length, maxBytes, size - offset);
+  const byteLength = Math.min(length, maxChars, size - offset);
   const body = await fs.readFile(path, {
     encoding: "utf8",
     byteOffset: offset,

@@ -45,7 +45,7 @@ describe("truncateOutput, in both copies", () => {
    * makes `half` zero or negative, and `slice(-0)` is `slice(0)` — the whole
    * string — so the function returns *more* than it was given: 500 characters in,
    * 543 out at `max: 80`. A copy that lost this guard would look fine until a
-   * host set a small `maxOutputBytes`.
+   * host set a small `maxOutputChars`.
    */
   it.each(both)(
     "%s: never returns more than it was given",

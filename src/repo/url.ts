@@ -37,14 +37,25 @@ export const PROTECTED_BRANCHES = new Set([
 export const UNSAFE_BRANCH =
   /[:^~?*[\\\x00-\x20\x7f]|^[+-]|^refs\/|\.\.|@\{|\.lock$|\/$/;
 
-/** Where a repository URL points, in a form that cannot be spoofed by a path. */
+/**
+ * Where a repository URL points, in a form that cannot be spoofed by a path.
+ *
+ * **https only, on every branch.** This used to accept scp-like syntax as well —
+ * `git@github.com:owner/repo.git` — and that branch returned before the protocol
+ * check below, so the one invariant this function exists to state was quietly
+ * false for the syntax most likely to carry an SSH URL. `repo_clone`'s own
+ * refusal promises "only clone over https", and it was letting one through.
+ *
+ * Nothing can act on such a URL any more. The three credentialed operations run
+ * host-side over isomorphic-git, which has no SSH transport, so an scp URL that
+ * passed the gate reached the host and failed there instead — a worse error, one
+ * step further from the model that could have fixed it. Origins are written by
+ * `repo_clone` from a URL that came through here, so a checkout cannot acquire
+ * one this refuses without somebody rewriting `.git/config` by hand.
+ */
 export function repoLocation(
   url: string
 ): { host: string; path: string } | undefined {
-  // `git@github.com:owner/repo.git` — scp-like syntax, which `new URL` rejects.
-  const scp = /^[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):(.+)$/.exec(url.trim());
-  if (scp) return { host: scp[1]!.toLowerCase(), path: scp[2]! };
-
   try {
     const parsed = new URL(url.trim());
     // https only. Not pedantry: git accepts `ext::<command>`, `file://` and

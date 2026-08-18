@@ -331,6 +331,35 @@ describe("installFingerprint", () => {
     ).toBe(before);
   });
 
+  /**
+   * A lockfile says which versions; `.npmrc` says how they are laid out. pnpm's
+   * `node-linker=hoisted` produces a completely different `node_modules` from a
+   * byte-identical lockfile, so a warm container skipped the reinstall that
+   * change requires.
+   */
+  it.each([".npmrc", ".yarnrc.yml", "pnpm-workspace.yaml"])(
+    "re-installs when %s changes",
+    async (name) => {
+      const withConfig = { ...files, [at(name)]: "node-linker=isolated\n" };
+      const resolution = await resolve(withConfig);
+      const before = await installFingerprint(
+        probe(withConfig),
+        DIR,
+        resolution
+      );
+
+      const changed = { ...withConfig, [at(name)]: "node-linker=hoisted\n" };
+      expect(
+        await installFingerprint(probe(changed), DIR, resolution)
+      ).not.toBe(before);
+
+      // And adding one where there was none is itself a change.
+      expect(await installFingerprint(probe(files), DIR, resolution)).not.toBe(
+        before
+      );
+    }
+  );
+
   it("has nothing to fingerprint when nothing will be installed", async () => {
     const skip = await resolve({ [at("README.md")]: "" });
     expect(await installFingerprint(probe({}), DIR, skip)).toBeNull();

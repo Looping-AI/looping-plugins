@@ -160,6 +160,37 @@ const SHELL_OPERATORS = /\|\||&&|[;|\n()]/;
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
+ * Programs that run *another* program, so the name after them is the one that
+ * matters.
+ *
+ * Without these, `time vitest run` and `env CI=1 vitest run` both read as a
+ * command called `time` or `env`, neither of which is in
+ * {@link DEPENDENCY_TOOLS} — so they skipped the gate and ran against a
+ * half-built `node_modules`, which is the expensive half of the asymmetry
+ * {@link needsDependencies} documents. Package managers were never affected,
+ * because {@link PACKAGE_MANAGERS} matches anywhere in the string.
+ *
+ * `sudo` is here because a container image that has it will have a model reach
+ * for it, not because it should be needed.
+ */
+const COMMAND_WRAPPERS = new Set([
+  "env",
+  "time",
+  "nice",
+  "ionice",
+  "nohup",
+  "stdbuf",
+  "timeout",
+  "xargs",
+  "sudo",
+  "command",
+  "exec"
+]);
+
+/** An option, or the number that follows one — `nice -n 10`, `xargs -n1`. */
+const WRAPPER_ARGUMENT = /^-|^\d+$/;
+
+/**
  * Does this command plausibly read `node_modules`, and therefore have to wait for
  * a dependency install to finish?
  *
@@ -185,7 +216,18 @@ export function needsDependencies(command: string): boolean {
   for (const segment of command.split(SHELL_OPERATORS)) {
     const words = segment.trim().split(/\s+/).filter(Boolean);
     let i = 0;
-    while (i < words.length && ENV_ASSIGNMENT.test(words[i])) i++;
+    // Assignments, then a wrapper and whatever it takes, then round again:
+    // `env CI=1 nice -n 10 vitest` is all three in one command.
+    for (;;) {
+      while (i < words.length && ENV_ASSIGNMENT.test(words[i]!)) i++;
+      if (i >= words.length) break;
+      if (
+        !COMMAND_WRAPPERS.has(words[i]!.slice(words[i]!.lastIndexOf("/") + 1))
+      )
+        break;
+      i++;
+      while (i < words.length && WRAPPER_ARGUMENT.test(words[i]!)) i++;
+    }
     if (i >= words.length) continue;
     const head = words[i];
     // `/usr/local/bin/tsc` and `./bin/vitest` are the same program as `tsc` and

@@ -243,6 +243,44 @@ const run = (tools: ToolSet, name: string, input: unknown) =>
  * site as a `true` nobody reads, and `computerExec` silently inherited the wrong
  * one for as long as it existed.
  */
+/**
+ * What `sb_exec` promises the model, which depends on whether a shell was
+ * configured.
+ *
+ * Two of the guarantees are the shell's, not this plugin's: the interleaved
+ * transcript is `2>&1` on the wrapper process, and first-failure reporting is
+ * `-o pipefail`. Without a shell there is no wrapper to carry either, and a
+ * description that promised them anyway would be the exact failure `wrapped`
+ * documents at length — a model that cannot trust a piped exit code re-runs the
+ * whole gate to get one.
+ */
+describe("what sb_exec claims for itself", () => {
+  const describeOf = (shell?: string) =>
+    buildComputerTools(stub().workspace, { ...config, shell }).sb_exec!
+      .description!;
+
+  it("promises a transcript and first-failure only with a shell", () => {
+    const withShell = describeOf("bash");
+    expect(withShell).toContain("interleaved in the order they were written");
+    expect(withShell).toContain("report the first failing stage");
+  });
+
+  it("promises neither without one, and says what happens instead", () => {
+    const bare = describeOf(undefined);
+    expect(bare).not.toContain("interleaved in the order they were written");
+    expect(bare).not.toContain("report the first failing stage");
+    // The honest replacements: labelled blocks, and the pipe's own status.
+    expect(bare).toContain("--- stderr ---");
+    expect(bare).toContain("reports its **last** stage");
+  });
+
+  it("still promises the exit line either way, because that one is ours", () => {
+    for (const shell of ["bash", undefined]) {
+      expect(describeOf(shell)).toContain("--- exit 0 ---");
+    }
+  });
+});
+
 describe("withShell", () => {
   it("is a no-op when no shell is configured", () => {
     expect(withShell("npm test", undefined)).toBe("npm test");
@@ -431,7 +469,7 @@ describe("sb_read", () => {
     const { workspace } = stub({ [path]: body });
     const tools = buildComputerTools(workspace, {
       ...config,
-      maxOutputBytes: 400
+      maxOutputChars: 400
     });
 
     const out = await run(tools, "sb_read", { path });
@@ -474,7 +512,7 @@ describe("sb_ls", () => {
 
   /**
    * The regression this retires. `ls` is a prefix scan with no bound: it returned
-   * every path in the subtree, the isolate held all of them, and the byte ceiling
+   * every path in the subtree, the isolate held all of them, and the character ceiling
    * then discarded most — the same read-everything-then-discard shape the
    * `readdir` limit was introduced to fix one arm above. `find` takes a limit, so
    * asserting one arrived is asserting the walk stops early.
@@ -933,7 +971,7 @@ describe("sb_read windows", () => {
     const { workspace } = stub({ [path]: body });
     const tools = buildComputerTools(workspace, {
       ...config,
-      maxOutputBytes: 400
+      maxOutputChars: 400
     });
 
     const out = await run(tools, "sb_read", { path, offset: 0, length: 300 });
@@ -944,7 +982,7 @@ describe("sb_read windows", () => {
     const { workspace } = stub({ [path]: body });
     const tools = buildComputerTools(workspace, {
       ...config,
-      maxOutputBytes: 200
+      maxOutputChars: 200
     });
 
     const out = await run(tools, "sb_read", {
@@ -968,7 +1006,7 @@ describe("sb_read windows", () => {
     const { workspace } = stub({ [path]: body });
     const tools = buildComputerTools(workspace, {
       ...config,
-      maxOutputBytes: 400
+      maxOutputChars: 400
     });
 
     const out = await run(tools, "sb_read", { path });

@@ -226,15 +226,19 @@ export interface RepoConfig {
    */
   allowedHosts?: string[];
   /**
-   * Ceiling on what any one tool here returns to the model. Defaults to 16,000
-   * bytes, matching the computer plugin.
+   * Ceiling on what any one tool here returns to the model, in **characters**.
+   * Defaults to 16,000, matching the computer plugin.
+   *
+   * Characters, not bytes, and the field was renamed to say so: `truncateOutput`
+   * budgets with `String.length`, so a diff of 16,000 non-ASCII characters was
+   * three times the "byte" limit this used to advertise.
    *
    * This is not tidiness. `repo_diff` is the main input for an agent that
    * reviews rather than writes — a delegating coder whose subagents hold the
    * shell — and an unbounded diff on a large change is precisely the context
    * blowup that design exists to prevent.
    */
-  maxOutputBytes?: number;
+  maxOutputChars?: number;
   /**
    * Called after a checkout is in place, freshly cloned or refreshed onto a new
    * commit.
@@ -310,7 +314,7 @@ const DEFAULT_AUTHOR = {
   name: "looping-coder",
   email: "coder@looping.invalid"
 };
-const DEFAULT_MAX_OUTPUT_BYTES = 16_000;
+const DEFAULT_MAX_OUTPUT_CHARS = 16_000;
 /**
  * Ceiling on the one call this plugin makes that is not a container command.
  *
@@ -412,10 +416,10 @@ export function buildRepoTools(
   const apiBase = config.apiBase ?? DEFAULT_API_BASE;
   const author = config.author ?? DEFAULT_AUTHOR;
   const allowedHosts = config.allowedHosts ?? DEFAULT_ALLOWED_HOSTS;
-  const maxBytes = config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const maxChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
 
   /** Everything this plugin hands back to the model, bounded. */
-  const bounded = (text: string) => truncateOutput(text, maxBytes);
+  const bounded = (text: string) => truncateOutput(text, maxChars);
 
   /**
    * Tell the host a checkout is ready, and never let that fail the clone.

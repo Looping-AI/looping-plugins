@@ -86,7 +86,7 @@ describe("renderResult", () => {
   });
 
   /**
-   * `truncateOutput` used to run once per stream, so `maxOutputBytes` really
+   * `truncateOutput` used to run once per stream, so `maxOutputChars` really
    * meant "up to twice this" — a budget that does not bound the thing it names.
    */
   it("applies the output budget once, to the whole transcript", () => {

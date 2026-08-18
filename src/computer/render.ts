@@ -101,7 +101,7 @@ function capLine(text: string): string {
  */
 export function packBlocks(
   blocks: string[][],
-  maxBytes: number
+  maxChars: number
 ): { body: string; shown: number } {
   const out: string[] = [];
   let used = 0;
@@ -109,7 +109,7 @@ export function packBlocks(
 
   for (const block of blocks) {
     const cost = block.reduce((n, line) => n + line.length + 1, 0);
-    if (shown > 0 && used + cost > maxBytes) break;
+    if (shown > 0 && used + cost > maxChars) break;
     out.push(...block);
     used += cost;
     shown += 1;
@@ -141,7 +141,7 @@ export function packBlocks(
  */
 export function renderGrepMatches(
   matches: GrepMatch[],
-  maxBytes: number
+  maxChars: number
 ): { body: string; shown: number; capped: boolean } {
   let path: string | undefined;
   const blocks: string[][] = [];
@@ -169,7 +169,7 @@ export function renderGrepMatches(
     blocks.push(block);
   });
 
-  const { body, shown } = packBlocks(blocks, maxBytes);
+  const { body, shown } = packBlocks(blocks, maxChars);
   // Only a line that actually made it out is worth explaining.
   return { body, shown, capped: hasLongLine.slice(0, shown).includes(true) };
 }
@@ -207,7 +207,7 @@ export function humanMs(ms: number): string {
  *
  * ## One budget, applied once
  *
- * `truncateOutput` used to run per stream, so `maxOutputBytes` was really "up to
+ * `truncateOutput` used to run per stream, so `maxOutputChars` was really "up to
  * twice this". It now bounds the rendered transcript, which is the thing that
  * actually reaches the context window.
  */
@@ -218,7 +218,7 @@ export function renderResult(
     stderr: string;
     status?: WorkspaceRuntimeStatus;
   },
-  maxBytes: number
+  maxChars: number
 ): string {
   const parts: string[] = [];
   if (result.stdout) parts.push(result.stdout);
@@ -227,7 +227,7 @@ export function renderResult(
   // two labelled blocks beat silently dropping half the output.
   if (result.stderr) parts.push(`--- stderr ---\n${result.stderr}`);
 
-  const body = truncateOutput(parts.join("\n"), maxBytes);
+  const body = truncateOutput(parts.join("\n"), maxChars);
   const state =
     result.status && result.status !== "completed" ? ` (${result.status})` : "";
   const verdict = `--- exit ${result.exitCode}${state} ---`;

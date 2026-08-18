@@ -80,4 +80,39 @@ describe("needsDependencies", () => {
     expect(needsDependencies("CI=1 vitest run")).toBe(true);
     expect(needsDependencies("cd /repo && ./bin/eslint .")).toBe(true);
   });
+
+  /**
+   * A wrapper hid the program that needed the tree.
+   *
+   * `time vitest run` read as a command called `time`, which is in no list, so
+   * it skipped the gate and ran against a half-built `node_modules` — the
+   * expensive half of the asymmetry, and invisible, because the failure surfaces
+   * later as a module that cannot be found. Package managers were never affected:
+   * `PACKAGE_MANAGERS` matches anywhere in the string, so `time npm test` always
+   * gated.
+   */
+  it.each([
+    "env CI=1 vitest run",
+    "time vitest run",
+    "nice -n 10 tsc --noEmit",
+    "xargs -n1 tsc",
+    "sudo eslint .",
+    "timeout 60 vitest run",
+    "env CI=1 nice -n 10 vitest run",
+    "/usr/bin/time tsc"
+  ])("looks past a wrapper to the program behind it: %s", (command) => {
+    expect(needsDependencies(command)).toBe(true);
+  });
+
+  /**
+   * The wrapper list must not become a way to gate on nothing. A wrapper with no
+   * program behind it, and a wrapper's own name as an ordinary argument, are
+   * both reads rather than builds.
+   */
+  it.each(["time", "env", "cat env", "ls -la /usr/bin/time"])(
+    "does not gate on a wrapper with nothing behind it: %s",
+    (command) => {
+      expect(needsDependencies(command)).toBe(false);
+    }
+  );
 });

@@ -147,7 +147,7 @@ export function workspaceNameFromRuntime(runtime: unknown): string | undefined {
 }
 
 /**
- * How much command output the model is allowed to see.
+ * How much command output the model is allowed to see, in characters.
  *
  * One `npm install` prints more than a small context window holds, and the
  * interesting part of a failing build is the first error and the last summary —
@@ -155,12 +155,12 @@ export function workspaceNameFromRuntime(runtime: unknown): string | undefined {
  * which is what a naive `slice` would do and would drop the exit summary that
  * says what actually failed.
  */
-const DEFAULT_MAX_OUTPUT_BYTES = 16_000;
+const DEFAULT_MAX_OUTPUT_CHARS = 16_000;
 
 /**
  * How many directory entries one `sb_ls` returns.
  *
- * A bound on the *listing*, not on the rendered text — `maxOutputBytes` still
+ * A bound on the *listing*, not on the rendered text — `maxOutputChars` still
  * applies on top. The two used to be the same budget applied in the wrong order:
  * `readdir` returned every entry, the isolate held all of them, and the byte
  * ceiling then discarded the tail. A real `node_modules` is 22,470 files, and a
@@ -364,8 +364,24 @@ export interface ComputerConfig {
   shell?: string;
   /** Per-command timeout. Defaults to ten minutes. */
   timeoutMs?: number;
-  /** Output ceiling per command. Defaults to 16,000 bytes. */
-  maxOutputBytes?: number;
+  /**
+   * Output ceiling per command, in **characters**. Defaults to 16,000.
+   *
+   * Characters — JavaScript `String.length`, UTF-16 code units — and not bytes,
+   * which is what this was called and was never measuring. The renderers all
+   * budget with `.length`, so 16,000 `✓` passed a "16,000 byte" ceiling while
+   * occupying 48,000 UTF-8 bytes: three times the advertised limit, on exactly
+   * the output a non-English repository produces.
+   *
+   * Characters are also the right unit for what this bounds. The ceiling exists
+   * to protect a context window, which is measured in tokens, and tokens track
+   * characters far better than they track UTF-8 bytes. So the name moved to meet
+   * the implementation rather than the other way round.
+   *
+   * `sb_read` is the one place a byte bound survives, and it is derived from
+   * this rather than separate — see `readBounded`.
+   */
+  maxOutputChars?: number;
   /**
    * How long `sb_exec` waits for a running dependency install before giving the
    * turn back. Defaults to 90 seconds.
@@ -423,7 +439,7 @@ export function buildComputerTools(
 ): ToolSet {
   const cwd = config.cwd ?? DEFAULT_CWD;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const maxBytes = config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const maxChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
   const gateMs = config.installGateMs ?? 90_000;
   const env = config.env;
 
@@ -525,13 +541,31 @@ export function buildComputerTools(
        * lossy and given no exit code to check, which are two independent reasons
        * to re-run a command and capture the output "properly". That is exactly
        * what happened, twice, at 60 seconds a go. Truncation was never actually
-       * firing: the gate emits a few hundred bytes against a 16,000-byte ceiling.
+       * firing: the gate emits a few hundred characters against a 16,000-character
+       * ceiling.
+       */
+      /**
+       * Two of these sentences are only true when a shell is configured, so the
+       * description says whichever is.
+       *
+       * `withShellTranscript` is a no-op without {@link ComputerConfig.shell}:
+       * no `2>&1`, so the streams arrive separate and {@link renderResult}
+       * labels them; no `-o pipefail`, so the runtime's `/bin/sh` reports a
+       * pipeline's *last* stage. Promising an interleaved transcript and
+       * first-failure semantics there would be the same lie this module spends
+       * `wrapped`'s comment explaining the cost of — a model that cannot trust a
+       * piped exit code re-runs the whole gate to get one, and a failed build
+       * that reports success is worse than no answer at all.
        */
       description:
         "Run a shell command in the container and return its output. Use this for builds, tests, package installs, git, and anything else a terminal can do. " +
-        "The result is the command's full transcript — stdout and stderr interleaved in the order they were written — followed by a line reporting the exit code, e.g. `--- exit 0 ---`. A command killed at the time limit says so on that line. " +
-        "You do not need to append `echo $?`, add `2>&1`, or redirect to a file to see any of this. " +
-        "Do not pipe into `head` or `tail` to shorten output: long output is already truncated from the middle, keeping the beginning and the end, and piping costs you the parts you wanted. Pipelines report the first failing stage, so a piped command reports its real failure rather than the pipe's — but `cmd | head` may report 141 when `head` closes the pipe early, which is not a failure of `cmd`. " +
+        (config.shell
+          ? "The result is the command's full transcript — stdout and stderr interleaved in the order they were written — followed by a line reporting the exit code, e.g. `--- exit 0 ---`. A command killed at the time limit says so on that line. " +
+            "You do not need to append `echo $?`, add `2>&1`, or redirect to a file to see any of this. " +
+            "Do not pipe into `head` or `tail` to shorten output: long output is already truncated from the middle, keeping the beginning and the end, and piping costs you the parts you wanted. Pipelines report the first failing stage, so a piped command reports its real failure rather than the pipe's — but `cmd | head` may report 141 when `head` closes the pipe early, which is not a failure of `cmd`. "
+          : "The result is the command's stdout, then any stderr under a `--- stderr ---` heading, then a line reporting the exit code, e.g. `--- exit 0 ---`. A command killed at the time limit says so on that line. " +
+            "You do not need to append `echo $?` to see the exit code. Add `2>&1` yourself if you need the two streams in the order they were written. " +
+            "Do not pipe into `head` or `tail` to shorten output: long output is already truncated from the middle, keeping the beginning and the end, and piping costs you the parts you wanted. A pipeline reports its **last** stage, so check the exit code of the command you care about rather than the pipe's. ") +
         "Prefer targeted commands over ones that print everything.",
       inputSchema: z.object({
         command: z.string().describe("The shell command, e.g. 'npm test'"),
@@ -607,7 +641,7 @@ export function buildComputerTools(
             // a timeout wearing a normal-looking number.
             timeoutMs
           });
-          return note(renderResult(result, maxBytes));
+          return note(renderResult(result, maxChars));
         } catch (err) {
           const lost = execLostNote(err);
           console.warn("[computer] sb_exec failed", {
@@ -658,13 +692,13 @@ export function buildComputerTools(
           // Either knob means the model chose a region; only an unqualified read
           // gets the middle-out guess.
           return offset === undefined && length === undefined
-            ? await readBounded(fs, path, maxBytes)
+            ? await readBounded(fs, path, maxChars)
             : await readWindow(
                 fs,
                 path,
                 offset ?? 0,
-                length ?? maxBytes,
-                maxBytes
+                length ?? maxChars,
+                maxChars
               );
         });
       }
@@ -793,7 +827,7 @@ export function buildComputerTools(
             const blocks = page.items
               .slice(0, DEFAULT_MAX_ENTRIES)
               .map((e) => [e.type === "dir" ? `${e.path}/` : e.path]);
-            const { body, shown } = packBlocks(blocks, maxBytes);
+            const { body, shown } = packBlocks(blocks, maxChars);
             return body + listingNote(page, shown, "entries", "`pattern`");
           }
           // One over the ceiling: enough to know the listing was cut without a
@@ -814,7 +848,7 @@ export function buildComputerTools(
             .map((e) => [
               e.isDirectory ? `${e.name}/` : `${e.name}\t${humanBytes(e.size)}`
             ]);
-          const { body, shown } = packBlocks(blocks, maxBytes);
+          const { body, shown } = packBlocks(blocks, maxChars);
           const more = entries.length > shown;
           return (
             body +
@@ -921,7 +955,7 @@ export function buildComputerTools(
 
           const { body, shown, capped } = renderGrepMatches(
             page.items.slice(0, DEFAULT_MAX_MATCHES),
-            maxBytes
+            maxChars
           );
           return (
             body +
