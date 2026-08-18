@@ -732,9 +732,15 @@ function normalizePath(path: string): string {
  * any host that hands out the file tools without a shell, which is precisely the
  * shape a reviewing parent agent has.
  *
- * Writing through such a link is the half that is not recoverable, and is the
- * vector the repo plugin's clean-room work closed by another door: a `.git/config`
- * or a `.git/hooks/pre-commit` planted once is read by every later git command.
+ * Writing through such a link is the half that is not recoverable: a
+ * `.git/config` or a `.git/hooks/pre-commit` planted once is read by every later
+ * git command in that checkout.
+ *
+ * It no longer reaches a *credential* — `/repo` stopped running authenticated git
+ * in the container, so there is no token in an environment for a hook to inherit.
+ * What is left is still worth refusing: a planted hook runs the model's code on
+ * every `repo_commit`, and a planted config can quietly change what a commit
+ * records.
  *
  * ## Only the last component
  *

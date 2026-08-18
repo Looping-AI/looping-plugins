@@ -3,7 +3,9 @@ import {
   buildRepoTools,
   parseRepo,
   type RepoConfig,
-  type RepoExec
+  type RepoExec,
+  type RepoGit,
+  type RepoGitResult
 } from "./index.js";
 import type { ToolSet } from "ai";
 
@@ -87,10 +89,63 @@ function recorder(results: Stubbed = {}): {
   return { exec, calls };
 }
 
+/** One credentialed operation, as the host was asked to perform it. */
+type GitCall = {
+  op: "clone" | "fetch" | "push";
+  req: Record<string, unknown>;
+};
+
+type GitStub = Partial<
+  Record<"clone" | "fetch" | "push", RepoGitResult | { throws: unknown }>
+>;
+
+/**
+ * The host's side of the boundary, recorded.
+ *
+ * The counterpart to {@link recorder}, and the split between them is the point
+ * of these tests: `calls` is everything that ran in the container, `gitCalls` is
+ * everything that touched the forge. No token appears in the first list, ever,
+ * and asserting that is much of what this file now does.
+ */
+function gitRecorder(results: GitStub = {}): {
+  git: RepoGit;
+  gitCalls: GitCall[];
+} {
+  const gitCalls: GitCall[] = [];
+  const defaults: Record<GitCall["op"], string> = {
+    clone: "main",
+    fetch: "fetched",
+    push: "pushed"
+  };
+  const op =
+    (name: GitCall["op"]) =>
+    async (req: Record<string, unknown>): Promise<RepoGitResult> => {
+      gitCalls.push({ op: name, req });
+      const stub = results[name];
+      if (stub && "throws" in stub) throw stub.throws;
+      return stub ?? { ok: true, detail: defaults[name] };
+    };
+  return {
+    git: {
+      clone: op("clone"),
+      fetch: op("fetch"),
+      push: op("push")
+    } as unknown as RepoGit,
+    gitCalls
+  };
+}
+
 const TOKEN = "ghp_supersecret";
 
 function tools(exec: RepoExec, config: Partial<RepoConfig> = {}): ToolSet {
-  return buildRepoTools({ exec, token: () => TOKEN, ...config });
+  // A fresh no-op git unless the case supplies one, so the many tests that only
+  // care about container commands do not each have to build one.
+  return buildRepoTools({
+    exec,
+    git: gitRecorder().git,
+    token: () => TOKEN,
+    ...config
+  });
 }
 
 const run = (set: ToolSet, name: string, input: unknown) =>
@@ -105,33 +160,55 @@ describe("token containment", () => {
    * shell history, and into any recorded cassette. A token that reaches it is
    * a token that has leaked, even though nothing looks broken.
    */
-  it("never puts the token in a command string", async () => {
+  it("never gives the container the token, in a command or in an environment", async () => {
     const { exec, calls } = recorder();
-    const set = tools(exec);
+    const { git, gitCalls } = gitRecorder();
+    const set = tools(exec, { git });
 
     await run(set, "repo_clone", { url: "https://github.com/o/r" });
     await run(set, "repo_commit", { dir: "/workspace/r", message: "wip" });
     await run(set, "repo_push", { dir: "/workspace/r", branch: "coder/x" });
 
+    // The whole invariant, in one loop. It replaces eleven assertions about a
+    // disposable git dir, a scoped credential helper and an alternates file —
+    // machinery that existed to make credentialed git survive running in a
+    // container the model has a root shell on. None of it is needed once the
+    // credential is not there: there is no command to plant a hook for and no
+    // process environment to read out of `/proc`.
     expect(calls.length).toBeGreaterThan(0);
     for (const call of calls) {
       expect(call.command).not.toContain(TOKEN);
+      expect(JSON.stringify(call.options?.env ?? {})).not.toContain(TOKEN);
+      expect(call.options?.env?.["REPO_TOKEN"]).toBeUndefined();
     }
+
+    // And the work still happened — a test that only proves absence would pass
+    // just as well against a plugin that does nothing at all.
+    expect(gitCalls.map((c) => c.op)).toEqual(["clone", "push"]);
   });
 
-  it("passes the token through the environment on network commands only", async () => {
+  it("runs no git at all in the container for the operations that need a credential", async () => {
     const { exec, calls } = recorder();
-    await run(tools(exec), "repo_push", {
+    const { git, gitCalls } = gitRecorder();
+    await run(tools(exec, { git }), "repo_push", {
       dir: "/workspace/r",
       branch: "coder/x"
     });
 
-    const push = calls.find((c) => c.command.includes("push"))!;
-    expect(push.options?.env?.["REPO_TOKEN"]).toBe(TOKEN);
+    // The container still does the local half — switching to the branch,
+    // resolving its tip, checking it is ahead of the default. That is the split
+    // this plugin now rests on, so it is asserted from both sides: nothing in
+    // the container talks to the forge, and the thing that does never appears
+    // there.
+    expect(calls.some((c) => c.command.includes("checkout"))).toBe(true);
+    expect(calls.some((c) => /\bgit push\b/.test(c.command))).toBe(false);
+    expect(calls.some((c) => /\bgit fetch\b/.test(c.command))).toBe(false);
+    expect(calls.some((c) => /\bgit clone\b/.test(c.command))).toBe(false);
 
-    // The local branch switch has no reason to hold the credential.
-    const checkout = calls.find((c) => c.command.includes("checkout"))!;
-    expect(checkout.options?.env?.["REPO_TOKEN"]).toBeUndefined();
+    expect(gitCalls).toHaveLength(1);
+    expect(gitCalls[0]!.op).toBe("push");
+    expect(gitCalls[0]!.req["branch"]).toBe("coder/x");
+    expect(gitCalls[0]!.req["allowedHosts"]).toEqual(["github.com"]);
   });
 
   it("opens the pull request from the Worker, never from the container", async () => {
@@ -288,14 +365,16 @@ describe("guardrails", () => {
   });
 
   it("still pushes an ordinary work branch", async () => {
-    const { exec, calls } = recorder();
-    const result = await run(tools(exec), "repo_push", {
+    const { exec } = recorder();
+    const { git, gitCalls } = gitRecorder();
+    const result = await run(tools(exec, { git }), "repo_push", {
       dir: "/w/r",
       branch: "coder/add-json-flag"
     });
 
     expect(result).toBe("pushed coder/add-json-flag");
-    expect(calls.some((c) => c.command.includes("push"))).toBe(true);
+    expect(gitCalls.map((c) => c.op)).toEqual(["push"]);
+    expect(gitCalls[0]!.req["branch"]).toBe("coder/add-json-flag");
   });
 
   /**
@@ -391,17 +470,18 @@ describe("guardrails", () => {
 
   /** A repo with no resolvable default branch is unusual, not a reason to block. */
   it("skips the empty-branch guard when the baseline cannot be resolved", async () => {
-    const { exec, calls } = recorder({
+    const { exec } = recorder({
       symbolic: { success: false },
       "rev-parse --verify --quiet": { success: true }
     });
-    const result = await run(tools(exec), "repo_push", {
+    const { git, gitCalls } = gitRecorder();
+    const result = await run(tools(exec, { git }), "repo_push", {
       dir: "/w/r",
       branch: "coder/x"
     });
 
     expect(result).toBe("pushed coder/x");
-    expect(calls.some((c) => c.command.includes("push"))).toBe(true);
+    expect(gitCalls.map((c) => c.op)).toEqual(["push"]);
   });
 
   it("reports a clean tree rather than failing the round", async () => {
@@ -482,20 +562,193 @@ describe("parseRepo", () => {
 });
 
 /**
- * The property the original threat model missed entirely.
+ * What the credential can reach.
  *
- * It covered "the token must not appear in a command string" thoroughly, and
- * that was true — but the credential helper was installed as plain
- * `credential.helper`, which answers for *every* host without ever seeing which
- * one git is asking about. Since the clone URL is model input, a hostile one was
- * enough to have git offer the token to an attacker's server the moment it
- * replied 401. Verified against real git before fixing:
+ * This block used to be called "credential scoping" and was mostly about a
+ * disposable bare git dir: how it was built, that its whole configuration was
+ * written in the same command that read it, that objects reached it through an
+ * alternates file, that it was discarded even when the push failed. All of that
+ * existed to make a *credentialed command in the container* survivable, because
+ * git runs whatever `.git/config` and `.git/hooks` name and the model has a root
+ * shell on that filesystem. None of it is needed once the credential is not
+ * there, and none of it is tested here any more.
+ *
+ * The question that outlives the mechanism is which hosts may be offered the
+ * token — and that one is not theoretical. The original threat model covered
+ * "the token must not appear in a command string" thoroughly and correctly, and
+ * still installed the credential helper as plain `credential.helper`, which
+ * answers for *every* host without ever seeing which one git is asking about.
+ * Since the clone URL is model input, a hostile one was enough to have git offer
+ * the token to an attacker's server the moment it replied 401. Verified against
+ * real git before fixing:
  *
  *     $ printf 'protocol=https\nhost=evil.example.com\n\n' \
  *         | REPO_TOKEN=SECRET git -c "credential.helper=$HELPER" credential fill
  *     password=SECRET
+ *
+ * The helper is gone; the lesson is the allowlist, and it is now enforced at the
+ * moment the host would hand the credential over rather than by a config key.
  */
-describe("credential scoping", () => {
+/**
+ * Reading the forge, which is what a model reaches for `gh` to do.
+ *
+ * Served from the Worker for exactly the reason `repo_open_pr` is: the token that
+ * can read a private repository and write comments on it is the same token, and
+ * installing a CLI in the container to use it would hand it to the shell the
+ * model drives. These tools give the capability without the credential ever
+ * moving.
+ *
+ * The repository is the checkout's own origin rather than a parameter, so there
+ * is no new model input to validate and no new way to point the token at a
+ * repository nobody asked about.
+ */
+describe("reading the forge", () => {
+  /**
+   * Answers keyed by the path each belongs to, matched as a **suffix**.
+   *
+   * Not `includes`: `/issues/42` is a prefix of `/issues/42/comments`, so a
+   * substring match quietly answers the comments request with the issue and the
+   * test for a failed comment load passes against a route that never failed.
+   */
+  const api = (routes: Record<string, unknown>, status = 200) =>
+    vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const hit = Object.entries(routes).find(([path]) =>
+          url.endsWith(path)
+        )?.[1];
+        return new Response(JSON.stringify(hit ?? {}), {
+          status: hit === undefined ? 404 : status
+        });
+      });
+
+  it("reads an issue and its thread, from the checkout's own repository", async () => {
+    const spy = api({
+      "/issues/42/comments": [
+        { user: { login: "reviewer" }, body: "needs a test" }
+      ],
+      "/issues/42": {
+        title: "Flag is ignored",
+        state: "open",
+        user: { login: "reporter" },
+        body: "The --json flag does nothing."
+      }
+    });
+    try {
+      const { exec, calls } = recorder();
+      const result = await run(tools(exec), "repo_issue_view", {
+        dir: "/w/r",
+        number: 42
+      });
+
+      expect(result).toContain("Flag is ignored");
+      expect(result).toContain("The --json flag does nothing.");
+      expect(result).toContain("reviewer");
+      expect(result).toContain("needs a test");
+      // The repository came from `remote get-url origin`, not from the model.
+      expect(calls.some((c) => c.command.includes("remote get-url"))).toBe(
+        true
+      );
+      expect(spy.mock.calls.every(([u]) => String(u).includes("/o/r/"))).toBe(
+        true
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still answers when only the comments fail to load", async () => {
+    const spy = api({
+      "/issues/42": { title: "Flag is ignored", state: "open", body: "x" }
+    });
+    try {
+      const result = await run(tools(recorder().exec), "repo_issue_view", {
+        dir: "/w/r",
+        number: 42
+      });
+
+      // Half an answer beats none: the issue was read, and the model is told
+      // which half is missing rather than being handed a bare failure.
+      expect(result).toContain("Flag is ignored");
+      expect(result).toContain("comments could not be read");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports a pull request whose mergeability GitHub has not computed yet", async () => {
+    const spy = api({
+      "/pulls/7/files": [{ filename: "src/a.ts", additions: 3, deletions: 1 }],
+      "/pulls/7": {
+        title: "Add flag",
+        state: "open",
+        mergeable: null,
+        head: { ref: "coder/x" },
+        base: { ref: "main" }
+      }
+    });
+    try {
+      const result = await run(tools(recorder().exec), "repo_pr_view", {
+        dir: "/w/r",
+        number: 7
+      });
+
+      // `null` is the ordinary answer seconds after opening a pull request,
+      // which is exactly when this gets called. Reported as unknown rather than
+      // collapsed into "not mergeable", which would read as a conflict.
+      expect(result).toContain("mergeability not yet computed");
+      expect(result).not.toContain("NOT mergeable");
+      expect(result).toContain("src/a.ts");
+      expect(result).toContain("coder/x → main");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("warns that a comment may exist when the API never answers", async () => {
+    const spy = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("timed out"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await run(tools(recorder().exec), "repo_pr_comment", {
+        dir: "/w/r",
+        number: 7,
+        body: "done"
+      });
+
+      // The same hazard `repo_open_pr` names: a POST whose answer never arrived
+      // may have landed, and a blind retry is how one comment becomes two.
+      expect(result).toMatch(/may exist anyway/i);
+      expect(result).toMatch(/repo_issue_view/);
+    } finally {
+      spy.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("refuses to read anything for a checkout with no allowed origin", async () => {
+    const spy = api({});
+    try {
+      const { exec } = recorder({
+        "remote get-url origin": { stdout: "https://evil.example.com/o/r" }
+      });
+      const result = await run(tools(exec), "repo_issue_view", {
+        dir: "/w/r",
+        number: 42
+      });
+
+      expect(result).toMatch(/no origin on an allowed host/i);
+      // And nothing was asked of the API, so the token was never sent anywhere.
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("what the credential can reach", () => {
   it.each([
     "https://evil.example.com/o/r",
     "https://github.com.evil.test/o/r",
@@ -505,239 +758,86 @@ describe("credential scoping", () => {
     "git@evil.example.com:o/r.git"
   ])("refuses to clone from %s without running anything", async (url) => {
     const { exec, calls } = recorder();
-    const result = await run(tools(exec), "repo_clone", { url });
+    const { git, gitCalls } = gitRecorder();
+    const result = await run(tools(exec, { git }), "repo_clone", { url });
 
     expect(result).toMatch(/refusing to clone/i);
-    // Before any command: a check that runs after git has already contacted the
-    // host is not a check.
+    // Before anything: a check that runs after git has already contacted the
+    // host is not a check. Both sides, because there are now two of them — the
+    // host's git is the one holding the token, so "nothing ran" has to include
+    // it.
     expect(calls).toHaveLength(0);
-  });
-
-  it("binds the helper to the forge origin, never globally", async () => {
-    const { exec, calls } = recorder();
-    await run(tools(exec), "repo_clone", { url: "https://github.com/o/r" });
-
-    const clone = calls.find((c) => c.command.includes("clone"))!;
-    expect(clone.command).toContain("credential.https://github.com.helper=");
-    // An unscoped helper with a *value* is the bug. The empty one next to it is
-    // the opposite: it clears whatever the container had already put in the
-    // chain, which would otherwise answer first and answer for every host.
-    expect(clone.command).not.toMatch(/-c\s+credential\.helper=\S/);
-    expect(clone.command).toMatch(
-      /-c\s+credential\.helper=\s+-c\s+credential\.https/
-    );
-  });
-
-  /**
-   * The property the previous threat model assumed and did not have.
-   *
-   * Rules about *where the token is written* are all beside the point if the
-   * command holding it runs in a repository the model can configure: git
-   * executes what `.git/config` and `.git/hooks` name, both live in the durable
-   * workspace, and a co-installed shell tool writes them. Verified against real
-   * git before this changed — a planted `core.hooksPath` had `pre-push` print
-   * `$REPO_TOKEN` on an ordinary `repo_push`.
-   *
-   * So the invariant is positional, not textual: a command carrying the token
-   * either creates the repository it runs in (`clone`) or runs in a git dir this
-   * plugin made moments earlier. Never the checkout.
-   */
-  it("runs no credentialed command inside the checkout", async () => {
-    // A fresh clone, a refresh of an existing checkout, and a push — every path
-    // in this plugin that touches the network.
-    const fresh = recorder();
-    await run(tools(fresh.exec), "repo_clone", {
-      url: "https://github.com/o/r"
-    });
-
-    const warm = recorder({
-      "rev-parse --git-dir": { success: true, stdout: ".git" },
-      "rev-list --count": { stdout: "1" }
-    });
-    const set = tools(warm.exec);
-    await run(set, "repo_clone", { url: "https://github.com/o/r" });
-    await run(set, "repo_push", { dir: "/workspace/r", branch: "coder/x" });
-
-    const credentialed = [...fresh.calls, ...warm.calls].filter(
-      (c) => c.options?.env?.["REPO_TOKEN"] !== undefined
-    );
-    // The clone, the refresh's fetch, and the push.
-    expect(credentialed).toHaveLength(3);
-
-    for (const call of credentialed) {
-      const clean = /--git-dir="\$GIT_ROOM"/.test(call.command);
-      expect(clean || call.command.includes("clone")).toBe(true);
-      // Not merely pointed elsewhere by `--git-dir`: not *run* in the checkout
-      // either, so a `.git` discovered from the working directory cannot stand
-      // in for the one we named.
-      expect(call.options?.cwd).toBe("/workspace");
-      // The sharp edge of folding the room's setup into this same command: a
-      // `git -C "$REPO_DIR"` anywhere in it would be git running inside the
-      // checkout with the token in its environment, which is the entire thing
-      // this arrangement exists to prevent. Plain file operations on paths
-      // under the checkout are fine — they execute nothing.
-      expect(call.command).not.toContain('git -C "$REPO_DIR"');
-      if (clean) {
-        expect(call.options?.env?.["GIT_ROOM"]).toMatch(
-          /^\/tmp\/looping-repo-[0-9a-f-]{36}\.git$/
-        );
-      }
-      // Hooks are off even so: the dir is fresh, but a template directory in
-      // the image would otherwise seed one into it.
-      expect(call.command).toContain("core.hooksPath=/dev/null");
-      // `core.askPass` runs a program of the config's choosing when a helper
-      // does not answer, and it would run it with this environment.
-      expect(call.options?.env?.["GIT_ASKPASS"]).toBe("/bin/false");
-      expect(call.options?.env?.["GIT_CONFIG_GLOBAL"]).toBe("/dev/null");
-      expect(call.options?.env?.["GIT_CONFIG_SYSTEM"]).toBe("/dev/null");
-    }
-  });
-
-  /**
-   * `depth` makes the checkout shallow, and a clean dir that does not know it
-   * builds a pack on history it does not have: the push is rejected with
-   * `unpacker error`. Copying `.git/shallow` across is what makes a shallow
-   * push behave exactly as it did before this indirection existed.
-   */
-  it("carries the shallow marker into the clean dir", async () => {
-    const { exec, calls } = recorder({
-      "rev-list --count": { stdout: "1" }
-    });
-    await run(tools(exec), "repo_push", { dir: "/w/r", branch: "coder/x" });
-
-    const prep = calls.find((c) => c.command.includes("init -q --bare"))!;
-    expect(prep.command).toContain('"$REPO_DIR/.git/shallow"');
-    expect(prep.command).toContain('"$GIT_ROOM/shallow"');
-    // The objects come across by reference, not by copy.
-    expect(prep.command).toContain('"$GIT_ROOM/objects/info/alternates"');
-  });
-
-  /**
-   * The window the isolated dir used to leave open.
-   *
-   * Creating it in one command and using it in the next left a gap, and the
-   * model has a root shell on the same filesystem: a `$GIT_ROOM/config` planted
-   * in that gap could set `http.<url>.proxy` and `sslVerify=false`, and a
-   * URL-specific key in a repository's own config beats a `-c` override — which
-   * is the whole reason the dir exists. So the credentialed command builds and
-   * re-asserts the dir itself, and an attacker has to win a race inside one
-   * process rather than between two.
-   */
-  it("builds and re-asserts the clean dir in the command that uses it", async () => {
-    const { exec, calls } = recorder({
-      "rev-list --count": { stdout: "1" }
-    });
-    await run(tools(exec), "repo_push", { dir: "/w/r", branch: "coder/x" });
-
-    const push = calls.find((c) => c.command.includes(" push "))!;
-    expect(push.options?.env?.["REPO_TOKEN"]).toBeDefined();
-    // Everything the dir is, stated in the same command that reads it.
-    expect(push.command).toContain("init -q --bare");
-    expect(push.command).toContain('> "$GIT_ROOM/config"');
-    expect(push.command).toContain('"$GIT_ROOM/objects/info/alternates"');
-    // Chained, so a failure anywhere in the setup stops before the credential
-    // is ever offered.
-    expect(push.command.indexOf("init -q --bare")).toBeLessThan(
-      push.command.indexOf(" push ")
-    );
-    // And nothing else ran in between: one command, not three.
-    expect(
-      calls.filter((c) => c.command.includes("init -q --bare"))
-    ).toHaveLength(1);
-  });
-
-  /**
-   * The refresh cannot collapse the same way, and the reason is worth pinning
-   * down: seeding the dir means reading the checkout's refs, which is `git -C`
-   * *inside* the checkout — the one command that must never carry the token. So
-   * it stays separate and unauthenticated, and the credentialed fetch re-asserts
-   * the dir rather than trusting what the seed left.
-   */
-  it("seeds the clean dir without the token, then re-asserts it with one", async () => {
-    const { exec, calls } = recorder({
-      "rev-parse --git-dir": { success: true, stdout: ".git" }
-    });
-    await run(tools(exec), "repo_clone", { url: "https://github.com/o/r" });
-
-    const seed = calls.find((c) => c.command.includes("for-each-ref"))!;
-    expect(seed.options?.env?.["REPO_TOKEN"]).toBeUndefined();
-    expect(seed.command).toContain('git -C "$REPO_DIR"');
-
-    const fetch = calls.find((c) => c.command.includes(" fetch --prune "))!;
-    expect(fetch.options?.env?.["REPO_TOKEN"]).toBeDefined();
-    expect(fetch.command).toContain('> "$GIT_ROOM/config"');
-  });
-
-  /**
-   * Ordering inside the seed command, and it is not cosmetic.
-   *
-   * `update-ref` refuses a ref whose object it cannot reach, and the objects are
-   * reachable only through the alternates file. Write it after the seed and
-   * every ref fails with "nonexistent object", the seed does nothing, and the
-   * fetch re-downloads the entire history — silently, because the seed is
-   * deliberately best-effort. Measured against real git, which is the only
-   * reason this is a test rather than a comment.
-   */
-  it("writes the alternates before seeding, not after", async () => {
-    const { exec, calls } = recorder({
-      "rev-parse --git-dir": { success: true, stdout: ".git" }
-    });
-    await run(tools(exec), "repo_clone", { url: "https://github.com/o/r" });
-
-    const seed = calls.find((c) => c.command.includes("for-each-ref"))!;
-    expect(seed.command.indexOf("objects/info/alternates")).toBeLessThan(
-      seed.command.indexOf("for-each-ref")
-    );
-  });
-
-  /** A clean dir left behind is a clean dir the model gets a second go at. */
-  it("discards the clean dir even when the push fails", async () => {
-    const { exec, calls } = recorder({
-      "rev-list --count": { stdout: "1" },
-      push: { success: false, stdout: "denied" }
-    });
-    const result = await run(tools(exec), "repo_push", {
-      dir: "/w/r",
-      branch: "coder/x"
-    });
-
-    expect(result).toMatch(/push failed/i);
-    expect(calls.some((c) => c.command === 'rm -rf "$GIT_ROOM"')).toBe(true);
-  });
-
-  it("never lets a credential prompt hang the round", async () => {
-    const { exec, calls } = recorder();
-    await run(tools(exec), "repo_clone", { url: "https://github.com/o/r" });
-
-    const clone = calls.find((c) => c.command.includes("clone"))!;
-    expect(clone.options?.env?.["GIT_TERMINAL_PROMPT"]).toBe("0");
+    expect(gitCalls).toHaveLength(0);
   });
 
   it("allows a configured Enterprise host", async () => {
-    const { exec, calls } = recorder();
+    const { exec } = recorder();
+    const { git, gitCalls } = gitRecorder();
     const result = await run(
-      tools(exec, { allowedHosts: ["git.acme.dev"] }),
+      tools(exec, { git, allowedHosts: ["git.acme.dev"] }),
       "repo_clone",
       { url: "https://git.acme.dev/o/r" }
     );
 
     expect(result).not.toMatch(/refusing/i);
-    expect(calls.find((c) => c.command.includes("clone"))!.command).toContain(
-      "credential.https://git.acme.dev.helper="
-    );
+    expect(gitCalls[0]!.req["url"]).toBe("https://git.acme.dev/o/r");
+  });
+
+  it("sends the allowlist with every credentialed operation, not just the first", async () => {
+    const { exec } = recorder({
+      "rev-parse --git-dir": { success: true },
+      "remote get-url origin": { stdout: "https://git.acme.dev/o/r" }
+    });
+    const { git, gitCalls } = gitRecorder();
+    const set = tools(exec, { git, allowedHosts: ["git.acme.dev"] });
+
+    // A refresh, then a push: the two operations that act on a checkout that
+    // already exists, and therefore on a `.git/config` the container has had the
+    // chance to rewrite.
+    await run(set, "repo_clone", { url: "https://git.acme.dev/o/r" });
+    await run(set, "repo_push", { dir: "/workspace/r", branch: "coder/x" });
+
+    expect(gitCalls.map((c) => c.op)).toEqual(["fetch", "push"]);
+    // The allowlist travels with each call rather than being established once,
+    // because the host binds it to the moment the token would be handed over —
+    // which is the only check that also sees a host reached by redirect.
+    for (const call of gitCalls)
+      expect(call.req["allowedHosts"]).toEqual(["git.acme.dev"]);
+  });
+
+  it("still refuses a push whose origin drifted off the allowlist", async () => {
+    // The checkout is the container's, and a co-installed shell can rewrite its
+    // remote. `origin` is therefore re-derived and re-checked on every push
+    // rather than remembered from the clone.
+    const { exec } = recorder({
+      "remote get-url origin": { stdout: "https://evil.example.com/o/r" }
+    });
+    const { git, gitCalls } = gitRecorder();
+
+    const result = await run(tools(exec, { git }), "repo_push", {
+      dir: "/workspace/r",
+      branch: "coder/x"
+    });
+
+    expect(result).toMatch(/no origin on an allowed host/i);
+    expect(gitCalls).toHaveLength(0);
+  });
+
+  it("never lets a credential prompt hang the round", async () => {
+    const { exec, calls } = recorder();
+    await run(tools(exec), "repo_commit", {
+      dir: "/workspace/r",
+      message: "wip"
+    });
+
+    // Vestigial only in appearance. Nothing the container runs authenticates any
+    // more, but `git` will still stop and ask if some future command reaches a
+    // remote by accident, and a round that hangs is worse than one that fails.
+    for (const call of calls)
+      expect(call.options?.env?.["GIT_TERMINAL_PROMPT"]).toBe("0");
   });
 });
 
-/**
- * The container is not a given, and nothing here used to admit that.
- *
- * `exec` does not only return failures — it throws them. `@cloudflare/computer`
- * throws `EEXEC_LOST` when a container is replaced mid-command, and a call to a
- * Durable Object can fail outright. Neither was caught anywhere in this plugin,
- * so both left as a tool error carrying a sentence about an "execution runtime"
- * that reads exactly like the command crashed — and the model went debugging a
- * command that never ran.
- */
 describe("a container that is not there", () => {
   /** The shape `@cloudflare/computer` throws; `code` is what it sets deliberately. */
   const lost = Object.assign(
@@ -815,60 +915,51 @@ describe("a container that is not there", () => {
     expect(result).not.toContain("another repository");
   });
 
-  it("lets the push failure through, not the cleanup that followed it", async () => {
-    // Ordered deliberately: the push command *contains* the room's own
-    // `rm -rf`, so the more specific fragment has to be found first.
-    const { exec, calls } = recorder({
-      'push "$REPO_URL"': { throws: lost },
-      "rm -rf": { throws: new Error("cleanup could not run either") }
-    });
-    const result = await run(tools(exec), "repo_push", {
+  it("reports an unreachable host as plumbing, not as a git failure", async () => {
+    const { exec } = recorder();
+    const { git } = gitRecorder({ push: { throws: lost } });
+    const result = await run(tools(exec, { git }), "repo_push", {
       dir: "/w/r",
       branch: "coder/x"
     });
 
-    // A throw out of a `finally` replaces the exception it interrupts. With the
-    // room cleanup able to throw, the model was told about the `rm -rf` and
-    // never about the push it was cleaning up after.
+    // A throw from this side means the operation never ran — the same
+    // distinction `run` draws for the container, drawn again for the host. A
+    // rejected push is data and reads as git's answer; only this reads as
+    // infrastructure.
     expect(result).toContain("container was replaced");
-    expect(result).not.toContain("cleanup could not run");
-    // And the room is still discarded on the way out.
-    expect(calls.some((c) => c.command.startsWith("rm -rf"))).toBe(true);
   });
 
-  it("does not blame the isolated git dir for the container", async () => {
-    const { exec } = recorder({ 'push "$REPO_URL"': { throws: lost } });
-    const result = await run(tools(exec), "repo_push", {
-      dir: "/w/r",
-      branch: "coder/x"
-    });
+  it("survives a token the host cannot resolve while reporting a failure", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { exec } = recorder();
+      const set = buildRepoTools({
+        exec,
+        git: gitRecorder({
+          push: { ok: false, message: "remote rejected: non-fast-forward" }
+        }).git,
+        token: () => {
+          throw new Error("GITHUB_TOKEN is not set");
+        }
+      });
 
-    // The stage markers exist to attribute a failure inside the room script. A
-    // command that never ran reached no stage at all, and "stopped at start"
-    // would point at the script for something the container did.
-    expect(result).not.toContain("isolated git dir");
-  });
+      const result = await run(set, "repo_push", {
+        dir: "/w/r",
+        branch: "coder/x"
+      });
 
-  it("reports a token the host cannot resolve instead of throwing it", async () => {
-    const { exec, calls } = recorder();
-    const set = buildRepoTools({
-      exec,
-      token: () => {
-        throw new Error("GITHUB_TOKEN is not set");
-      }
-    });
-
-    const result = await run(set, "repo_push", {
-      dir: "/w/r",
-      branch: "coder/x"
-    });
-
-    expect(result).toContain("GITHUB_TOKEN is not set");
-    // Nothing was sent: the token is read while building the command's
-    // environment, inside the same handler. The failure logger reads it too, to
-    // scrub it out of what it writes — unguarded, that would have thrown out of
-    // the handler written to stop throws escaping.
-    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+      // The push path no longer reads the thunk at all — the host holds the
+      // credential now. One thing still does: the failure logger reads it to
+      // scrub it out of what it writes, and it runs on exactly the path where an
+      // unresolvable `GITHUB_TOKEN` is a likely reason to be. Unguarded, that
+      // would throw out of the handler written to stop throws escaping, and the
+      // model would get the thunk's error in place of git's.
+      expect(result).toMatch(/non-fast-forward/);
+      expect(result).not.toContain("GITHUB_TOKEN is not set");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("warns that a pull request may exist when the API never answers", async () => {
@@ -1009,15 +1100,18 @@ describe("re-entrant clone", () => {
 
   it("fetches and resets a clean existing checkout instead of failing", async () => {
     const { exec, calls } = recorder(existing());
-    const result = await run(tools(exec), "repo_clone", {
+    const { git, gitCalls } = gitRecorder();
+    const result = await run(tools(exec, { git }), "repo_clone", {
       url: "https://github.com/o/r"
     });
 
     expect(result).toMatch(/reused the existing checkout/i);
-    expect(calls.some((c) => c.command.includes("fetch --prune"))).toBe(true);
+    // The fetch is the host's now; the reset stays in the container, where it
+    // needs no credential and the model can watch it happen.
+    expect(gitCalls.map((c) => c.op)).toEqual(["fetch"]);
     expect(calls.some((c) => c.command.includes("reset --hard"))).toBe(true);
     // Nothing was re-cloned over the top.
-    expect(calls.some((c) => c.command.includes("clone"))).toBe(false);
+    expect(gitCalls.some((c) => c.op === "clone")).toBe(false);
   });
 
   /**
@@ -1127,10 +1221,12 @@ describe("failure logging", () => {
     try {
       const { exec } = recorder({
         "rev-parse --verify --quiet": { success: true },
-        "rev-list --count": { stdout: "1" },
-        push: { success: false, stdout: "fatal: Authentication failed" }
+        "rev-list --count": { stdout: "1" }
       });
-      const result = await run(tools(exec), "repo_push", {
+      const { git } = gitRecorder({
+        push: { ok: false, message: "fatal: Authentication failed" }
+      });
+      const result = await run(tools(exec, { git }), "repo_push", {
         dir: "/w/r",
         branch: "coder/x"
       });
@@ -1153,10 +1249,16 @@ describe("failure logging", () => {
   it("scrubs the token out of anything it logs", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const { exec } = recorder({
-        clone: { success: false, stdout: `remote: bad credential ${TOKEN}` }
+      const { exec } = recorder();
+      const { git } = gitRecorder({
+        clone: { ok: false, message: `remote: bad credential ${TOKEN}` }
       });
-      await run(tools(exec), "repo_clone", { url: "https://github.com/o/r" });
+      // Through the host's git, because that is the only side that has ever
+      // seen the token: if it surfaces anywhere, it surfaces in what a failed
+      // credentialed operation says.
+      await run(tools(exec, { git }), "repo_clone", {
+        url: "https://github.com/o/r"
+      });
 
       const logged = JSON.stringify(warn.mock.calls);
       expect(logged).not.toContain(TOKEN);

