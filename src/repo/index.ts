@@ -448,10 +448,13 @@ export function buildRepoTools(
    * against the GitHub API to prove the branch never landed. One line naming
    * the tool and carrying the stderr answers it directly.
    *
-   * The token is scrubbed rather than trusted. It never reaches a command line
-   * and the credential helper prints only to git's stdin, so stderr should be
-   * clean — but "should be" is not the standard for something that writes a
-   * credential into a log that outlives the request.
+   * The token is scrubbed rather than trusted. It has no route into a container
+   * command at all any more, and the one channel that could still carry it is
+   * the forge API's error body, which {@link forge} logs through this same
+   * function. So stderr *should* be clean — but "should be" is not the standard
+   * for something that writes a credential into a log that outlives the request,
+   * and the cost of being wrong is unbounded while the cost of the scrub is a
+   * `split`/`join` on a failure path.
    */
   const logFailure = (
     tool: string,
@@ -743,8 +746,9 @@ export function buildRepoTools(
     const url = result.stdout.trim();
     const location = repoLocation(url);
     if (!location || !allowedHosts.includes(location.host)) return {};
-    // The URL as well as the host: the credentialed commands run in a dir with
-    // no remotes, so `origin` means nothing there and the URL has to be passed.
+    // The URL as well as the host: the credentialed operations run on the
+    // host's side of the boundary and take the repository as a parameter, so
+    // `origin` is a name that means nothing to them. The URL has to travel.
     return { remote: { host: location.host, url } };
   };
 
@@ -800,6 +804,22 @@ export function buildRepoTools(
             `/pull/… or /blob/… part) and try again.`
           );
         }
+
+        // The same guard `repo_push` applies, at the second door a branch name
+        // enters by. `refreshCheckout` runs `git checkout "$REPO_BRANCH"`, and
+        // quoting stops word-splitting but *not* option parsing: a `branch` of
+        // `--detach` arrives as an option, git detaches HEAD, the `reset` that
+        // follows fails against `origin/--detach`, and the checkout a later task
+        // inherits has moved for reasons nothing reported.
+        //
+        // Checked here rather than in `refreshCheckout` because this is where
+        // model input arrives and where the message can say what to send instead.
+        // It also covers the fresh-clone path, where the name reaches
+        // isomorphic-git as a ref: no argv there, so no option to parse, but an
+        // unresolvable ref is a worse error than this sentence.
+        if (branch !== undefined && UNSAFE_BRANCH.test(branch))
+          return `"${branch}" is not a plain branch name — use something like "main"`;
+
         const dir = `${workdir}/${parsed.repo}`;
 
         // Before anything runs, and before `dir` is touched: a host keying its
@@ -1128,8 +1148,11 @@ export function buildRepoTools(
           }
         }
 
-        // Resolved here, in the checkout, so the credentialed command downstream
-        // never has to read this repository to find out what it is pushing.
+        // A pre-flight check, not a value anyone downstream consumes: `push`
+        // takes the branch *name* and resolves it itself, against the same
+        // files. What this buys is the failure arriving here, where the sentence
+        // can name the branch and the checkout, instead of surfacing as a push
+        // that rejects a ref nobody can see.
         const tip = await plain(
           `rev-parse --verify "refs/heads/$REPO_BRANCH"`,
           dir,

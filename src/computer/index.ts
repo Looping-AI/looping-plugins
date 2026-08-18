@@ -405,11 +405,13 @@ export interface ComputerConfig {
    *
    * Do not hand the agent the credential; hand it the *action*. Keep the secret
    * on the Worker side and expose one tool that makes the one call it is for.
-   * `@loopingai/plugins/repo` is the worked example: `repo_open_pr` holds a forge
-   * token that can write to the repository and calls the API from the Worker, so
-   * that token never crosses into the container at all — and the one command that
-   * genuinely needs a credential in the container gets it for the duration of
-   * that command, scoped to a single origin.
+   * `@loopingai/plugins/repo` is the worked example, and it goes all the way:
+   * `repo_open_pr` holds a forge token and calls the API from the Worker, and
+   * the three git operations that need to authenticate — clone, fetch, push —
+   * run on the host's side of the boundary too. **No command in the container is
+   * ever given that token**, not for the length of one command and not scoped to
+   * one origin. It got there by trying the narrower versions first; the module
+   * doc in `@loopingai/plugins/repo` records why each of them leaked.
    */
   env?: () => Record<string, string | undefined>;
 }
@@ -698,11 +700,18 @@ export function buildComputerTools(
 
     sb_edit: tool({
       description:
-        "Replace an exact string in a file. The string must appear exactly once — if it appears zero times or more than once the edit is refused, so include enough surrounding context to make it unique.",
+        "Replace an exact string in a file. The string must be non-empty and must appear exactly once — if it appears zero times or more than once the edit is refused, so include enough surrounding context to make it unique.",
       inputSchema: z.object({
         path: z.string().describe("Absolute path"),
         find: z
           .string()
+          // Empty is refused at the schema rather than in the body, because
+          // `split("")` does not count empty-string occurrences: on a file of
+          // one character it reports none, on a longer one it reports one per
+          // character, and on an *empty* file it reports -1 — which slips past
+          // both guards below and writes `replace` into the file as if an edit
+          // had been found. A write tool must not write what nobody asked for.
+          .min(1)
           .describe("Exact text to replace, unique within the file"),
         replace: z.string().describe("Replacement text")
       }),
@@ -958,15 +967,19 @@ export function buildComputerTools(
  * asymmetry is a decision rather than an oversight.
  *
  * What this function hands out is a raw shell to *another plugin*, whose commands
- * this module neither writes nor sees. `/repo` uses it to run credential-bearing
- * git, and it controls that environment exactly — `GIT_CONFIG_GLOBAL`,
- * `GIT_ASKPASS` and `GIT_TERMINAL_PROMPT` are pinned per command precisely so
- * nothing else decides what git reads. Merging a host environment underneath that
- * would let every key it does *not* pin through: `http_proxy`,
- * `GIT_PROXY_COMMAND`, `GIT_SSL_CAINFO`, `GIT_EXEC_PATH`. The last one relocates
- * git's own helper binaries. Redirecting those inside a command holding a forge
- * token is not a thing a container plugin's config field should be able to do by
- * accident, from a host that only meant to set a registry.
+ * this module neither writes nor sees. `/repo` runs its **unauthenticated** git
+ * through it — `status`, `diff`, `add`, `commit`, `checkout` — and pins the
+ * environment those need, which today is `GIT_TERMINAL_PROMPT=0` plus the
+ * model-authored values it passes as variables rather than interpolating.
+ * Merging a host environment underneath that would let every key it does *not*
+ * pin through: `http_proxy`, `GIT_PROXY_COMMAND`, `GIT_SSL_CAINFO`,
+ * `GIT_CONFIG_GLOBAL`, `GIT_EXEC_PATH`. The last two redirect the config git
+ * reads and relocate git's own helper binaries.
+ *
+ * No token is at stake — the credentialed operations do not run here at all —
+ * and the decision stands anyway: silently changing what git does inside another
+ * plugin's commands is not a thing a container plugin's config field should be
+ * able to do by accident, from a host that only meant to set a registry.
  *
  * So it is not withheld to be safe from the host — it is withheld so that a host
  * doing it does it *visibly*, at the call site, where the merge is in front of

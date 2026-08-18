@@ -181,6 +181,13 @@ export async function refreshCheckout({
   if (!target)
     return { message: `could not determine a default branch for ${url}` };
 
+  // The one place in this plugin where a model-authored value lands in git's
+  // *operand* position — everywhere else it is prefixed (`origin/…`,
+  // `refs/heads/…`) or is the value of a flag. Quoting is not enough here: it
+  // stops word-splitting, not option parsing, so `--detach` would be read as an
+  // option. `repo_clone` rejects such a name with `UNSAFE_BRANCH` before this
+  // runs, and that is a precondition of calling this function rather than an
+  // accident of the caller.
   const checkout = await plain(`checkout "$REPO_BRANCH"`, dir, {
     REPO_BRANCH: target
   });

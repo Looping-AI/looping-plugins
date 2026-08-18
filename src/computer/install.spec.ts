@@ -48,7 +48,7 @@ describe("resolveInstallCommand", () => {
     expect(result).toMatchObject({
       kind: "run",
       command: "npm ci --no-audit --no-fund",
-      lockfile: "package-lock.json"
+      lockfiles: ["package-lock.json"]
     });
   });
 
@@ -66,7 +66,7 @@ describe("resolveInstallCommand", () => {
     };
     expect(await resolve(both)).toMatchObject({
       command: "corepack pnpm install --frozen-lockfile",
-      lockfile: "pnpm-lock.yaml"
+      lockfiles: ["pnpm-lock.yaml"]
     });
 
     // Same inputs, opposite insertion order: the answer must not move.
@@ -76,7 +76,7 @@ describe("resolveInstallCommand", () => {
       [at("package.json")]: "{}"
     };
     expect(await resolve(reversed)).toMatchObject({
-      lockfile: "pnpm-lock.yaml"
+      lockfiles: ["pnpm-lock.yaml"]
     });
   });
 
@@ -98,7 +98,7 @@ describe("resolveInstallCommand", () => {
       [at("package.json")]: JSON.stringify({ packageManager: "turbo@2" }),
       [at("pnpm-lock.yaml")]: "lockfileVersion: 9"
     });
-    expect(result).toMatchObject({ lockfile: "pnpm-lock.yaml" });
+    expect(result).toMatchObject({ lockfiles: ["pnpm-lock.yaml"] });
   });
 
   it("survives a package.json that does not parse", async () => {
@@ -106,13 +106,13 @@ describe("resolveInstallCommand", () => {
       [at("package.json")]: "{ not json",
       [at("pnpm-lock.yaml")]: "lockfileVersion: 9"
     });
-    expect(result).toMatchObject({ lockfile: "pnpm-lock.yaml" });
+    expect(result).toMatchObject({ lockfiles: ["pnpm-lock.yaml"] });
   });
 
   it("falls back when there is a package.json and no lockfile", async () => {
     expect(await resolve({ [at("package.json")]: "{}" })).toMatchObject({
       command: "npm install --no-audit --no-fund",
-      lockfile: null
+      lockfiles: []
     });
   });
 
@@ -145,6 +145,99 @@ describe("resolveInstallCommand", () => {
     expect(
       await resolveInstallCommand(probe(files), DIR, plan, "acme/other")
     ).toMatchObject({ command: "corepack pnpm install --frozen-lockfile" });
+  });
+
+  /**
+   * An override replaces the whole command, so nothing here knows which manager
+   * it drives — but it still has to be fingerprinted against the lockfiles that
+   * are there, or a dependency bump that touches only the lock reuses a stale
+   * tree. See {@link installFingerprint}.
+   */
+  it("fingerprints an override against every lockfile the plan knows", async () => {
+    const plan: InstallPlan = {
+      ...DEFAULT_INSTALL_PLAN,
+      overrides: { "acme/site": "npm ci && npm run build" }
+    };
+    const result = await resolveInstallCommand(
+      probe({
+        [at("package.json")]: "{}",
+        [at("pnpm-lock.yaml")]: "lockfileVersion: 9",
+        [at("package-lock.json")]: "{}"
+      }),
+      DIR,
+      plan,
+      "acme/site"
+    );
+
+    expect(result).toMatchObject({ kind: "run" });
+    expect((result as { lockfiles: readonly string[] }).lockfiles).toEqual(
+      expect.arrayContaining(["pnpm-lock.yaml", "package-lock.json"])
+    );
+  });
+});
+
+/**
+ * Yarn, whose two generations disagree about their own flags.
+ *
+ * Measured rather than assumed, because the failure is silent: yarn 1.22.22 does
+ * not reject `--immutable`, it ignores it — exit 0, "success Saved lockfile", and
+ * a rewritten lockfile. An install that quietly stops being reproducible says
+ * nothing in the tool output, so nothing downstream can notice.
+ */
+describe("the yarn generations", () => {
+  const yarnFiles = (packageJson: string) => ({
+    [at("package.json")]: packageJson,
+    [at("yarn.lock")]: "# yarn lockfile v1\n"
+  });
+
+  it("uses the Berry flag when the pin is Berry", async () => {
+    expect(
+      await resolve(yarnFiles(JSON.stringify({ packageManager: "yarn@4.1.0" })))
+    ).toMatchObject({ command: "corepack yarn install --immutable" });
+  });
+
+  it("uses the Classic flag when the pin is Classic", async () => {
+    expect(
+      await resolve(
+        yarnFiles(JSON.stringify({ packageManager: "yarn@1.22.22" }))
+      )
+    ).toMatchObject({ command: "corepack yarn install --frozen-lockfile" });
+  });
+
+  /**
+   * The case that was actually broken, and the reason the default leans Classic:
+   * corepack's own default `yarn` is 1.22.22, so an unpinned `yarn.lock` — a
+   * legacy repository, which is most of them — ran Yarn 1 with a flag it ignored.
+   */
+  it("uses the Classic flag when nothing is pinned", async () => {
+    expect(await resolve(yarnFiles("{}"))).toMatchObject({
+      command: "corepack yarn install --frozen-lockfile",
+      reason: "found yarn.lock"
+    });
+  });
+
+  it("uses the Classic flag when the pin carries no readable version", async () => {
+    expect(
+      await resolve(
+        yarnFiles(JSON.stringify({ packageManager: "yarn@stable" }))
+      )
+    ).toMatchObject({ command: "corepack yarn install --frozen-lockfile" });
+  });
+
+  /**
+   * The narrowing in `commandFor`, reached the only way it can be: a pin naming
+   * a manager no rule claims falls through to the lockfiles, and `yarn.lock`
+   * then selects yarn. That other manager's major must not answer yarn's
+   * question — without the narrowing, `9 >= 2` picks Berry's flag for a tree
+   * whose lockfile is Classic. (A pin naming a manager that *does* have a rule
+   * never gets here: the pin beats the lockfiles outright.)
+   */
+  it("does not hand one manager's version to another's rule", async () => {
+    expect(
+      await resolve(
+        yarnFiles(JSON.stringify({ packageManager: "turbo@9.0.0" }))
+      )
+    ).toMatchObject({ command: "corepack yarn install --frozen-lockfile" });
   });
 });
 
@@ -230,6 +323,45 @@ describe("installFingerprint", () => {
     expect(await installFingerprint(probe(files), DIR, base)).not.toBe(
       await installFingerprint(probe(files), DIR, overridden)
     );
+  });
+
+  /**
+   * The silent one. An override used to record no lockfile, so its digest was
+   * the command plus `package.json` — and a dependency bump, which is a commit
+   * that touches only the lock, matched the stored fingerprint. The install was
+   * skipped, `node_modules` stayed a version behind, and the first sign of it
+   * was a build failing somewhere unrelated.
+   */
+  it("re-installs under an override when only the lockfile changed", async () => {
+    const plan: InstallPlan = {
+      ...DEFAULT_INSTALL_PLAN,
+      overrides: { "a/b": "npm ci && npm run build" }
+    };
+    const resolveOverride = (f: Record<string, string>) =>
+      resolveInstallCommand(probe(f), DIR, plan, "a/b");
+
+    const before = await installFingerprint(
+      probe(files),
+      DIR,
+      await resolveOverride(files)
+    );
+
+    const bumped = {
+      ...files,
+      [at("pnpm-lock.yaml")]: "lockfileVersion: 9\n  zod: 4.1.0\n"
+    };
+    expect(
+      await installFingerprint(
+        probe(bumped),
+        DIR,
+        await resolveOverride(bumped)
+      )
+    ).not.toBe(before);
+
+    // And an untouched tree still skips, or the fix would just be "always run".
+    expect(
+      await installFingerprint(probe(files), DIR, await resolveOverride(files))
+    ).toBe(before);
   });
 
   it("has nothing to fingerprint when nothing will be installed", async () => {

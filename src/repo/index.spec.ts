@@ -283,6 +283,41 @@ describe("shell injection", () => {
 });
 
 describe("guardrails", () => {
+  /**
+   * The second door a branch name enters by, and the one that was unguarded.
+   *
+   * `repo_clone.branch` reaches `refreshCheckout`, which runs
+   * `git checkout "$REPO_BRANCH"` — the only place in this plugin a
+   * model-authored value lands in git's *operand* position. Quoting stops word
+   * splitting, not option parsing, so `--detach` was read as an option: HEAD
+   * detached, the `reset` behind it failed against `origin/--detach`, and the
+   * next task inherited a checkout that had moved with nothing reporting it.
+   */
+  it.each(["--detach", "-f", "--orphan", "+x:main", "refs/heads/main"])(
+    "refuses to clone onto %s without running anything",
+    async (branch) => {
+      const { exec, calls } = recorder();
+      const result = await run(tools(exec), "repo_clone", {
+        url: "https://github.com/owner/repo",
+        branch
+      });
+
+      expect(result).toMatch(/not a plain branch name/i);
+      expect(calls).toHaveLength(0);
+    }
+  );
+
+  it("still clones onto an ordinary branch name", async () => {
+    const { exec, calls } = recorder();
+    const result = await run(tools(exec), "repo_clone", {
+      url: "https://github.com/owner/repo",
+      branch: "release-2.x"
+    });
+
+    expect(result).not.toMatch(/not a plain branch name/i);
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
   it.each(["main", "master", "trunk", "develop"])(
     "refuses to push to %s without running anything",
     async (branch) => {

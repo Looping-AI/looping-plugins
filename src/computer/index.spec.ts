@@ -380,6 +380,33 @@ describe("sb_edit", () => {
       await run(tools, "sb_edit", { path, find: "nope", replace: "x" })
     ).toContain("no match");
   });
+
+  /**
+   * Asserted on the schema rather than through `run`, because the schema is
+   * where the refusal lives — `run` calls `execute` directly, the way nothing in
+   * production does.
+   *
+   * The body cannot defend itself here: `split("")` counts no occurrences of the
+   * empty string, so on an empty file `occurrences` is -1, both guards miss, and
+   * `"".replace("", replace)` writes `replace` into the file and reports a
+   * successful edit. The other two cases are merely wrong rather than
+   * destructive — one character reports "no match", more than one reports one
+   * occurrence per character.
+   */
+  it("refuses an empty find at the schema, before any of that can happen", () => {
+    const { workspace } = stub();
+    const tools = buildComputerTools(workspace, config);
+    const schema = tools.sb_edit!.inputSchema as {
+      safeParse: (v: unknown) => { success: boolean };
+    };
+
+    expect(schema.safeParse({ path, find: "", replace: "x" }).success).toBe(
+      false
+    );
+    expect(schema.safeParse({ path, find: "a", replace: "x" }).success).toBe(
+      true
+    );
+  });
 });
 
 /**

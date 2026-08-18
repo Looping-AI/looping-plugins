@@ -63,13 +63,37 @@ export type InstallState =
       tail?: string;
     };
 
+/**
+ * A `package.json#packageManager` pin, parsed.
+ *
+ * The major is kept because one manager's generations disagree about their own
+ * flags — see the yarn rule in {@link DEFAULT_INSTALL_PLAN}. `undefined` when the
+ * pin named something with no parseable version, which is not an error: the name
+ * alone is still the strongest signal about which manager will run.
+ */
+export interface PinnedManager {
+  /** `pnpm`, `yarn`, `npm`, … */
+  name: string;
+  /** Major version, if the pin carried one. */
+  major?: number;
+}
+
 export interface InstallRule {
   /** How `package.json#packageManager` spells this one, e.g. `pnpm`. */
   manager: string;
   /** Lockfiles that select it, checked in this order. */
   lockfiles: readonly string[];
-  /** What to run, from the checkout directory. */
-  command: string;
+  /**
+   * What to run, from the checkout directory.
+   *
+   * A function when the command depends on which *generation* of the manager
+   * will run, which is a real problem for exactly one of them today. It is
+   * called with the repository's pin when that pin names this rule's manager,
+   * and with `undefined` otherwise — including when a lockfile selected the rule
+   * and nothing was pinned at all, which is the case worth thinking about,
+   * because that is when the version is whatever the runner defaults to.
+   */
+  command: string | ((pin?: PinnedManager) => string);
 }
 
 export interface InstallPlan {
@@ -102,7 +126,23 @@ export interface InstallPlan {
  * installs nothing without one" is a diagnosis; a bare `skip` is a mystery.
  */
 export type InstallResolution =
-  | { kind: "run"; command: string; reason: string; lockfile: string | null }
+  | {
+      kind: "run";
+      command: string;
+      reason: string;
+      /**
+       * The lockfiles this install depends on, for {@link installFingerprint}.
+       *
+       * Plural, and empty rather than absent, because the three cases differ. A
+       * rule match names the one lockfile that selected it. A `noLockfile`
+       * install names none. An **override** names every lockfile the plan knows
+       * of that is present, because an override replaces the whole command and
+       * this layer cannot know which manager it drives — and hashing only
+       * `package.json` there meant a lockfile-only commit reused a stale
+       * `node_modules` in silence.
+       */
+      lockfiles: readonly string[];
+    }
   | { kind: "skip"; reason: string };
 
 /**
@@ -123,7 +163,30 @@ export const DEFAULT_INSTALL_PLAN: InstallPlan = {
     {
       manager: "yarn",
       lockfiles: ["yarn.lock"],
-      command: "corepack yarn install --immutable"
+      /**
+       * The one manager whose generations disagree, and the disagreement is
+       * silent rather than loud — which is why this is a function and the other
+       * three are strings.
+       *
+       * Berry took `--immutable` and deprecated `--frozen-lockfile`. Yarn 1 has
+       * only the latter, and does **not** reject the former: measured against
+       * 1.22.22, `yarn install --immutable` on a lockfile that disagreed with
+       * `package.json` exited 0, printed "success Saved lockfile", and rewrote
+       * the lockfile — the exact opposite of what the flag was asked for. An
+       * install that quietly stops being reproducible is worse than one that
+       * fails, because nothing in the tool output says so.
+       *
+       * No pin means Yarn 1, deliberately: corepack's own default `yarn` is
+       * 1.22.22, so an unpinned `yarn.lock` — a legacy repository, which is most
+       * of them — is exactly the case that was silently broken. A Berry
+       * repository with no pin would now get the deprecated spelling, which
+       * Berry still honours (it warns YN0050 and enforces immutability anyway),
+       * and Berry writes that pin itself, so the case is rare and recoverable.
+       */
+      command: (pin) =>
+        pin?.major !== undefined && pin.major >= 2
+          ? "corepack yarn install --immutable"
+          : "corepack yarn install --frozen-lockfile"
     },
     {
       manager: "bun",
@@ -140,19 +203,55 @@ export const DEFAULT_INSTALL_PLAN: InstallPlan = {
   timeoutMs: 20 * 60_000
 };
 
-/** `pnpm@9.1.0+sha512.…` → `pnpm`. Undefined for anything unparseable. */
-function pinnedManager(packageJson: string): string | undefined {
+/** `pnpm@9.1.0+sha512.…` → `{ name: "pnpm", major: 9 }`. */
+function pinnedManager(packageJson: string): PinnedManager | undefined {
   try {
     const pin = (JSON.parse(packageJson) as { packageManager?: unknown })
       .packageManager;
     if (typeof pin !== "string") return undefined;
-    const name = pin.split("@")[0]?.trim();
-    return name || undefined;
+    const [rawName, rawVersion] = pin.split("@");
+    const name = rawName?.trim();
+    if (!name) return undefined;
+    // The major only, and only when it is really there. `yarn@stable` and
+    // `yarn@` are both things people write, and a rule reading `major` has to be
+    // able to tell "1" from "no idea".
+    const major = Number.parseInt(rawVersion ?? "", 10);
+    return Number.isNaN(major) ? { name } : { name, major };
   } catch {
     // A `package.json` that does not parse is the repository's problem, not
     // ours, and the install will surface it far more legibly than we can.
     return undefined;
   }
+}
+
+/**
+ * A rule's command, given the pin if the pin is about this rule's manager.
+ *
+ * The narrowing matters: a repository pinning `pnpm` whose `yarn.lock` selected
+ * the yarn rule must not have pnpm's major handed to yarn's command.
+ */
+function commandFor(rule: InstallRule, pin?: PinnedManager): string {
+  if (typeof rule.command === "string") return rule.command;
+  return rule.command(pin?.name === rule.manager ? pin : undefined);
+}
+
+/**
+ * Every lockfile the plan knows of that is present in `dir`.
+ *
+ * For an override, which replaces the whole command and tells this layer nothing
+ * about which manager it drives.
+ */
+async function knownLockfiles(
+  fs: InstallProbe,
+  dir: string,
+  plan: InstallPlan
+): Promise<string[]> {
+  const names = [...new Set(plan.rules.flatMap((r) => [...r.lockfiles]))];
+  const present: string[] = [];
+  for (const name of names) {
+    if (await fs.exists(`${dir}/${name}`)) present.push(name);
+  }
+  return present;
 }
 
 /**
@@ -175,7 +274,7 @@ export async function resolveInstallCommand(
       kind: "run",
       command: override,
       reason: `${repo} has an install override configured`,
-      lockfile: null
+      lockfiles: await knownLockfiles(fs, dir, plan)
     };
   }
 
@@ -187,14 +286,14 @@ export async function resolveInstallCommand(
   // is the thing corepack will enforce anyway.
   const pinned = pinnedManager(await fs.readFile(at("package.json"), "utf8"));
   if (pinned) {
-    const rule = plan.rules.find((r) => r.manager === pinned);
+    const rule = plan.rules.find((r) => r.manager === pinned.name);
     if (rule) {
       const lockfile = await firstPresent(fs, dir, rule.lockfiles);
       return {
         kind: "run",
-        command: rule.command,
-        reason: `package.json pins packageManager to ${pinned}`,
-        lockfile
+        command: commandFor(rule, pinned),
+        reason: `package.json pins packageManager to ${pinned.name}`,
+        lockfiles: lockfile ? [lockfile] : []
       };
     }
     // Named a manager nothing here knows. Fall through rather than fail: the
@@ -207,9 +306,9 @@ export async function resolveInstallCommand(
     if (lockfile) {
       return {
         kind: "run",
-        command: rule.command,
+        command: commandFor(rule, pinned),
         reason: `found ${lockfile}`,
-        lockfile
+        lockfiles: [lockfile]
       };
     }
   }
@@ -219,7 +318,7 @@ export async function resolveInstallCommand(
       kind: "run",
       command: plan.noLockfile,
       reason: "package.json with no lockfile",
-      lockfile: null
+      lockfiles: []
     };
   }
 
@@ -265,6 +364,23 @@ async function firstPresent(
  * reason that does not affect installs — a version bump — buys one redundant
  * install. That is a far cheaper failure than the one above.
  *
+ * ## An override is hashed against every lockfile the plan knows
+ *
+ * An override replaces the whole command, so this layer cannot know which
+ * manager it drives or which lockfile it reads. It used to record none, which
+ * meant the digest was the command plus `package.json` alone — and a commit that
+ * changed only `package-lock.json`, which is what a dependency bump is, matched
+ * the stored fingerprint, skipped the install, and left a `node_modules` that
+ * was quietly a version behind. So {@link resolveInstallCommand} reports every
+ * lockfile the plan names that is present, and all of them are hashed.
+ *
+ * The residual is worth stating because it cannot be closed here: an override
+ * that *builds* — `npm ci && npm run build`, the documented example — is not
+ * fingerprinted on the sources it builds from, because hashing `package.json`
+ * cannot know what an arbitrary command reads. A host that needs a rebuild on
+ * every source change should make its override cheap enough to run every time
+ * rather than expect this to detect one.
+ *
  * ## This is only half of the skip condition
  *
  * A matching fingerprint means "the same install would produce the same tree".
@@ -281,14 +397,10 @@ export async function installFingerprint(
 ): Promise<string | null> {
   if (resolution.kind !== "run") return null;
 
-  // An override can name a command with no lockfile behind it, and a bare
-  // `package.json` is a repository too — so either file being absent is
-  // ordinary, and only the pair being absent means there is nothing to
-  // fingerprint at all.
-  const names = [
-    "package.json",
-    ...(resolution.lockfile ? [resolution.lockfile] : [])
-  ];
+  // Either file being absent is ordinary — a bare `package.json` is a
+  // repository, and a `noLockfile` install has no lock by definition — so only
+  // the whole set being absent means there is nothing to fingerprint at all.
+  const names = ["package.json", ...resolution.lockfiles];
 
   // Names as well as contents. Two lockfiles will not collide on content in
   // practice, but a digest that cannot say *which* file it read is one that
