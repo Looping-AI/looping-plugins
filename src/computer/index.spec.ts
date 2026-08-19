@@ -396,6 +396,33 @@ describe("sb_edit", () => {
   });
 
   /**
+   * The replacement is written byte-for-byte, `$` and all.
+   *
+   * `String.replace` interprets `$$`, `$&`, `` $` `` and `$'` in a *string*
+   * replacement even when the pattern is a plain string, so the naive call writes
+   * something other than what the model sent — and reports success while doing
+   * it. None of these is exotic: `$$` escapes a dollar in a Makefile and reads a
+   * PID in shell, and `$'…'` is bash ANSI-C quoting.
+   */
+  it.each([
+    ["a PID, or a Makefile's escaped dollar", "echo $$"],
+    ["the whole-match pattern", "a$&b"],
+    ["the before-match pattern", "x$`y"],
+    ["the after-match pattern", "x$'y"],
+    ["bash ANSI-C quoting", "printf '%s' $'\\t'"]
+  ])("writes %s literally", async (_why, replace) => {
+    const { workspace, files } = stub({ [path]: "const a = MARK;\n" });
+    const tools = buildComputerTools(workspace, config);
+
+    expect(await run(tools, "sb_edit", { path, find: "MARK", replace })).toBe(
+      `edited ${path}`
+    );
+    // The file's bytes, not the tool's answer: the defect this guards returns
+    // "edited" either way.
+    expect(files.get(path)).toBe(`const a = ${replace};\n`);
+  });
+
+  /**
    * Refusing an ambiguous edit is the whole value of this tool over `sb_write`:
    * a silent first-match replace corrupts the file in a way that surfaces much
    * later, usually as a confusing test failure.

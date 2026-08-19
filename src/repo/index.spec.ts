@@ -506,6 +506,57 @@ describe("guardrails", () => {
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
   });
 
+  /**
+   * A comparison that fails has not established anything, and this is the only
+   * probe in `repo_push` that could read that as permission.
+   *
+   * The guard is skipped when there is no baseline at all — the case below — but
+   * once `origin/HEAD` has resolved, a `rev-list` that then fails leaves the
+   * empty-pull-request question open. Pushing anyway is how an empty branch
+   * reaches `repo_open_pr` and gets reported as delivered work.
+   */
+  it("refuses to push when the empty-branch comparison fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { exec, calls } = recorder({
+        "rev-parse --verify --quiet": { success: true },
+        "rev-list --count": { success: false }
+      });
+      const { git, gitCalls } = gitRecorder();
+      const result = await run(tools(exec, { git }), "repo_push", {
+        dir: "/w/r",
+        branch: "coder/x"
+      });
+
+      expect(result).toMatch(
+        /could not tell whether "coder\/x" has anything to push/i
+      );
+      expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+      expect(gitCalls).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("names a lost container rather than the comparison when nothing ran", async () => {
+    const { exec } = recorder({
+      "rev-parse --verify --quiet": { success: true },
+      "rev-list --count": {
+        throws: Object.assign(new Error("gone"), { code: "EEXEC_LOST" })
+      }
+    });
+    const { git, gitCalls } = gitRecorder();
+    const result = await run(tools(exec, { git }), "repo_push", {
+      dir: "/w/r",
+      branch: "coder/x"
+    });
+
+    // The same distinction the three probes around it draw: a container that
+    // vanished is not an answer about the branch.
+    expect(result).toMatch(/container was replaced/i);
+    expect(gitCalls).toHaveLength(0);
+  });
+
   /** A repo with no resolvable default branch is unusual, not a reason to block. */
   it("skips the empty-branch guard when the baseline cannot be resolved", async () => {
     const { exec } = recorder({
@@ -562,17 +613,23 @@ describe("guardrails", () => {
  */
 describe("talking to the forge", () => {
   /**
-   * Answers keyed by the path each belongs to, matched as a **suffix**.
+   * Answers keyed by the path each belongs to, matched as a **suffix of the
+   * pathname**.
    *
    * Not `includes`: `/issues/42` is a prefix of `/issues/42/comments`, so a
    * substring match quietly answers the comments request with the issue and the
    * test for a failed comment load passes against a route that never failed.
+   *
+   * The pathname rather than the whole URL, because the list endpoints carry a
+   * `?per_page=`. Matching the raw string would make every route here miss and
+   * every list arrive as a 404 — which reads as a plugin bug rather than a stale
+   * test.
    */
   const api = (routes: Record<string, unknown>, status = 200) =>
     vi
       .spyOn(globalThis, "fetch")
       .mockImplementation(async (input: RequestInfo | URL) => {
-        const url = String(input);
+        const url = new URL(String(input)).pathname;
         const hit = Object.entries(routes).find(([path]) =>
           url.endsWith(path)
         )?.[1];
@@ -740,6 +797,81 @@ describe("talking to the forge", () => {
       expect(result).toMatch(/no origin on an allowed host/i);
       // And nothing was asked of the API, so the token was never sent anywhere.
       expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  /**
+   * A full page is very likely not the whole thread, and the model has to be told.
+   *
+   * Comments arrive oldest first, so the ones missing from page one are the most
+   * recent — the review feedback on a pull request busy enough to have overflowed,
+   * which is exactly what the agent was sent to act on. Silence here reads as "this
+   * is the discussion".
+   */
+  it("asks for a full page and says when the thread is longer", async () => {
+    const spy = api({
+      "/issues/42": { title: "T", state: "open", body: "b" },
+      "/issues/42/comments": Array.from({ length: 100 }, (_, i) => ({
+        user: { login: `u${i}` },
+        body: `c${i}`
+      }))
+    });
+    try {
+      const { exec } = recorder();
+      const result = await run(tools(exec), "repo_issue_view", {
+        dir: "/w/r",
+        number: 42
+      });
+
+      const asked = spy.mock.calls.map((c) => String(c[0]));
+      expect(asked.some((u) => u.includes("/comments?per_page=100"))).toBe(
+        true
+      );
+      expect(result).toMatch(/showing the first 100 comments/i);
+      expect(result).toMatch(/newest are not among them/i);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("says nothing about pagination when the thread fits", async () => {
+    const spy = api({
+      "/issues/42": { title: "T", state: "open", body: "b" },
+      "/issues/42/comments": [{ user: { login: "u" }, body: "c" }]
+    });
+    try {
+      const { exec } = recorder();
+      const result = await run(tools(exec), "repo_issue_view", {
+        dir: "/w/r",
+        number: 42
+      });
+      expect(result).not.toMatch(/showing the first/i);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports a pull request whose file list was cut", async () => {
+    const spy = api({
+      "/pulls/7": { title: "T", state: "open", head: {}, base: {} },
+      "/pulls/7/files": Array.from({ length: 100 }, (_, i) => ({
+        filename: `src/f${i}.ts`,
+        additions: 1,
+        deletions: 0
+      }))
+    });
+    try {
+      const { exec } = recorder();
+      const result = await run(tools(exec), "repo_pr_view", {
+        dir: "/w/r",
+        number: 7
+      });
+
+      const asked = spy.mock.calls.map((c) => String(c[0]));
+      expect(asked.some((u) => u.includes("/files?per_page=100"))).toBe(true);
+      expect(result).toMatch(/showing the first 100 files/i);
     } finally {
       spy.mockRestore();
     }

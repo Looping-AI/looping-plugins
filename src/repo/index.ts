@@ -304,6 +304,17 @@ const DEFAULT_MAX_OUTPUT_CHARS = 16_000;
  * requests, and thirty seconds is already generous for one.
  */
 const FORGE_TIMEOUT_MS = 30_000;
+/**
+ * How many items one forge list call asks for. GitHub's maximum, and its default
+ * without this is 30.
+ *
+ * One page, never a Link-header walk: an unbounded fetch loop does not belong
+ * inside a model turn, and the render is bounded by `maxOutputChars` anyway. What
+ * matters is that a full page is *reported* as possibly partial rather than
+ * presented as the whole answer — a pull request's newest review comments are on
+ * the last page, and those are exactly the ones an agent was sent to act on.
+ */
+const FORGE_PAGE_SIZE = 100;
 
 /**
  * Middle-out truncation, so both the head of a diff and its tail survive.
@@ -403,6 +414,29 @@ function unreachableNote(err: unknown): string {
  * isolate, one container. Reads are serialised too — `git status` does not take
  * the lock, but ordering costs nothing at these durations and removes having to
  * be right about which commands write.
+ *
+ * ## The unit is a command, not a tool call
+ *
+ * Worth stating exactly, because the name suggests more. What is guaranteed is
+ * that no two git commands run at once, which is what `.git/index.lock` needs.
+ * What is *not* guaranteed is that one tool's sequence is atomic: `repo_push`
+ * issues nine commands and `repo_commit` two, and another tool's command can be
+ * dequeued between any of them. The shape to watch for is a branch switch landing
+ * inside another tool's work —
+ *
+ *     repo_commit: git add -A
+ *     repo_push:   git checkout -b coder/x    ← interleaves here
+ *     repo_commit: git commit -m "…"          ← lands on coder/x
+ *
+ * — because the checked-out branch is state the whole checkout shares, so only
+ * concurrent *mutating* tools can disturb it. Both calls report success.
+ *
+ * Accepted rather than closed, because reaching it takes two repo tool calls in
+ * flight against one checkout from one agent, and that is not how the coder
+ * drives them. If it is ever observed, the fix is to take the lock once around
+ * each tool body instead of around each command — which means the runners below
+ * must stop taking it themselves, since a nested take on a promise chain waits
+ * on a tail its own caller is still holding.
  */
 const gitQueues = new WeakMap<RepoConfig, { tail: Promise<unknown> }>();
 
@@ -1125,10 +1159,13 @@ export function buildRepoTools(
         // A branch level with the default branch means the commit went
         // somewhere else, or was never made. Pushing it succeeds, `repo_open_pr`
         // opens an empty pull request, and the round reports a URL as if the
-        // work had landed — the one outcome worse than an error. Skipped rather
-        // than failed when the baseline cannot be resolved: a repository with no
-        // `origin/HEAD` is unusual but legitimate, and guessing is worse than
-        // not guarding.
+        // work had landed — the one outcome worse than an error.
+        //
+        // The guard is skipped only when there is no baseline to compare
+        // against: a repository with no `origin/HEAD` is unusual but legitimate,
+        // and guessing is worse than not guarding. Once there *is* one, a
+        // comparison that fails is an unanswered question rather than a pass —
+        // the same rule the three probes around this one follow.
         if (defaultBranch) {
           const ahead = await plain(
             `rev-list --count "origin/$REPO_BASE..HEAD"`,
@@ -1137,7 +1174,19 @@ export function buildRepoTools(
               REPO_BASE: defaultBranch
             }
           );
-          if (ahead.success && ahead.stdout.trim() === "0") {
+          if (ahead.unreachable)
+            return bounded(`could not push "${branch}": ${ahead.stderr}`);
+          if (!ahead.success) {
+            logFailure("repo_push", ahead);
+            return bounded(
+              `could not tell whether "${branch}" has anything to push: comparing it ` +
+                `against origin/${defaultBranch} failed with ` +
+                `${ahead.stderr || ahead.stdout || "no output"}\n` +
+                `Nothing was pushed. Pushing without that answer risks an empty pull ` +
+                `request reported as success, so check repo_status and repo_diff first.`
+            );
+          }
+          if (ahead.stdout.trim() === "0") {
             return (
               `refusing to push "${branch}" — it has no commits that origin/${defaultBranch} ` +
               `does not already have, so the pull request would be empty. Check repo_status ` +
@@ -1282,13 +1331,18 @@ export function buildRepoTools(
 
         const comments = await forge(
           "repo_issue_view",
-          `/repos/${owner}/${repo}/issues/${number}/comments`
+          `/repos/${owner}/${repo}/issues/${number}/comments?per_page=${FORGE_PAGE_SIZE}`
         );
         // A failure here is not a failure of the tool: the issue itself was
         // read, and half an answer beats none.
         const thread = (
           comments.ok && Array.isArray(comments.data) ? comments.data : []
         ) as { user?: { login?: string }; body?: string }[];
+        // A full page means there is very likely another. Said out loud, because
+        // this thread is what the model reasons from: comments arrive oldest
+        // first, so the ones it cannot see are the most recent — the review
+        // feedback, on the pull request busy enough to have overflowed.
+        const moreComments = thread.length >= FORGE_PAGE_SIZE;
 
         return bounded(
           [
@@ -1301,7 +1355,13 @@ export function buildRepoTools(
               (c) =>
                 `\n--- ${c.user?.login ?? "unknown"} ---\n${c.body?.trim() ?? ""}`
             ),
-            ...(comments.ok ? [] : [`\n(comments could not be read)`])
+            ...(comments.ok ? [] : [`\n(comments could not be read)`]),
+            ...(moreComments
+              ? [
+                  `\n(showing the first ${FORGE_PAGE_SIZE} comments; the thread is ` +
+                    `longer, and the newest are not among them)`
+                ]
+              : [])
           ].join("\n")
         );
       }
@@ -1337,11 +1397,12 @@ export function buildRepoTools(
 
         const files = await forge(
           "repo_pr_view",
-          `/repos/${owner}/${repo}/pulls/${number}/files`
+          `/repos/${owner}/${repo}/pulls/${number}/files?per_page=${FORGE_PAGE_SIZE}`
         );
         const changed = (
           files.ok && Array.isArray(files.data) ? files.data : []
         ) as { filename?: string; additions?: number; deletions?: number }[];
+        const moreFiles = changed.length >= FORGE_PAGE_SIZE;
 
         return bounded(
           [
@@ -1368,7 +1429,13 @@ export function buildRepoTools(
                   .join("\n")
               : files.ok
                 ? "  (no files reported)"
-                : "  (changed files could not be read)"
+                : "  (changed files could not be read)",
+            ...(moreFiles
+              ? [
+                  `\n(showing the first ${FORGE_PAGE_SIZE} files; this pull request ` +
+                    `touches more)`
+                ]
+              : [])
           ].join("\n")
         );
       }

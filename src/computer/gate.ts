@@ -184,8 +184,15 @@ const COMMAND_WRAPPERS = new Set([
   "exec"
 ]);
 
-/** An option, or the number that follows one — `nice -n 10`, `xargs -n1`. */
-const WRAPPER_ARGUMENT = /^-|^\d+$/;
+/**
+ * An option, or the value that follows one — `nice -n 10`, `xargs -n1`.
+ *
+ * The unit suffix is not decoration: `timeout` takes `60s`, `5m`, `2h`, and a
+ * bare-integer pattern reads that duration as the program being run. So
+ * `timeout 60s vitest run` never reaches `vitest`, skips the gate, and tests
+ * against a half-built `node_modules` — while `timeout 60 vitest run` works.
+ */
+const WRAPPER_ARGUMENT = /^-|^\d+[smhd]?$/;
 
 /**
  * Does this command plausibly read `node_modules`, and therefore have to wait for

@@ -303,6 +303,10 @@ const INSTALL_CONFIG_FILES = [
   ".yarnrc",
   ".yarnrc.yml",
   "pnpm-workspace.yaml",
+  // Not configuration in the same sense as the rest: its `readPackage` hook
+  // rewrites dependency manifests as the install reads them, so it changes what
+  // `node_modules` becomes from a byte-identical lockfile.
+  ".pnpmfile.cjs",
   "bunfig.toml"
 ] as const;
 

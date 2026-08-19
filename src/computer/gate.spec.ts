@@ -49,6 +49,23 @@ describe("needsDependencies", () => {
   });
 
   /**
+   * `timeout` takes a duration, and a duration usually carries a unit.
+   *
+   * A bare-integer wrapper argument reads `60s` as the program being run, so the
+   * `vitest` behind it is never checked — while the `timeout 60 …` spelling
+   * works. That asymmetry is the expensive direction: a test suite running
+   * against a half-built `node_modules`.
+   */
+  it.each([
+    "timeout 60s vitest run",
+    "timeout 5m tsc",
+    "timeout 2h jest",
+    "timeout --preserve-status 30s vitest"
+  ])("looks past a wrapper's duration argument in %s", (command) => {
+    expect(needsDependencies(command)).toBe(true);
+  });
+
+  /**
    * A package manager's own lockfile is a file, not a build.
    *
    * The sibling of the config-file case below, and the one a position check

@@ -727,7 +727,17 @@ export function buildComputerTools(
           if (occurrences === 0) return `no match for that text in ${path}`;
           if (occurrences > 1)
             return `that text appears ${occurrences} times in ${path} — add surrounding context to make it unique`;
-          await fs.writeFile(path, content.replace(find, replace));
+          // A replacer function, not the string itself. `String.replace`
+          // interprets `$$`, `$&`, `` $` `` and `$'` in a *string* replacement
+          // even when the pattern is a plain string, so the text written is not
+          // the text the model sent: `echo $$` becomes `echo $`, and `$'` splices
+          // in everything before the match. Those two are not exotic — `$$`
+          // escapes a dollar in a Makefile and reads a PID in shell, and `$'…'`
+          // is bash ANSI-C quoting. A function's return value is used verbatim.
+          await fs.writeFile(
+            path,
+            content.replace(find, () => replace)
+          );
           return `edited ${path}`;
         });
       }
