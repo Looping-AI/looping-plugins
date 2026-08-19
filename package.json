@@ -80,7 +80,7 @@
   "peerDependencies": {
     "@cloudflare/computer": "^0.2.1",
     "@cloudflare/shell": "^0.4.3",
-    "@loopingai/core": "^0.6.0",
+    "@loopingai/core": "^0.7.0",
     "agents": "^0.20.0",
     "ai": "^7.0.52",
     "drizzle-orm": "^0.45.2",
@@ -99,7 +99,7 @@
     "@cloudflare/computer": "^0.2.1",
     "@cloudflare/shell": "0.4.3",
     "@cloudflare/vitest-pool-workers": "^0.21.3",
-    "@loopingai/core": "^0.6.0",
+    "@loopingai/core": "^0.7.0",
     "@types/node": "^26.2.0",
     "agents": "^0.20.0",
     "ai": "^7.0.52",
