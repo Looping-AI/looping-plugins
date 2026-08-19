@@ -95,6 +95,10 @@ export {
   truncateOutput
 } from "./render.js";
 export { needsDependencies } from "./gate.js";
+// A host implementing `InstallProbe` needs exactly this, and hand-rolling it
+// loses the fast path: across a Durable Object boundary `fs` is a stub carrying
+// `exists`, which a `stat`-only probe never asks for.
+export { pathExists } from "./read.js";
 
 /**
  * This plugin's tool-family name, as a recipe's `toolFamilies` lists it.
