@@ -8,11 +8,19 @@
   // a consumer brings their own, and each plugin's README ships the snippet.
   "name": "looping-plugins-test",
   "main": "test/worker.ts",
-  "compatibility_date": "2026-07-01",
-
-  // The Agents SDK reaches for Node builtins (`node:async_hooks` among others),
-  // and the plugin stores run drizzle over durable-sqlite. Both need this.
-  "compatibility_flags": ["nodejs_compat"],
+  // 2026-08-04 is not an arbitrary "recent enough" date: it is the day
+  // `nodejs_compat` became a default rather than a flag. The Agents SDK reaches
+  // for Node builtins (`node:async_hooks` among others) and the plugin stores run
+  // drizzle over durable-sqlite, so this Worker has always needed it — on an
+  // earlier date it needed `compatibility_flags: ["nodejs_compat"]` to say so,
+  // and on this one that entry is redundant. workerd rejects flags a compatibility
+  // date already enables, and `@cloudflare/vitest-pool-workers` 0.21.2 started
+  // dropping the redundant pair on the way through for exactly that reason.
+  //
+  // Held at the boundary rather than pushed to today, so the date means the thing
+  // the comment says it means. Moving it further is a separate decision with its
+  // own behaviour changes to read.
+  "compatibility_date": "2026-08-04",
 
   "durable_objects": {
     "bindings": [{ "name": "TEST_AGENT", "class_name": "TestAgent" }]

@@ -80,13 +80,15 @@ needing per-caller state takes it the same way.
 
 ## The plugins
 
-| Subpath                        | What it adds                                                                          | Needs                         |
-| ------------------------------ | ------------------------------------------------------------------------------------- | ----------------------------- |
-| [`/arc-agi`](src/arc-agi/)     | Play ARC-AGI-3 games — a delegable subtask type, a catalogue tool, a scorecard ledger | `ARC_API_KEY`                 |
-| [`/browser`](src/browser/)     | Read web pages via Browser Rendering Quick Actions                                    | `BROWSER` (paid plan)         |
-| [`/recall`](src/recall/)       | Episodic memory over Vectorize — search history that compaction folded away           | `VECTORIZE` (1024-dim/cosine) |
-| [`/triage`](src/triage/)       | A pre-turn gate: is this message even for me?                                         | —                             |
-| [`/workspace`](src/workspace/) | A durable file store for long subagent runs, plus tools over it                       | `@cloudflare/shell`           |
+| Subpath                        | What it adds                                                                                 | Needs                         |
+| ------------------------------ | -------------------------------------------------------------------------------------------- | ----------------------------- |
+| [`/arc-agi`](src/arc-agi/)     | Play ARC-AGI-3 games — a delegable subtask type, a catalogue tool, a scorecard ledger        | `ARC_API_KEY`                 |
+| [`/browser`](src/browser/)     | Read web pages via Browser Rendering Quick Actions                                           | `BROWSER` (paid plan)         |
+| [`/computer`](src/computer/)   | A Linux container whose filesystem outlives it: shell, package manager, unrestricted network | `@cloudflare/computer` (paid) |
+| [`/recall`](src/recall/)       | Episodic memory over Vectorize — search history that compaction folded away                  | `VECTORIZE` (1024-dim/cosine) |
+| [`/repo`](src/repo/)           | Clone, commit, push a branch, open a pull request — over any container                       | `GITHUB_TOKEN`                |
+| [`/triage`](src/triage/)       | A pre-turn gate: is this message even for me?                                                | —                             |
+| [`/workspace`](src/workspace/) | A durable file store for long subagent runs, plus tools over it                              | `@cloudflare/shell`           |
 
 Each directory has its own README with the config shape and a paste-ready `wrangler.jsonc`
 snippet — a plugin cannot add its own binding, which is why it declares what it needs.
@@ -125,7 +127,7 @@ Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the ha
 `@loopingai/core/testing`.
 
 ```bash
-npm test          # 232 specs, no credentials and no network
+npm test          # 514 specs, no credentials and no network
 npm run check     # prettier + eslint + tsc + build
 npm run verify:exports
 ```

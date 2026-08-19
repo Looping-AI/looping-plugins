@@ -155,9 +155,10 @@ describe("what ARC_GAME_SPEC tells the main agent", () => {
   });
 
   it("declares its capability on the type, never also on the plugin", () => {
-    // The two are rendered by different call sites (`runtime.renderCapabilities`
-    // and `runtime.types.renderCapabilities`), so declaring both would make the
-    // main agent read the same advice twice per round — the exact drift above.
+    // `runtime.renderCapabilities()` emits both blocks a plugin may declare — its
+    // own `capability` and the one on its `subtaskType` — and it is the single
+    // path into the main agent's soul. Declaring both would therefore make the
+    // model read the same advice twice per round: the exact drift above.
     const plugin = arcAgi({
       apiKey: "k",
       storage: {} as DurableObjectStorage,
@@ -166,9 +167,13 @@ describe("what ARC_GAME_SPEC tells the main agent", () => {
     expect(plugin.capability).toBeUndefined();
     expect(plugin.subtaskType!.capability).toBe(ARC_GAME_SPEC.capability);
 
-    const rt = runtime();
-    expect(rt.renderCapabilities()).toBe("");
-    expect(rt.types.renderCapabilities()).toContain("arc_list_games");
+    // Declared once and rendered once. Equality, not `toContain`: it is what
+    // catches a second copy, which is the whole point of declaring it in one
+    // place. arc-agi is the only plugin installed here, so its block is the
+    // entire render.
+    const rendered = runtime().renderCapabilities();
+    expect(rendered).toContain("arc_list_games");
+    expect(rendered).toBe(ARC_GAME_SPEC.capability);
   });
 
   it("names the param that starts a play and the tool that supplies it", () => {
