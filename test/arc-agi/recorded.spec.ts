@@ -39,7 +39,8 @@ import { setupRecording } from "@loopingai/core/testing";
 setupRecording();
 
 /**
- * The recording key, from `.dev.vars`.
+ * The recording key, from `.env.test` (bridged into the worker's `env` by
+ * vitest.config.ts).
  *
  * Read through a cast rather than off a typed `Env`, because this package
  * deliberately does not generate one: a published plugin must never name a
