@@ -27,6 +27,8 @@
  * `packageManager` pin, then lockfiles in the order the plan lists them.
  */
 
+import type { JobState } from "@loopingai/core/job";
+
 /** Just enough of a workspace filesystem to inspect a checkout. */
 export interface InstallProbe {
   exists(path: string): Promise<boolean>;
@@ -41,27 +43,29 @@ export interface InstallProbe {
  * to run against a tree that is still being built. A shape they agreed on
  * informally would drift, and the drift would show up as a shell command running
  * halfway through an `npm ci`.
+ *
+ * ## Why it is core's `JobState` with one field intersected in
+ *
+ * Core owns the *choreography* around a job a Durable Object drives through its
+ * alarm — arming, the single-flight guard, the staleness bound, the generation
+ * marker a drain checks before it writes. This package owns what an install
+ * specifically **is**: which package manager, which lockfile, what counts as
+ * skippable. Splitting them along that line is what lets a second job on the
+ * same object — a coding-agent run, say — reuse every rule without inheriting
+ * `npm ci`.
+ *
+ * `JobState` intersects `TExtra` into its `running`/`done`/`failed` variants
+ * instead of nesting it under `meta`, so this alias is byte-identical to the
+ * hand-written union it replaced. Every reader still spells `status.command` at
+ * the top level and no call site moved.
+ *
+ * The `/job` subpath landed in `@loopingai/core` **0.8.1**, which is why the
+ * peer range is `^0.8.1` rather than the `^0.8.0` the rest of this package would
+ * otherwise be content with. A consumer resolving 0.8.0 does not get a subtly
+ * wrong type here, it gets an unresolvable import — so the floor is stated in
+ * `package.json` rather than left to chance.
  */
-export type InstallState =
-  | { state: "idle" }
-  | { state: "skipped"; reason: string }
-  | { state: "running"; command: string; startedAt: number; tail?: string }
-  | {
-      state: "done";
-      command: string;
-      exitCode: number;
-      finishedAt: number;
-      ms: number;
-      tail?: string;
-    }
-  | {
-      state: "failed";
-      command: string;
-      finishedAt: number;
-      error: string;
-      exitCode?: number;
-      tail?: string;
-    };
+export type InstallState = JobState<{ command: string }>;
 
 export interface InstallRule {
   /** How `package.json#packageManager` spells this one, e.g. `pnpm`. */
