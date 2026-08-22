@@ -29,12 +29,12 @@ before it does anything (see [Costs](#costs)).
 
 Two nested notions of "subagent" that must never be conflated:
 
-|                                | Looping subtask        | Claude Code subagent          |
-| ------------------------------ | ---------------------- | ----------------------------- |
-| Durable                        | yes                    | no                            |
-| Visible to Looping's scheduler | yes                    | **no**                        |
-| Cancellable by Looping         | yes                    | **no**                        |
-| Bounded by                     | the egress budget gate | `CLAUDE_CODE_MAX_*`, advisory |
+|                                | Looping subtask                                | Claude Code subagent          |
+| ------------------------------ | ---------------------------------------------- | ----------------------------- |
+| Durable                        | yes                                            | no                            |
+| Visible to Looping's scheduler | yes                                            | **no**                        |
+| Cancellable by Looping         | yes                                            | **no**                        |
+| Bounded by                     | `timeoutMs`, enforced by the container runtime | `CLAUDE_CODE_MAX_*`, advisory |
 
 ## The credential never enters the container
 
@@ -45,12 +45,12 @@ repository's own build and test commands. So nothing secret goes in it.
 The session launches with `CREDENTIAL_PLACEHOLDER`. `computerd` intercepts every
 outbound request and hands it to `claudeCodeEgress` on the **Worker** side, which:
 
-1. **swaps** the placeholder for the real credential, for `api.anthropic.com` only;
+1. **swaps** the placeholder for a real credential, for `api.anthropic.com` only;
 2. **strips** every credential header from anything else;
 3. optionally **restricts the container to named hosts** — exact hostname match,
    no wildcards, and **off by default** (see below);
-4. can **refuse** a model call that is over budget, with a `429` the client renders
-   as `system/api_retry`.
+4. **rotates** to the next credential when Anthropic says the current one's
+   bucket is spent (see below).
 
 A `postinstall` that dumps the environment learns the placeholder and nothing else.
 
@@ -93,13 +93,59 @@ Nothing sets `ANTHROPIC_BASE_URL`. The intercept is transparent, so the client
 talks to the real hostname — which means nothing in the container is _told_ to
 use a proxy, and nothing in the container can be told not to.
 
-### The gateway is the only ceiling that holds
+### The 5-hour and weekly limits: rotate, do not predict
 
-`--max-turns` and the subagent caps are advisory, and the inner agent tree
-multiplies both. Every inner call still crosses the gateway, so a budget refused
-there is a budget refused. Meter from the `result` event — it carries `usage` and
-a per-model cost breakdown, and it is parsed anyway — and let the gate read the
-counter.
+A Claude subscription has a rolling 5-hour bucket and a weekly one. Neither is
+readable, and an earlier version of this package tried to stay under them by
+_estimating_ spend — a dollar counter, a cap, and a gate that refused to start
+work when the counter got high. That was the wrong instrument twice over: the
+estimate is a guess about a bucket nobody can see, and it only moved when a run
+_ended_ (usage is learned from the terminal `result` event), so it was never a
+cap on spend at all — only a gate on starting.
+
+The gateway sees Anthropic's actual response, which is the one place the bucket
+announces itself, exactly, the moment it is empty. So the credential is a
+**pool**:
+
+```
+429 (reset 4h out)  →  mark entry 0 spent until its reset
+                    →  the lead becomes entry 1
+                    →  return the 429 with `retry-after: 1`
+                    →  Claude Code's own retry lands on entry 1
+```
+
+The `retry-after` rewrite is what turns the client's existing retry into the
+rotation, and it is why nothing here buffers a request body. Left at the
+upstream's value — four hours — the client would sleep inside the container
+holding a chunk open, which is a stall rather than a rotation.
+
+Three behaviours are worth knowing before you rely on it:
+
+- **A short `retry-after` is not exhaustion.** Under a minute is read as an
+  ordinary slow-down and forwarded untouched. Rotating on a speed bump would
+  retire a working credential for whatever window the header named, and with a
+  small pool two of those would empty it.
+- **A `401`/`403` retires an entry for good**, rather than until a reset — a
+  revoked credential does not heal on a timer. The response is rewritten to a
+  `429` on the way out, because a client does not retry a `401` and would
+  otherwise fail the run on a credential the gateway has already stopped using.
+- **When every entry is spent**, the real wait goes through: a `429` naming the
+  earliest reset, so the run ends cleanly having said when to come back. When
+  every entry is _rejected_ it is a `500` instead, because that one needs an
+  operator and a `429` would hide it behind a retry loop.
+
+State lives wherever the host's {@link CredentialStore} puts it. Keeping it in
+the workspace Durable Object's own storage is the intended shape: each workspace
+learns a rotation independently, which costs one wasted `429` per workspace per
+rotation and saves a Durable Object class, a binding and a migration.
+
+> **The detection rules are inferences, not observations.** No genuine
+> subscription-exhaustion `429` has been captured through this path — the
+> ones seen during development were the _raw-API_ refusal, which is a different
+> response — so `readRefusal` reads `retry-after`, then
+> `anthropic-ratelimit-unified-reset`, then falls back to a long default. The
+> gateway logs every `401`/`403`/`429` whole, headers and body, precisely so the
+> first real one can replace the inference with a fact.
 
 ## What the host must provide
 
@@ -135,7 +181,16 @@ counter.
   "migrations": [
     { "tag": "v5", "new_sqlite_classes": ["ClaudeCoderWorkspaceDO"] }
   ],
-  "secrets": { "required": ["CLAUDE_CODE_OAUTH_TOKEN"] }
+  // The pool, in priority order — **exactly the credentials you have**.
+  //
+  // `secrets.required` drives type generation and `wrangler dev`'s
+  // missing-secret warnings, so a name listed here and left unset is typed as a
+  // definite string that is undefined at runtime, and warns on every local run.
+  // For a single-credential deployment, drop `_2` from this list *and* from the
+  // `credentials` array below — they are one change, not two.
+  "secrets": {
+    "required": ["CLAUDE_CODE_OAUTH_TOKEN_1", "CLAUDE_CODE_OAUTH_TOKEN_2"]
+  }
 }
 ```
 
@@ -151,18 +206,41 @@ The workspace Durable Object installs the gateway as its egress policy:
 
 ```ts
 readonly #session = claudeCodeSession({
-  credential: () => this.env.CLAUDE_CODE_OAUTH_TOKEN,
+  // Order is priority, and this example is a rotating deployment: two entries.
+  // One is a complete deployment too — it simply gives up when its bucket empties
+  // instead of rotating. `.filter(Boolean)` is defence against a secret that is
+  // declared and unset, not a substitute for declaring the right ones.
+  credentials: () =>
+    [
+      this.env.CLAUDE_CODE_OAUTH_TOKEN_1,
+      this.env.CLAUDE_CODE_OAUTH_TOKEN_2
+    ].filter(Boolean),
+  // How a delegated session finds this workspace — see below.
+  workspaceName: () => this.#name(),
   // Omit for unrestricted, which is the default.
-  restrictToHosts: ["registry.npmjs.org"],
-  budget: { check: () => this.#budgetRemaining() }
+  restrictToHosts: ["registry.npmjs.org"]
 });
+
+/** The pool's `{ index → resetAt }` map, in this object's own storage. */
+readonly #credentials: CredentialStore = {
+  read: async () => (await this.ctx.storage.get(CREDS_KEY)) ?? [],
+  write: (states) => this.ctx.storage.put(CREDS_KEY, states)
+};
 
 readonly backend = new CloudflareContainerBackend({
   container: () => this,
   workspace: { binding: "CLAUDE_CODER_WORKSPACE", id: this.ctx.id.toString() },
-  egress: { mode: "http-gateway", gateway: this.#session.egress() }
+  egress: {
+    mode: "http-gateway",
+    gateway: this.#session.egress(this.#credentials)
+  }
 });
 ```
+
+`egress` takes the store as an **argument** rather than reading it off the
+config, and that is deliberate: the same config object is also held by the
+parent's plugin list and by the subagent facet, and neither of those has
+storage. Making it a field would force both of them to invent one.
 
 > **`mode: "http-gateway"` intercepts _all_ egress**, so a restriction you do
 > configure is load-bearing for `npm ci` too. A restricted gateway that forgets
@@ -190,9 +268,32 @@ flat concurrent fan-out and a workspace is one container, so two sessions
 sharing an id would spawn over each other, each drain would attach to whichever
 won, and `stop` would kill the wrong one.
 
+**`runtime` is where the workspace name comes from**, and it is the reason
+`workspaceName` is on the config:
+
+```ts
+const name = runtime?.[WORKSPACE_RUNTIME_KEY] as string | undefined;
+const stub = env.CLAUDE_CODER_WORKSPACE.get(idFromName(name));
+using ws = await getWorkspace(stub); // ws.runtime satisfies SessionRuntime
+```
+
+The plugin's `resolveRuntime` writes it on the **parent**, where the verified
+caller is known; core dispatches that hook to whichever plugin declared the
+subtask type, which is this one, so nothing else can supply it. A facet cannot
+work the name out for itself — `callerKey()` throws there by design — and it is
+deliberately not a subtask param, because those are rendered to the delegating
+model and a model-authored workspace name would let it name somebody else's.
+
+`getWorkspace` rebuilds a real `WorkspaceRuntimeExecHandle` on the client side
+from the stub's byte stream, so the drain works across a Durable Object boundary
+and the container→workspace filesystem sync still fires when the stream reaches
+`done`.
+
 ## Costs
 
-Two numbers drive every budget here.
+Two numbers drive the sizing here — not a spend cap, which this package
+deliberately does not have, but `timeoutMs`, `maxSubtasks` and how large a brief
+is worth writing.
 
 **The harness prefix is ~18.7-27k cached tokens per invocation.** A ten-call
 burst billed **twenty** raw input tokens against 187,130 cache reads. On anything
@@ -201,7 +302,9 @@ of work, and why warm containers and temporally clustered subtasks matter.
 
 **A 5-hour session is worth roughly $10 of Opus-equivalent.** Usage draws the
 interactive session bucket, so agent work competes with whoever is using Claude
-Code at their desk. Budget for about one substantial round per window.
+Code at their desk — expect about one substantial round per window, per
+credential in the pool. Rotation does not create allowance; it moves to the next
+bucket when one runs out, and then stops cleanly.
 
 ## What this deliberately does not do
 
@@ -214,7 +317,8 @@ Code at their desk. Budget for about one substantial round per window.
 - **No claude.ai login flow, ever.** Credentials are BYO-paste from
   `claude setup-token`. Anthropic does not allow third-party developers to offer
   claude.ai login or subscription rate limits for their products.
-- **No metering in the gateway.** The `result` event already carries it.
+- **No metering in the gateway.** Spend estimates were tried and removed; the
+  bucket says when it is empty, and rotation acts on that. See above.
 
 > A deployment-wide subscription token means one person's plan backs everyone
 > using that deployment. That is fine for a single-operator fork and it is the

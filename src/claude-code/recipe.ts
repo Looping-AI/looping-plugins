@@ -4,6 +4,21 @@ import type { ResolvedRecipe, SubtaskTypeSpec } from "@loopingai/core";
 export const CLAUDE_CODE_TYPE = "claude-code";
 
 /**
+ * The key this plugin writes the workspace name under, for the facet to read
+ * back off `SubtaskRuntime`.
+ *
+ * **Deliberately a second declaration of `/computer`'s `WORKSPACE_RUNTIME_KEY`,
+ * not an import of it.** Importing one string constant across the subpath
+ * boundary would merge two realms `verify:exports` keeps apart, and pull the
+ * whole computer plugin into the graph of every agent that installs this one.
+ *
+ * The two must stay equal, because a host that installs both on its subagent
+ * gets them working off one runtime value — so `index.spec.ts` imports both and
+ * asserts it, which is where a cross-realm import costs nothing.
+ */
+export const WORKSPACE_RUNTIME_KEY = "workspaceName";
+
+/**
  * The recipe a Claude Code session runs under — and most of it is inert, which
  * is worth saying plainly rather than letting a reader assume otherwise.
  *
@@ -23,8 +38,8 @@ export const CLAUDE_CODE_TYPE = "claude-code";
  * - `soul` — required and never defaulted, so it says what this recipe *is*.
  *   Nothing sends it to a model.
  * - `limits.maxTurns` — the budget core would meter if it were driving. It is
- *   not, so what actually bounds a session is `timeoutMs` in the container and
- *   the egress budget gate. Set to 1 to say so: one Looping "turn" is one whole
+ *   not, so what actually bounds a session is `timeoutMs`, enforced by the
+ *   container runtime. Set to 1 to say so: one Looping "turn" is one whole
  *   Claude Code session.
  */
 export const CLAUDE_CODE_RECIPE: ResolvedRecipe = {
