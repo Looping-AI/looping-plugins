@@ -115,7 +115,12 @@ export function claudeCodeSession(config: ClaudeCodeConfig) {
     egress: () =>
       claudeCodeEgress({
         credential: config.credential,
-        allowHosts: config.allowHosts ?? [],
+        // Forwarded only when set. Defaulting it to `[]` here would turn "the
+        // host said nothing" into "Anthropic only", which is the one reading
+        // the three-way semantics exist to keep distinct.
+        ...(config.restrictToHosts === undefined
+          ? {}
+          : { restrictToHosts: config.restrictToHosts }),
         ...(config.budget ? { budget: config.budget } : {}),
         label: CLAUDE_CODE_TYPE
       })

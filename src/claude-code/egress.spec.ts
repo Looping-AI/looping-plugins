@@ -29,12 +29,18 @@ function stubUpstream(status = 200) {
 const REAL = "sk-ant-oat01-REAL-CREDENTIAL";
 const PLACEHOLDER = "sk-ant-oat01-000000000000";
 
+/** A gateway restricted to one host — most tests below are about restriction. */
 const gateway = (over: Partial<Parameters<typeof claudeCodeEgress>[0]> = {}) =>
   claudeCodeEgress({
     credential: () => REAL,
-    allowHosts: ["registry.npmjs.org"],
+    restrictToHosts: ["registry.npmjs.org"],
     ...over
   });
+
+/** The shipped default: no restriction configured at all. */
+const openGateway = (
+  over: Partial<Parameters<typeof claudeCodeEgress>[0]> = {}
+) => claudeCodeEgress({ credential: () => REAL, ...over });
 
 /** How Claude Code 2.1.238 actually sends a model call — see the Phase 0 capture. */
 function modelCall(): Request {
@@ -113,7 +119,7 @@ describe("the credential swap", () => {
   });
 });
 
-describe("the host allowlist", () => {
+describe("the host restriction", () => {
   it("passes an allowed host through", async () => {
     const sent = stubUpstream();
     const response = await gateway().fetch(
@@ -126,10 +132,11 @@ describe("the host allowlist", () => {
 
   /**
    * The repo plugin keeps git on the Worker: clone, fetch and push all run as
-   * isomorphic-git inside the Durable Object, so the container has no business
-   * reaching a forge at all — and the forge token never enters it.
+   * isomorphic-git inside the Durable Object, so the container never needs forge
+   * access and the forge token never enters it. That is true whether or not a
+   * restriction is configured — this only checks that a configured one bites.
    */
-  it("refuses github.com, which the container has no reason to reach", async () => {
+  it("refuses github.com when a restriction is configured", async () => {
     const sent = stubUpstream();
     const response = await gateway().fetch(new Request("https://github.com/x"));
 
@@ -174,10 +181,99 @@ describe("the host allowlist", () => {
 
   it("allows api.anthropic.com without it being listed", async () => {
     const sent = stubUpstream();
-    await claudeCodeEgress({ credential: () => REAL, allowHosts: [] }).fetch(
-      modelCall()
-    );
+    await claudeCodeEgress({
+      credential: () => REAL,
+      restrictToHosts: []
+    }).fetch(modelCall());
     expect(sent).toHaveLength(1);
+  });
+
+  /**
+   * The three-way semantics, and the reason `[]` is not the same as omitting.
+   *
+   * A host computing this list — `repos.flatMap(hostsFor)` — that happens to
+   * produce `[]` means "nothing extra". Collapsing that into "everything" would
+   * hand the widest possible policy to an expression that returned nothing.
+   */
+  describe("the default is unrestricted", () => {
+    it("lets an arbitrary host through when nothing is configured", async () => {
+      const sent = stubUpstream();
+      const response = await openGateway().fetch(
+        new Request("https://objects.githubusercontent.com/some-binary.tgz")
+      );
+
+      expect(response.status).toBe(200);
+      expect(sent).toHaveLength(1);
+    });
+
+    it("still strips credential headers from that arbitrary host", async () => {
+      // The invariant that does *not* depend on the restriction, and the reason
+      // opening the default up costs nothing where the credential is concerned.
+      const sent = stubUpstream();
+      await openGateway().fetch(
+        new Request("https://anywhere.example", {
+          headers: { authorization: `Bearer ${PLACEHOLDER}` }
+        })
+      );
+
+      expect(sent[0]!.headers.get("authorization")).toBeNull();
+    });
+
+    it("still swaps the credential for Anthropic", async () => {
+      const sent = stubUpstream();
+      await openGateway().fetch(modelCall());
+      expect(sent[0]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
+    });
+
+    it("still refuses over budget", async () => {
+      const sent = stubUpstream();
+      const response = await openGateway({
+        budget: { check: async () => ({ ok: false as const, reason: "cap" }) }
+      }).fetch(modelCall());
+
+      expect(response.status).toBe(429);
+      expect(sent).toHaveLength(0);
+    });
+
+    it("treats an empty array as Anthropic only, not as unrestricted", async () => {
+      const sent = stubUpstream();
+      const response = await claudeCodeEgress({
+        credential: () => REAL,
+        restrictToHosts: []
+      }).fetch(new Request("https://registry.npmjs.org/left-pad"));
+
+      expect(response.status).toBe(403);
+      expect(sent).toHaveLength(0);
+    });
+  });
+
+  /**
+   * Under `mode: "direct"` the container's traffic leaves from the container's
+   * own network position; under `http-gateway` **the Worker makes the request**.
+   * So an unrestricted policy hands the container the Worker's reach, and the
+   * loopback the intercept itself rides on is never a legitimate destination.
+   */
+  describe("the gateway's own side of the boundary", () => {
+    it.each(["computer.internal", "localhost", "127.0.0.1", "0.0.0.0"])(
+      "refuses %s even with no restriction configured",
+      async (host) => {
+        const sent = stubUpstream();
+        const response = await openGateway().fetch(
+          new Request(`http://${host}/ws`)
+        );
+
+        expect(response.status).toBe(403);
+        expect(sent).toHaveLength(0);
+      }
+    );
+
+    it("says which rule refused it, so the log is actionable", async () => {
+      const response = await openGateway().fetch(
+        new Request("http://computer.internal/ws")
+      );
+      const body = (await response.json()) as { error: { message: string } };
+      expect(body.error.message).toMatch(/names the egress gateway itself/);
+    });
   });
 });
 

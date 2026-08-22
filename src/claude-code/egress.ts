@@ -15,8 +15,9 @@
  *    cloned repository can read every environment variable the container has and
  *    still learn nothing — which is the repository's standing rule ("hand it the
  *    action, not the credential") applied to a process nobody can constrain.
- * 2. **The allowlist is fail-closed and total.** Not a policy the container
- *    cooperates with; the only route out.
+ * 2. **Any restriction that is applied is total.** Not a policy the container
+ *    cooperates with; the only route out. Restriction is **off by default** —
+ *    see {@link EgressConfig.restrictToHosts} for why.
  * 3. **A budget can be refused.** `--max-turns` and the subagent caps are
  *    advisory and Claude Code's inner agent tree multiplies both. A gate here is
  *    a ceiling, because a model call that does not cross this function does not
@@ -29,6 +30,13 @@
  * `message_delta` frames to keep a running total would buy precision the gate
  * does not need — it only has to answer "is there budget left", and the answer
  * moves once per run. This reads the counter; the drain writes it.
+ *
+ * And it does not, by default, **bound exfiltration**. The container holds the
+ * checkout, and with no restriction configured it can send it anywhere. That is
+ * a deliberate default rather than an oversight — the reasoning is on
+ * {@link EgressConfig.restrictToHosts} — and what it means for a reader is that
+ * the containment here is "the container holds no credential", full stop. Do not
+ * read a host restriction that is switched off as a boundary that exists.
  */
 
 /** Anthropic's API host — the one destination that gets a credential. */
@@ -43,6 +51,29 @@ export const ANTHROPIC_HOST = "api.anthropic.com";
  */
 const MESSAGES_PATH = "/v1/messages";
 
+/**
+ * Hosts that name **this** side of the boundary, refused whatever the policy.
+ *
+ * The reason is a difference between the two egress modes that is easy to miss.
+ * Under `mode: "direct"` the container's traffic leaves from the container's own
+ * network position. Under `http-gateway` **the Worker makes the request**, so an
+ * unrestricted policy hands the container the Worker's reach rather than its
+ * own — and `computer.internal` is the loopback the intercept itself rides on.
+ * Bouncing a request back into it is never a legitimate fetch, so it is refused
+ * before any policy is consulted.
+ *
+ * A workspace that overrides `egressHost` on its `CloudflareContainerBackend`
+ * should add that name here; the default is what the backend uses when nothing
+ * says otherwise.
+ */
+const NEVER_ALLOWED = new Set([
+  "computer.internal",
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "0.0.0.0"
+]);
+
 /** Headers that carry a credential, stripped from anything not Anthropic. */
 const CREDENTIAL_HEADERS = [
   "authorization",
@@ -55,10 +86,10 @@ export interface EgressBudget {
    * Whether a model call may proceed. Consulted **before** forwarding, so a
    * refusal costs nothing upstream.
    *
-   * Failing here is treated as a refusal, not as permission — see the note on
-   * `#refuse` below. That is the opposite of the `shouldHandleTurn` gate in
-   * core, and deliberately so: a gate that fails open costs a wrong reply, this
-   * one would cost an unbounded spend against somebody's subscription.
+   * Failing here is treated as a refusal, not as permission, which is the
+   * opposite of core's `shouldHandleTurn` gate and deliberately so: a gate that
+   * fails open there costs a wrong reply, one that failed open here would cost
+   * an unbounded spend against somebody's subscription.
    */
   check: () => Promise<{ ok: true } | { ok: false; reason: string }>;
 }
@@ -73,15 +104,44 @@ export interface EgressConfig {
    */
   credential: () => string;
   /**
-   * Hosts the container may reach, matched **exactly** on hostname.
+   * Restrict the container to these hosts, plus `api.anthropic.com`.
    *
-   * No wildcards, and that is not an omission. `*.example.com` is how an
-   * allowlist quietly becomes an anylist — one CDN or object-storage domain with
-   * user-controlled subdomains and the boundary is gone. List the hosts.
+   * **Three-way, and each value means literally what it says:**
    *
-   * `api.anthropic.com` is always allowed and need not appear here.
+   * | Value | Effect |
+   * |---|---|
+   * | omitted | unrestricted — the default |
+   * | `["registry.npmjs.org"]` | that host, plus Anthropic |
+   * | `[]` | Anthropic only |
+   *
+   * An empty array is *not* the same as omitting the field, deliberately. A host
+   * computing this list — `repos.flatMap(hostsFor)`, say — that happens to
+   * produce `[]` means "nothing extra", and collapsing that into "everything"
+   * would hand the widest possible policy to an expression that returned
+   * nothing.
+   *
+   * ## Why unrestricted is the default
+   *
+   * A curated list is permanently wrong for a coding agent. `esbuild`, `swc` and
+   * `sharp` fetch prebuilt binaries from release CDNs; Playwright downloads
+   * browsers from a third host; corepack fetches package managers; and reading
+   * documentation is part of the job. The failure mode is the bad one — `npm ci`
+   * dying inside a `postinstall` with a network error nobody connects to a list
+   * three files away.
+   *
+   * Little is lost by defaulting open, because **the restriction was never what
+   * protected the credential**. The swap is keyed on the destination being
+   * Anthropic and credential headers are stripped from everything else, so both
+   * hold whatever this says. What an unrestricted policy does give up is a bound
+   * on *exfiltration*: the container holds the checkout and can send it
+   * anywhere. That matches `/computer`, whose egress has always been
+   * unrestricted, for the same reason.
+   *
+   * Matched **exactly** on hostname when set. No wildcards, and that is not an
+   * omission: `*.example.com` is how a restriction quietly becomes no
+   * restriction, the first time a host serves user-controlled subdomains.
    */
-  allowHosts: readonly string[];
+  restrictToHosts?: readonly string[];
   budget?: EgressBudget;
   /** Named in log lines so one Worker's several gateways stay tellable apart. */
   label?: string;
@@ -108,7 +168,12 @@ function apiError(type: string, message: string, status: number): Response {
  * `undefined is not a function` several frames away.
  */
 export function claudeCodeEgress(config: EgressConfig): Fetcher {
-  const allowed = new Set([ANTHROPIC_HOST, ...config.allowHosts]);
+  // Resolved once. `undefined` is unrestricted; a list — including an empty one
+  // — is a restriction that always admits Anthropic.
+  const allowed =
+    config.restrictToHosts === undefined
+      ? undefined
+      : new Set([ANTHROPIC_HOST, ...config.restrictToHosts]);
   const tag = config.label
     ? `claude-code-egress:${config.label}`
     : "claude-code-egress";
@@ -121,20 +186,31 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
       return apiError("invalid_request_error", "unparseable egress URL", 400);
     }
 
-    if (!allowed.has(url.hostname)) {
+    // Before any policy: this side of the boundary is never a destination.
+    if (NEVER_ALLOWED.has(url.hostname)) {
+      console.warn(`[${tag}] refused a request aimed back at the gateway`, {
+        host: url.hostname,
+        method: request.method
+      });
+      return apiError(
+        "permission_error",
+        `${url.hostname} names the egress gateway itself and is never ` +
+          "reachable from inside the workspace",
+        403
+      );
+    }
+
+    if (allowed && !allowed.has(url.hostname)) {
       // Logged, because this is the line that makes a failing install
       // intelligible. A container that cannot reach its registry produces a
       // hundred lines of npm output and no mention of egress.
-      console.warn(
-        `[${tag}] refused a request to a host not on the allowlist`,
-        {
-          host: url.hostname,
-          method: request.method
-        }
-      );
+      console.warn(`[${tag}] refused a request outside the host restriction`, {
+        host: url.hostname,
+        method: request.method
+      });
       return apiError(
         "permission_error",
-        `${url.hostname} is not on this workspace's egress allowlist`,
+        `${url.hostname} is outside this workspace's egress host restriction`,
         403
       );
     }

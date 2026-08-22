@@ -47,11 +47,47 @@ outbound request and hands it to `claudeCodeEgress` on the **Worker** side, whic
 
 1. **swaps** the placeholder for the real credential, for `api.anthropic.com` only;
 2. **strips** every credential header from anything else;
-3. enforces a **fail-closed host allowlist** — exact hostname match, no wildcards;
+3. optionally **restricts the container to named hosts** — exact hostname match,
+   no wildcards, and **off by default** (see below);
 4. can **refuse** a model call that is over budget, with a `429` the client renders
    as `system/api_retry`.
 
 A `postinstall` that dumps the environment learns the placeholder and nothing else.
+
+### Egress is unrestricted by default
+
+`restrictToHosts` is three-way, and each value means literally what it says:
+
+| Value                    | Effect                         |
+| ------------------------ | ------------------------------ |
+| omitted                  | unrestricted — **the default** |
+| `["registry.npmjs.org"]` | that host, plus Anthropic      |
+| `[]`                     | Anthropic only                 |
+
+An empty array is deliberately _not_ the same as omitting the field: a host
+computing the list from config that happens to produce `[]` means "nothing
+extra", and reading that as "everything" would hand the widest policy to an
+expression that returned nothing.
+
+Open is the default because a curated list is permanently wrong for a coding
+agent — `esbuild`, `swc` and `sharp` fetch prebuilt binaries from release CDNs,
+Playwright downloads browsers from a third host, corepack fetches package
+managers, and reading documentation is part of the job. It also matches
+[`/computer`](../computer/), whose egress has always been unrestricted.
+
+**What that gives up is a bound on exfiltration**, and it is worth being plain
+about: the container holds the checkout and, unrestricted, can send it anywhere.
+It does not weaken the credential — the swap is keyed on the destination and
+credential headers are stripped from everything else, whatever the policy says.
+So the containment here is _"the container holds no credential"_, and nothing
+more. Set `restrictToHosts` if you want the other property; do not assume it.
+
+One rule applies regardless of policy: hosts naming the gateway's **own** side
+of the boundary — `computer.internal` and loopback — are always refused. Under
+`mode: "direct"` the container's traffic leaves from the container's network
+position; under `http-gateway` **the Worker makes the request**, so an
+unrestricted policy hands the container the Worker's reach, and bouncing a
+request back into the loopback the intercept rides on is never legitimate.
 
 Nothing sets `ANTHROPIC_BASE_URL`. The intercept is transparent, so the client
 talks to the real hostname — which means nothing in the container is _told_ to
@@ -92,7 +128,8 @@ The workspace Durable Object installs the gateway as its egress policy:
 ```ts
 readonly #session = claudeCodeSession({
   credential: () => this.env.CLAUDE_CODE_OAUTH_TOKEN,
-  allowHosts: ["registry.npmjs.org"],
+  // Omit for unrestricted, which is the default.
+  restrictToHosts: ["registry.npmjs.org"],
   budget: { check: () => this.#budgetRemaining() }
 });
 
@@ -103,9 +140,10 @@ readonly backend = new CloudflareContainerBackend({
 });
 ```
 
-> **`mode: "http-gateway"` intercepts _all_ egress**, so the allowlist is
-> load-bearing for `npm ci` too. A gateway that forgets the registry does not
-> degrade the agent — it stops the container installing anything.
+> **`mode: "http-gateway"` intercepts _all_ egress**, so a restriction you do
+> configure is load-bearing for `npm ci` too. A restricted gateway that forgets
+> the registry does not degrade the agent — it stops the container installing
+> anything. This is the main reason the default is open.
 
 And the subagent drives the session:
 
@@ -143,7 +181,7 @@ Code at their desk. Budget for about one substantial round per window.
   the agent good at that repository. The container already runs the repo's
   `postinstall` and its test suite, so suppressing `.claude/` closes one door
   while the others stand open by design — it costs the agent its context and buys
-  nothing. Containment is the credential swap and the allowlist.
+  nothing. Containment is the credential swap.
 - **No claude.ai login flow, ever.** Credentials are BYO-paste from
   `claude setup-token`. Anthropic does not allow third-party developers to offer
   claude.ai login or subscription rate limits for their products.

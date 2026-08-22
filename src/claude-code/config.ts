@@ -40,13 +40,18 @@ export interface ClaudeCodeConfig {
   maxConcurrentSubagents?: number;
 
   /**
-   * Hosts the container may reach beyond `api.anthropic.com`.
+   * Restrict the container's egress to these hosts, plus `api.anthropic.com`.
    *
-   * In practice: the package registry, and nothing else. The container needs no
-   * forge access at all — `/repo` runs clone, fetch and push as isomorphic-git
-   * inside the workspace object, so the forge token stays on the Worker side.
+   * **Omit it and egress is unrestricted, which is the default.** An empty array
+   * is not the same thing — it means Anthropic only. See
+   * {@link file://./egress.ts EgressConfig.restrictToHosts} for the full table
+   * and for why open is the default.
+   *
+   * Whatever this says, the container never needs forge access: `/repo` runs
+   * clone, fetch and push as isomorphic-git inside the workspace object, so the
+   * forge token stays on the Worker side.
    */
-  allowHosts?: readonly string[];
+  restrictToHosts?: readonly string[];
 
   /** The spend gate the egress gateway consults before every model call. */
   budget?: EgressBudget;
