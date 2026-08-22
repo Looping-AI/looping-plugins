@@ -1,6 +1,6 @@
 {
   "name": "@loopingai/plugins",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Optional, composable capabilities for Looping agents: ARC-AGI-3, browser rendering, a Linux container, git and pull requests, workspace, episodic recall, and pre-turn triage. One subpath per plugin, so a bundle grows only with what it imports.",
   "keywords": [
     "ai-agents",
@@ -55,6 +55,10 @@
     "./repo": {
       "types": "./dist/repo/index.d.ts",
       "import": "./dist/repo/index.js"
+    },
+    "./claude-code": {
+      "types": "./dist/claude-code/index.d.ts",
+      "import": "./dist/claude-code/index.js"
     },
     "./computer": {
       "types": "./dist/computer/index.d.ts",

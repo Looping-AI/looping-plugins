@@ -1,0 +1,357 @@
+import type { ProgressEvent } from "@loopingai/core/subtasks";
+
+/**
+ * `claude -p --output-format stream-json` on the wire, turned into things this
+ * package can act on.
+ *
+ * ## Pure, and stateless on purpose
+ *
+ * Nothing here remembers anything between calls. That is not minimalism — it is
+ * what makes the drain re-entrant. A Claude Code run is drained in bounded
+ * windows across several durable chunks, and a chunk that starts on a fresh
+ * isolate re-attaches with `getExec(id, { resume: "tail" })`, which replays. A
+ * parser holding a cursor would hand back a different answer depending on which
+ * isolate asked, and the difference would show up as duplicated or missing
+ * progress in the parent's context rather than as an error.
+ *
+ * So the caller owns the position and passes it in. See {@link toProgress}.
+ *
+ * ## A malformed line is skipped, never thrown
+ *
+ * The stream is a vendor's, it is version-coupled (see the pinned image), and it
+ * is the *only* record of what a run did. A parser that throws on one
+ * unrecognised line discards the whole run's output to report a schema change,
+ * which is the worst possible trade. Unparseable lines are counted instead —
+ * {@link ParsedStream.skipped} — so a systematic change is visible in the logs
+ * rather than silent, and a single corrupt line costs one line.
+ */
+
+/** Content blocks Claude Code emits inside an `assistant` message. */
+interface AssistantBlock {
+  type: string;
+  text?: string;
+  thinking?: string;
+  name?: string;
+  input?: unknown;
+}
+
+/** What a `result` line carries, of the fields anything here reads. */
+export interface ClaudeCodeResult {
+  /** `success`, or one of the `error_*` subtypes. */
+  subtype: string;
+  isError: boolean;
+  /** The run's final answer. Empty is legal and is handled by the caller. */
+  text: string;
+  sessionId?: string;
+  numTurns?: number;
+  durationMs?: number;
+  /** `null` on a clean run; an HTTP status when the API refused. */
+  apiErrorStatus: number | null;
+  costUsd: number;
+  usage: ClaudeCodeUsage;
+  /** How many inner subagents the run spawned — advisory, for the logs. */
+  subagentsSpawned?: number;
+  permissionDenials: number;
+}
+
+/**
+ * Token counts, flattened.
+ *
+ * Cache reads and writes are separated because they are priced differently and
+ * because they are the *bulk* of what a `claude -p` invocation bills: a
+ * ten-call burst measured 20 raw input tokens against 187,130 cache reads. A
+ * usage summary that folds them into one "input" number describes none of the
+ * cost.
+ */
+export interface ClaudeCodeUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export type ClaudeCodeEvent =
+  | { kind: "init"; sessionId: string; model?: string }
+  | { kind: "assistant"; text: string; tools: string[] }
+  | { kind: "retry"; detail: string }
+  | { kind: "result"; result: ClaudeCodeResult };
+
+export interface ParsedStream {
+  events: ClaudeCodeEvent[];
+  /**
+   * Bytes after the last newline — an incomplete line the next read completes.
+   *
+   * A bounded-window drain reads whatever has arrived, which routinely cuts a
+   * line in half. Parsing that half throws away a whole event; carrying it costs
+   * one string.
+   */
+  carry: string;
+  /** Lines that were not JSON, or were JSON of no recognised shape. */
+  skipped: number;
+  /** Lines dropped for carrying `parent_tool_use_id`. See {@link parseStream}. */
+  nested: number;
+}
+
+const EMPTY_USAGE: ClaudeCodeUsage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0
+};
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function num(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function str(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function readUsage(raw: unknown): ClaudeCodeUsage {
+  const usage = asRecord(raw);
+  if (!usage) return { ...EMPTY_USAGE };
+  return {
+    input: num(usage.input_tokens),
+    output: num(usage.output_tokens),
+    cacheRead: num(usage.cache_read_input_tokens),
+    cacheWrite: num(usage.cache_creation_input_tokens)
+  };
+}
+
+/**
+ * Flatten an `assistant` message into a line of prose and the tools it called.
+ *
+ * `thinking` blocks are dropped. They are the model's private reasoning, they
+ * are the largest thing in the stream by a wide margin, and the parent agent is
+ * being shown progress rather than asked to review the subagent's deliberation.
+ */
+function readAssistant(message: Record<string, unknown>): {
+  text: string;
+  tools: string[];
+} {
+  const content = Array.isArray(message.content)
+    ? (message.content as AssistantBlock[])
+    : [];
+  const text: string[] = [];
+  const tools: string[] = [];
+
+  for (const block of content) {
+    if (!asRecord(block)) continue;
+    const blockText = str(block.text);
+    if (block.type === "text" && blockText) text.push(blockText.trim());
+    const toolName = str(block.name);
+    if (block.type === "tool_use" && toolName) tools.push(toolName);
+  }
+
+  return { text: text.join(" ").replace(/\s+/g, " ").trim(), tools };
+}
+
+/**
+ * Parse whatever has arrived so far into complete events plus a carry.
+ *
+ * **Messages carrying `parent_tool_use_id` are dropped**, and this is the single
+ * most important line in the module. Claude Code runs its *own* subagents, and
+ * every message one of them produces arrives on this same stream tagged with the
+ * parent tool-use that spawned it. Forwarding those fills the Looping parent's
+ * context with the inner tree's chatter — which it can neither act on nor
+ * cancel, because those subagents are invisible to Looping's scheduler. The tag
+ * is the only reliable way to tell the two apart, so it is the filter.
+ *
+ * `result` and `init` are never nested and are read unconditionally.
+ */
+export function parseStream(buffer: string): ParsedStream {
+  const events: ClaudeCodeEvent[] = [];
+  let skipped = 0;
+  let nested = 0;
+
+  const newline = buffer.lastIndexOf("\n");
+  const carry = newline === -1 ? buffer : buffer.slice(newline + 1);
+  const complete = newline === -1 ? "" : buffer.slice(0, newline);
+
+  for (const line of complete.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      skipped++;
+      continue;
+    }
+
+    const event = asRecord(parsed);
+    if (!event) {
+      skipped++;
+      continue;
+    }
+
+    // The inner-subagent filter. Checked before the type switch so it applies to
+    // every message shape, including ones added by a later Claude Code.
+    if (str(event.parent_tool_use_id)) {
+      nested++;
+      continue;
+    }
+
+    switch (event.type) {
+      case "system": {
+        if (event.subtype === "init") {
+          const sessionId = str(event.session_id);
+          if (!sessionId) {
+            skipped++;
+            break;
+          }
+          const model = str(event.model);
+          events.push({
+            kind: "init",
+            sessionId,
+            ...(model ? { model } : {})
+          });
+          break;
+        }
+        if (event.subtype === "api_retry") {
+          events.push({
+            kind: "retry",
+            detail:
+              str(event.error) ??
+              str(event.message) ??
+              `attempt ${num(event.attempt) || "?"}`
+          });
+          break;
+        }
+        // Other `system` subtypes are informational and grow between releases.
+        // Not "skipped": nothing is wrong, there is simply nothing to say.
+        break;
+      }
+
+      case "assistant": {
+        const message = asRecord(event.message);
+        if (!message) {
+          skipped++;
+          break;
+        }
+        const { text, tools } = readAssistant(message);
+        if (!text && tools.length === 0) break;
+        events.push({ kind: "assistant", text, tools });
+        break;
+      }
+
+      // `user` messages on this stream are tool *results* being fed back to the
+      // model, not anything a human said. They are large, they are already
+      // summarised by the assistant turn that follows, and the un-nested ones
+      // belong to the outer run's own tools — so they are deliberately not
+      // surfaced as progress.
+      case "user":
+        break;
+
+      case "result": {
+        events.push({ kind: "result", result: readResult(event) });
+        break;
+      }
+
+      default:
+        skipped++;
+    }
+  }
+
+  return { events, carry, skipped, nested };
+}
+
+/** Read a `result` line. Total by construction — a missing field reads as zero. */
+function readResult(event: Record<string, unknown>): ClaudeCodeResult {
+  const apiErrorStatus = event.api_error_status;
+  const stats = asRecord(event.subagent_stats);
+  const denials = Array.isArray(event.permission_denials)
+    ? event.permission_denials.length
+    : 0;
+  const sessionId = str(event.session_id);
+  const spawned = stats ? num(stats.spawned) : undefined;
+
+  return {
+    subtype: str(event.subtype) ?? "unknown",
+    isError: event.is_error === true,
+    text: typeof event.result === "string" ? event.result : "",
+    ...(sessionId ? { sessionId } : {}),
+    numTurns: num(event.num_turns),
+    durationMs: num(event.duration_ms),
+    apiErrorStatus: typeof apiErrorStatus === "number" ? apiErrorStatus : null,
+    costUsd: num(event.total_cost_usd),
+    usage: readUsage(event.usage),
+    ...(spawned === undefined ? {} : { subagentsSpawned: spawned }),
+    permissionDenials: denials
+  };
+}
+
+/** How much of one progress note the parent is shown. */
+const PROGRESS_MAX_CHARS = 240;
+
+/**
+ * Turn events into progress notes the parent can post.
+ *
+ * **`from` is the number of notes already emitted for this run, and the key is
+ * derived from it.** Not from the note's content, not from a clock, and not from
+ * the Claude Code `uuid` — from position alone.
+ *
+ * The reason is replay. A chunk that dies mid-drain is retried by the Workflow,
+ * the re-attach replays the tail, and the same assistant turn is parsed twice. A
+ * content-derived key would make two identical notes collide *by luck* (and two
+ * genuinely repeated notes — "Running tests" twice — collide wrongly). A
+ * clock-derived key would never collide, so every replay would re-post
+ * everything. Position is the only choice that dedupes exactly the events that
+ * are the same event.
+ */
+export function toProgress(
+  events: readonly ClaudeCodeEvent[],
+  from: number
+): ProgressEvent[] {
+  const out: ProgressEvent[] = [];
+  let n = from;
+
+  for (const event of events) {
+    const text = describe(event);
+    if (!text) continue;
+    out.push({ key: `claude:${n}`, text });
+    n++;
+  }
+
+  return out;
+}
+
+/** One line of progress, or nothing when the event is not worth a note. */
+function describe(event: ClaudeCodeEvent): string | undefined {
+  switch (event.kind) {
+    case "assistant": {
+      const tools =
+        event.tools.length > 0 ? `[${unique(event.tools).join(", ")}] ` : "";
+      const body = event.text ? clip(event.text) : "";
+      const line = `${tools}${body}`.trim();
+      return line || undefined;
+    }
+    case "retry":
+      // Surfaced deliberately. This is what a budget refusal from the egress
+      // gateway looks like from inside the container, and a run that ends
+      // shortly afterwards is explained by it.
+      return `retrying the model call: ${clip(event.detail)}`;
+    // `init` names a session id nobody outside this package can use, and
+    // `result` is the terminal outcome the caller reports itself.
+    case "init":
+    case "result":
+      return undefined;
+  }
+}
+
+function unique(values: readonly string[]): string[] {
+  return [...new Set(values)];
+}
+
+function clip(text: string): string {
+  return text.length <= PROGRESS_MAX_CHARS
+    ? text
+    : `${text.slice(0, PROGRESS_MAX_CHARS - 1)}…`;
+}
