@@ -66,6 +66,29 @@ const MESSAGES_PATH = "/v1/messages";
  * should add that name here; the default is what the backend uses when nothing
  * says otherwise.
  */
+/**
+ * The hostname a rule should be matched against, not the one the URL reports.
+ *
+ * `URL.hostname` is not canonical for this purpose in two ways that both defeat
+ * an exact-match set:
+ *
+ * - **IPv6 keeps its brackets.** `new URL("http://[::1]/").hostname` is
+ *   `"[::1]"`, so a set holding `"::1"` never matches.
+ * - **A trailing dot survives.** `computer.internal.` and `api.anthropic.com.`
+ *   are the same destinations as their undotted forms and compare unequal.
+ *
+ * The second one cuts both ways and is the more dangerous: an undotted
+ * comparison against {@link ANTHROPIC_HOST} would send `api.anthropic.com.` down
+ * the *non-Anthropic* branch — which is fail-safe for the credential, but skips
+ * the budget gate entirely.
+ */
+function canonicalHost(url: URL): string {
+  let host = url.hostname.toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  if (host.endsWith(".")) host = host.slice(0, -1);
+  return host;
+}
+
 const NEVER_ALLOWED = new Set([
   "computer.internal",
   "localhost",
@@ -186,10 +209,12 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
       return apiError("invalid_request_error", "unparseable egress URL", 400);
     }
 
+    const host = canonicalHost(url);
+
     // Before any policy: this side of the boundary is never a destination.
-    if (NEVER_ALLOWED.has(url.hostname)) {
+    if (NEVER_ALLOWED.has(host)) {
       console.warn(`[${tag}] refused a request aimed back at the gateway`, {
-        host: url.hostname,
+        host,
         method: request.method
       });
       return apiError(
@@ -200,24 +225,24 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
       );
     }
 
-    if (allowed && !allowed.has(url.hostname)) {
+    if (allowed && !allowed.has(host)) {
       // Logged, because this is the line that makes a failing install
       // intelligible. A container that cannot reach its registry produces a
       // hundred lines of npm output and no mention of egress.
       console.warn(`[${tag}] refused a request outside the host restriction`, {
-        host: url.hostname,
+        host,
         method: request.method
       });
       return apiError(
         "permission_error",
-        `${url.hostname} is outside this workspace's egress host restriction`,
+        `${host} is outside this workspace's egress host restriction`,
         403
       );
     }
 
     const headers = new Headers(request.headers);
 
-    if (url.hostname !== ANTHROPIC_HOST) {
+    if (host !== ANTHROPIC_HOST) {
       // The placeholder must not leave the boundary either. It is worthless to
       // whoever receives it, but a credential-shaped header sent to a third
       // party is a credential leak in every log it lands in.
@@ -225,7 +250,29 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
       return await fetch(new Request(url, new Request(request, { headers })));
     }
 
-    // Anthropic, and only Anthropic, from here down.
+    /**
+     * Anthropic over TLS, and only that, from here down.
+     *
+     * Checked **before** the credential is read, let alone attached. Nothing
+     * stops a process in the container asking for `http://api.anthropic.com/…`,
+     * and this function would otherwise fetch it — putting the real
+     * subscription token on the wire in plaintext, from the Worker, at the
+     * request of code the workspace does not trust. The host matched; the
+     * scheme is the rest of the question.
+     */
+    if (url.protocol !== "https:") {
+      console.warn(`[${tag}] refused a plaintext request to Anthropic`, {
+        protocol: url.protocol,
+        method: request.method
+      });
+      return apiError(
+        "permission_error",
+        `${ANTHROPIC_HOST} is reachable over https only; a credential is never ` +
+          "attached to a plaintext request",
+        403
+      );
+    }
+
     if (config.budget && url.pathname.startsWith(MESSAGES_PATH)) {
       const verdict = await config.budget
         .check()

@@ -109,19 +109,43 @@ counter.
   "containers": [
     {
       "class_name": "ClaudeCoderWorkspaceDO",
-      "image": "./Dockerfile.claude-code",
+      "image": "./Dockerfile",
+      // A Docker build arg. One Dockerfile serves both the plain workspace and
+      // this one; only the entry naming a version gets the CLI.
+      "image_vars": { "CLAUDE_CODE_VERSION": "2.1.238" },
       "instance_type": "standard-2",
       "max_instances": 5
     }
+  ],
+  // The container is bound to a Durable Object, and the class has to exist as
+  // well as be named. Both of these are required: without the binding the
+  // backend has nothing to dial, and without the migration the class is never
+  // created — which surfaces at runtime, not at deploy time.
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "ClaudeCoderWorkspaceDO",
+        "name": "CLAUDE_CODER_WORKSPACE"
+      }
+    ]
+  },
+  // `new_sqlite_classes`, not `new_classes`: the workspace filesystem *is* the
+  // object's SQLite. And a **new tag** — a class appended to a tag you have
+  // already deployed is silently never created.
+  "migrations": [
+    { "tag": "v5", "new_sqlite_classes": ["ClaudeCoderWorkspaceDO"] }
   ],
   "secrets": { "required": ["CLAUDE_CODE_OAUTH_TOKEN"] }
 }
 ```
 
-The image is the workspace image plus a **pinned** `npm i -g
-@anthropic-ai/claude-code@X.Y.Z`. Pin it deliberately: the wire shape this
-package's gateway and parser are both written against is version-coupled, so
-re-run the smoke test on every bump.
+The class must also be exported from the Worker entry point, along with
+`WorkspaceProxy` from `@cloudflare/computer` — the container dials back through
+it, and dropping that export breaks the container with no compile error.
+
+Pin the CLI version deliberately: the wire shape this package's gateway and
+parser are both written against is version-coupled, so re-run the smoke test on
+every bump.
 
 The workspace Durable Object installs the gateway as its egress policy:
 
@@ -151,7 +175,7 @@ And the subagent drives the session:
 protected override async executeChunk(...): Promise<RecipeChunkResult> {
   const outcome = cursor
     ? await session.resume(runtime, cursor)
-    : await session.start(runtime, prompt, dir);
+    : await session.start(runtime, subtaskId, prompt, dir);
 
   if (!outcome.done) return { done: false, progress: outcome.progress };
   return { done: true, progress: outcome.progress, result: report(outcome) };
@@ -160,6 +184,11 @@ protected override async executeChunk(...): Promise<RecipeChunkResult> {
 
 `DrainCursor` is the only state, and the caller persists it. A fresh isolate
 resumes from the exact event sequence the last one consumed.
+
+**`subtaskId` namespaces the exec id, and it is not optional.** Subtasks are a
+flat concurrent fan-out and a workspace is one container, so two sessions
+sharing an id would spawn over each other, each drain would attach to whichever
+won, and `stop` would kill the wrong one.
 
 ## Costs
 

@@ -4,9 +4,10 @@ import { claudeCodeEgress } from "./egress.js";
 import {
   attachRun,
   drainRun,
+  execIdFor,
+  freshCursor,
   killRun,
   startRun,
-  FRESH_CURSOR,
   type DrainCursor,
   type DrainOutcome,
   type SessionRuntime
@@ -42,14 +43,23 @@ import { CLAUDE_CODE_SPEC, CLAUDE_CODE_TYPE } from "./recipe.js";
  *
  * The session is launched with a placeholder. Every request out of the container
  * is intercepted by `computerd` and handed to {@link claudeCodeEgress} on the
- * Worker side, which swaps in the real credential, enforces a fail-closed host
- * allowlist, and can refuse a call that is over budget.
+ * Worker side, which swaps in the real credential, strips credential headers
+ * from every other destination, and can refuse a call that is over budget.
  *
- * That last one matters more than it looks. `--max-turns` and the subagent caps
- * are advisory and Claude Code's inner agent tree multiplies both; the gateway
- * is a ceiling, because a model call that does not cross it does not happen. A
- * 5-hour subscription session is worth roughly $10 of Opus-equivalent, and it is
- * shared with whoever is using Claude Code interactively.
+ * It can **also** restrict which hosts the container may reach, but that is
+ * `restrictToHosts` and it is **off unless a deployment sets it** — so do not
+ * read it as a boundary that exists by default. The containment that always
+ * holds is the credential swap.
+ *
+ * The budget gate is worth being precise about, because it is easy to overclaim
+ * and this docblock did. Every model call crosses the gateway, so a refusal is
+ * absolute — but the counter it reads only moves when a run *ends*, since usage
+ * is learned from the terminal `result` event. So it is a hard gate on **starting
+ * work**, not a hard cap on spend: an in-flight run sees one balance throughout
+ * and can overshoot by its own cost before anything notices. What it bounds is
+ * the overshoot to a single run. A 5-hour subscription session is worth roughly
+ * $10 of Opus-equivalent and is shared with whoever is using Claude Code
+ * interactively, so size the reserve for one run's worth of headroom.
  *
  * ## Requires
  *
@@ -84,17 +94,27 @@ export function claudeCodeSession(config: ClaudeCodeConfig) {
   });
 
   return {
-    /** Spawn a session and drain its first window. */
+    /**
+     * Spawn a session for one subtask and drain its first window.
+     *
+     * `subtaskId` namespaces the exec id. Subtasks are a concurrent fan-out, so
+     * two sessions in one workspace under one id would spawn over each other —
+     * see {@link execIdFor}.
+     */
     async start(
       runtime: SessionRuntime,
+      subtaskId: string | number,
       prompt: string,
       dir: string
     ): Promise<DrainOutcome> {
-      const handle = await startRun(runtime, {
+      const execId = execIdFor(subtaskId);
+      // `using`, so the attachment is released even when the drain throws.
+      using handle = await startRun(runtime, {
         ...launch(prompt, dir),
+        execId,
         timeoutMs
       });
-      return await drainRun(handle, FRESH_CURSOR, { windowMs });
+      return await drainRun(handle, freshCursor(execId), { windowMs });
     },
 
     /** Re-attach to a running session and drain one more window. */
@@ -102,13 +122,16 @@ export function claudeCodeSession(config: ClaudeCodeConfig) {
       runtime: SessionRuntime,
       cursor: DrainCursor
     ): Promise<DrainOutcome> {
-      const handle = await attachRun(runtime, cursor);
+      using handle = await attachRun(runtime, cursor);
       return await drainRun(handle, cursor, { windowMs });
     },
 
     /** Stop a session — `SIGTERM`, so its own process tree goes with it. */
-    async stop(runtime: SessionRuntime): Promise<void> {
-      await killRun(runtime);
+    async stop(
+      runtime: SessionRuntime,
+      subtaskId: string | number
+    ): Promise<void> {
+      await killRun(runtime, execIdFor(subtaskId));
     },
 
     /** The `Fetcher` the workspace object installs as its egress policy. */
@@ -161,9 +184,10 @@ export { ANTHROPIC_HOST, claudeCodeEgress } from "./egress.js";
 export type { EgressBudget, EgressConfig } from "./egress.js";
 export {
   buildLaunch,
-  CLAUDE_EXEC_ID,
+  CLAUDE_EXEC_PREFIX,
   CREDENTIAL_PLACEHOLDER,
-  FRESH_CURSOR
+  execIdFor,
+  freshCursor
 } from "./run.js";
 export type {
   DrainCursor,

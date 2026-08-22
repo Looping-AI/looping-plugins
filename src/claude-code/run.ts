@@ -25,21 +25,24 @@ import {
  *
  * ## Detached, then re-attached — never owned by a request
  *
- * The run is spawned under a fixed exec id and left running. Each chunk
- * re-attaches, drains for a bounded window, and returns. That shape is not a
- * preference: a drain owned by an RPC that returns in milliseconds gets disposed
- * mid-command, which is exactly how the dependency install used to die halfway
- * through `npm ci`.
+ * The run is spawned under an exec id and left running. Each chunk re-attaches,
+ * drains for a bounded window, and returns. That shape is not a preference: a
+ * drain owned by an RPC that returns in milliseconds gets disposed mid-command,
+ * which is exactly how the dependency install used to die halfway through
+ * `npm ci`.
  *
- * ## The cursor, and why it is a `seq` rather than a tail
+ * ## The cursor
  *
  * `getExec(id, { resume })` accepts `"tail"`, `"full"` **or an event sequence
  * number**, and the number is what this uses. Each chunk records the last `seq`
  * it consumed, so the next one resumes exactly there instead of replaying an
- * arbitrary tail — no duplicate parsing on the happy path at all. Replay still
- * happens when a chunk dies before it can checkpoint, which is why the progress
- * keys stay positional (see `toProgress`); the cursor makes replay rare, the
- * keys make it harmless.
+ * arbitrary tail. Replay still happens when a chunk dies before it can
+ * checkpoint, which is why the progress keys stay positional (see
+ * `toProgress`); the cursor makes replay rare, the keys make it harmless.
+ *
+ * The cursor also carries the **exec id** and the **parsed result**, and both
+ * are there for reasons that only show up under concurrency or retry — see
+ * {@link DrainCursor}.
  */
 
 /**
@@ -63,8 +66,28 @@ export interface SessionRuntime {
   killExec(id: string, options?: WorkspaceRuntimeKillOptions): Promise<void>;
 }
 
-/** The exec id a run occupies. Fixed, because the point is to find it again. */
-export const CLAUDE_EXEC_ID = "claude-code-run";
+/** Namespace for every session exec id in a workspace. */
+export const CLAUDE_EXEC_PREFIX = "claude-code-run";
+
+/**
+ * The exec id one session occupies.
+ *
+ * **Per subtask, not fixed**, and the difference is load-bearing. A workspace is
+ * one Durable Object and one container, but subtasks are a flat *concurrent*
+ * fan-out — two `claude-code` subtasks for the same caller and repository run at
+ * the same time, against the same workspace. Under a single shared id they
+ * would spawn over one another, each drain would attach to whichever exec won,
+ * and `killRun` would stop somebody else's session. That is the displacement bug
+ * the coder's install guard exists to prevent, in a new place; here the answer
+ * is simply not to share the id.
+ *
+ * Fixed *per subtask*, though, because the point is still to find it again: an
+ * isolate that dies mid-drain leaves the session running in the container, and
+ * `getExec` is how the next chunk re-attaches instead of starting a second one.
+ */
+export function execIdFor(subtaskId: string | number): string {
+  return `${CLAUDE_EXEC_PREFIX}:${subtaskId}`;
+}
 
 /**
  * What the container is given instead of a credential.
@@ -79,6 +102,17 @@ export const CLAUDE_EXEC_ID = "claude-code-run";
  * invites a future reader to "fix" it by putting the real one there.
  */
 export const CREDENTIAL_PLACEHOLDER = "sk-ant-oat01-" + "0".repeat(24);
+
+/**
+ * The environment key a host may not set.
+ *
+ * `LaunchOptions.env` is merged last so a deployment can add what a repository
+ * needs, and that merge is exactly how the placeholder could be replaced by a
+ * real credential — silently, and in every container from then on. The whole
+ * design rests on the container holding nothing worth stealing, so this one key
+ * is refused rather than overridden.
+ */
+const RESERVED_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN";
 
 export interface LaunchOptions {
   /** The subtask's prompt — the whole of what this session is asked to do. */
@@ -98,7 +132,12 @@ export interface LaunchOptions {
    */
   maxSubagentDepth?: number;
   maxConcurrentSubagents?: number;
-  /** Merged last, so a host can add what a repository needs. Never secrets. */
+  /**
+   * Merged last, so a host can add what a repository needs.
+   *
+   * **Never secrets**, and {@link RESERVED_ENV_KEY} is refused outright rather
+   * than trusted to the reader of that sentence.
+   */
   env?: Record<string, string>;
 }
 
@@ -129,6 +168,24 @@ export interface Launch {
  * proxy, which means nothing in the container can be told *not* to.
  */
 export function buildLaunch(options: LaunchOptions): Launch {
+  /**
+   * Refused rather than silently dropped.
+   *
+   * A host that set this meant something by it, and the something is always
+   * wrong — the placeholder is what makes the container safe to run a
+   * stranger's `postinstall` in. The config is static, so this fails on the
+   * first run in development rather than surprising a live task.
+   */
+  if (options.env && RESERVED_ENV_KEY in options.env) {
+    throw new Error(
+      `claude-code: ${RESERVED_ENV_KEY} cannot be set through \`env\`. The ` +
+        "container is launched with a placeholder and the egress gateway swaps " +
+        "in the real credential on the way out; putting a real one here would " +
+        "hand it to every process in the container, including a cloned " +
+        "repository's install scripts. Pass it as `credential` instead."
+    );
+  }
+
   const argv = ["claude", "-p", shellQuote(options.prompt)];
   argv.push("--output-format", "stream-json", "--verbose");
   if (options.model) argv.push("--model", shellQuote(options.model));
@@ -136,12 +193,11 @@ export function buildLaunch(options: LaunchOptions): Launch {
     argv.push("--max-turns", String(options.maxTurns));
 
   const env: Record<string, string> = {
-    CLAUDE_CODE_OAUTH_TOKEN: CREDENTIAL_PLACEHOLDER,
     // Pinned image; an autoupdate would move the wire shape the gateway and the
     // parser are both written against, mid-run and without a deploy.
     DISABLE_AUTOUPDATER: "1",
-    // Telemetry and feature-flag fetches the allowlist would refuse anyway.
-    // Turned off at the source so the logs are not full of 403s that mean
+    // Telemetry and feature-flag fetches. Turned off at the source so an
+    // egress-restricted deployment does not fill its logs with 403s that mean
     // nothing.
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
   };
@@ -152,20 +208,45 @@ export function buildLaunch(options: LaunchOptions): Launch {
       options.maxConcurrentSubagents
     );
 
-  return { command: argv.join(" "), env: { ...env, ...options.env } };
+  return {
+    command: argv.join(" "),
+    // The placeholder is applied **after** the host's environment, not before,
+    // so the guard above is a second line rather than the only one.
+    env: { ...env, ...options.env, [RESERVED_ENV_KEY]: CREDENTIAL_PLACEHOLDER }
+  };
 }
 
 /** Where a drain got to. Persisted between chunks by the caller. */
 export interface DrainCursor {
+  /**
+   * The exec id this session occupies.
+   *
+   * Carried rather than derived so a re-attach cannot compute a different one
+   * from the subtask id it happens to have in hand.
+   */
+  execId: string;
   /** The last event sequence consumed; the next chunk resumes from here. */
   seq: number;
   /** Bytes after the last newline — an incomplete line the next read finishes. */
   carry: string;
   /** Progress notes emitted so far. The base for the positional keys. */
   emitted: number;
+  /**
+   * The `result` line, once seen.
+   *
+   * Carried because it and the `exit` event are two separate events and a window
+   * can end between them. Without this a run whose result arrived in the last
+   * moments of one chunk reports a terminal outcome with **no result** in the
+   * next — and `persistResult` converts an empty report into a failure, so a
+   * successful session would be recorded as a failed one.
+   */
+  result?: ClaudeCodeResult;
 }
 
-export const FRESH_CURSOR: DrainCursor = { seq: 0, carry: "", emitted: 0 };
+/** A cursor for a session that has not started yet. */
+export function freshCursor(execId: string): DrainCursor {
+  return { execId, seq: 0, carry: "", emitted: 0 };
+}
 
 /** Distinguishes "the window ran out" from a real stream event in the race below. */
 const WINDOW_EXPIRED = Symbol("window-expired");
@@ -177,7 +258,7 @@ export type DrainOutcome =
       cursor: DrainCursor;
       progress: ProgressEvent[];
       exitCode: number;
-      /** Absent when the process died without emitting a `result` line. */
+      /** Absent when the process died without ever emitting a `result` line. */
       result?: ClaudeCodeResult;
     };
 
@@ -194,24 +275,43 @@ export interface DrainOptions {
   now?: () => number;
 }
 
+/** Whether a thrown value is the runtime refusing to reuse a live exec id. */
+function isExecBusy(err: unknown): boolean {
+  return (err as { code?: unknown } | null | undefined)?.code === "EEXEC_BUSY";
+}
+
 /**
  * Start a session, detached.
  *
- * Returns nothing to await beyond the spawn: the run belongs to the container
- * from here, and every later chunk reaches it through {@link drainRun}.
+ * **Falls back to attaching when the id is already live**, which is not a
+ * nicety. `start` spawns and then drains for minutes, so a chunk that fails
+ * anywhere after the spawn is retried by the Workflow with no cursor to resume
+ * from — and `@cloudflare/computer` refuses to reuse an id whose execution is
+ * still running (`EEXEC_BUSY`). Without this the retry throws, every later retry
+ * throws the same way, and a perfectly healthy session in the container becomes
+ * unreachable.
  */
 export async function startRun(
   runtime: SessionRuntime,
-  options: LaunchOptions & { timeoutMs: number }
+  options: LaunchOptions & { execId: string; timeoutMs: number }
 ): Promise<WorkspaceRuntimeExecHandle<"utf8">> {
   const { command, env } = buildLaunch(options);
-  return await runtime.exec(command, {
-    id: CLAUDE_EXEC_ID,
-    cwd: options.dir,
-    encoding: "utf8",
-    env,
-    timeoutMs: options.timeoutMs
-  });
+  try {
+    return await runtime.exec(command, {
+      id: options.execId,
+      cwd: options.dir,
+      encoding: "utf8",
+      env,
+      timeoutMs: options.timeoutMs
+    });
+  } catch (err) {
+    if (!isExecBusy(err)) throw err;
+    console.info(
+      "[claude-code] a session is already running under this id — attaching",
+      { execId: options.execId }
+    );
+    return await attachRun(runtime, freshCursor(options.execId));
+  }
 }
 
 /** Re-attach to a session this isolate did not start. */
@@ -219,10 +319,10 @@ export async function attachRun(
   runtime: SessionRuntime,
   cursor: DrainCursor
 ): Promise<WorkspaceRuntimeExecHandle<"utf8">> {
-  return await runtime.getExec(CLAUDE_EXEC_ID, {
+  return await runtime.getExec(cursor.execId, {
     encoding: "utf8",
-    // `0` would be `"full"` semantically but is a legal seq, so a fresh cursor
-    // resumes from the beginning either way. Later chunks name their own place.
+    // `0` is a legal seq and also the beginning, so a fresh cursor resumes from
+    // the start either way. Later chunks name their own place.
     resume: cursor.seq
   });
 }
@@ -231,8 +331,8 @@ export async function attachRun(
  * Drain a session for one bounded window.
  *
  * Returns `done: false` when the window expired with the process still running —
- * the caller checkpoints the cursor and comes back — or `done: true` on the
- * `exit` event.
+ * the caller checkpoints the cursor and comes back — or `done: true` once the
+ * stream has finished.
  */
 export async function drainRun(
   handle: WorkspaceRuntimeExecHandle<"utf8">,
@@ -246,26 +346,18 @@ export async function drainRun(
   const events: ClaudeCodeEvent[] = [];
   let buffer = cursor.carry;
   let seq = cursor.seq;
-  let result: ClaudeCodeResult | undefined;
+  let result = cursor.result;
+  let exitCode: number | undefined;
 
-  const finish = (exitCode?: number): DrainOutcome => {
-    const progress = toProgress(events, cursor.emitted);
-    const next: DrainCursor = {
-      seq,
-      carry: buffer,
-      emitted: cursor.emitted + progress.length
-    };
-    return exitCode === undefined
-      ? { done: false, cursor: next, progress }
-      : {
-          done: true,
-          cursor: next,
-          progress,
-          exitCode,
-          ...(result ? { result } : {})
-        };
-  };
-
+  /**
+   * Parse whatever complete lines the buffer now holds.
+   *
+   * Called after **every** stdout event rather than once at the end. Claude
+   * Code's stream carries whole tool results, so a chunk that only parsed on the
+   * way out would hold an eight-minute transcript of a noisy build in a Durable
+   * Object's memory; parsing eagerly keeps only `carry`, which is at most one
+   * incomplete line.
+   */
   const absorb = (): void => {
     const parsed = parseStream(buffer);
     buffer = parsed.carry;
@@ -283,51 +375,102 @@ export async function drainRun(
     }
   };
 
+  const finish = (code?: number): DrainOutcome => {
+    const progress = toProgress(events, cursor.emitted);
+    const next: DrainCursor = {
+      execId: cursor.execId,
+      seq,
+      carry: buffer,
+      emitted: cursor.emitted + progress.length,
+      ...(result ? { result } : {})
+    };
+    return code === undefined
+      ? { done: false, cursor: next, progress }
+      : {
+          done: true,
+          cursor: next,
+          progress,
+          exitCode: code,
+          ...(result ? { result } : {})
+        };
+  };
+
   try {
     for (;;) {
-      const remaining = deadline - now();
-      if (remaining <= 0) {
-        absorb();
-        return finish();
+      /**
+       * Once the process has exited, stop racing the clock and read to the end.
+       *
+       * This is the single most important branch in the file. The stream
+       * `@cloudflare/computer` hands back is wrapped by `withPostPull`, and that
+       * wrapper runs **the container-to-workspace filesystem sync** when — and
+       * only when — the underlying stream reaches `done`. Returning on the
+       * `exit` event instead would leave it unread, so a session's edits would
+       * never reach the durable checkout: the run reports success, the files are
+       * simply not there.
+       *
+       * Reading on is also how the sync gets *awaited*: the wrapper resolves its
+       * pull before it closes the stream, so observing `done` means the sync has
+       * already finished.
+       */
+      if (exitCode !== undefined) {
+        const next = await reader.read();
+        if (next.done) return finish(exitCode);
+        consume(next.value);
+        continue;
       }
 
-      /**
-       * The abandoned read is deliberate and is safe.
-       *
-       * When the window wins this race the pending `read()` is dropped on the
-       * floor along with the reader. Nothing is lost, because the cursor names
-       * the last *consumed* `seq` and the next chunk resumes from exactly there
-       * — the event that read would have delivered is re-delivered.
-       */
+      const remaining = deadline - now();
+      if (remaining <= 0) return await yieldWindow();
+
       const next = await Promise.race([
         reader.read(),
         sleep(remaining).then((): typeof WINDOW_EXPIRED => WINDOW_EXPIRED)
       ]);
 
-      if (next === WINDOW_EXPIRED) {
-        absorb();
-        return finish();
-      }
+      if (next === WINDOW_EXPIRED) return await yieldWindow();
       if (next.done) {
         // The stream ended without an `exit` event — the container went away
         // under the run. Report it as a failure rather than as still-running,
         // or the caller waits out its whole chunk budget on a dead process.
-        absorb();
         return finish(-1);
       }
-
-      const event = next.value;
-      seq = event.seq;
-      if (event.name === "stdout") buffer += event.value;
-      // stderr is Claude Code's own diagnostics, not the protocol stream. Kept
-      // out of the parser so a warning line cannot be mistaken for an event.
-      if (event.name === "exit") {
-        absorb();
-        return finish(event.code);
-      }
+      consume(next.value);
     }
   } finally {
     reader.releaseLock();
+  }
+
+  function consume(event: {
+    seq: number;
+    name: string;
+    value?: string;
+    code?: number;
+  }): void {
+    seq = event.seq;
+    if (event.name === "stdout" && event.value !== undefined) {
+      buffer += event.value;
+      absorb();
+    }
+    // stderr is Claude Code's own diagnostics, not the protocol stream. Kept out
+    // of the parser so a warning line cannot be mistaken for an event.
+    if (event.name === "exit") exitCode = event.code ?? -1;
+  }
+
+  /**
+   * End the window with the session still running.
+   *
+   * **Cancels rather than merely releasing the lock.** Releasing leaves the
+   * attachment and its pending read alive on the far side, and a chunked run
+   * would strand one per window. `cancel` is the wrapper's own designed exit —
+   * it settles the pending read, resolves the sync outcome as `pending`, and
+   * lets the next chunk's `getExec` open a fresh attachment that will run the
+   * real sync when the session finally ends.
+   */
+  async function yieldWindow(): Promise<DrainOutcome> {
+    absorb();
+    const outcome = finish();
+    await reader.cancel("chunk window expired").catch(() => {});
+    return outcome;
   }
 }
 
@@ -343,6 +486,9 @@ function sleep(ms: number): Promise<void> {
  * leaves whatever the session had spawned still running in a container the
  * workspace will keep using.
  */
-export async function killRun(runtime: SessionRuntime): Promise<void> {
-  await runtime.killExec(CLAUDE_EXEC_ID, { signal: "SIGTERM" });
+export async function killRun(
+  runtime: SessionRuntime,
+  execId: string
+): Promise<void> {
+  await runtime.killExec(execId, { signal: "SIGTERM" });
 }

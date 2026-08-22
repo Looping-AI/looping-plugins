@@ -267,6 +267,24 @@ describe("the host restriction", () => {
       }
     );
 
+    /**
+     * `URL.hostname` is not canonical for an exact-match set. IPv6 keeps its
+     * brackets (`http://[::1]/` reports `[::1]`, not `::1`) and a trailing dot
+     * survives (`computer.internal.` resolves to the same place). Either
+     * spelling walks straight past a naive `Set.has`.
+     */
+    it.each([
+      ["http://[::1]/ws", "bracketed IPv6"],
+      ["http://computer.internal./ws", "trailing dot"],
+      ["http://COMPUTER.INTERNAL/ws", "uppercase"]
+    ])("refuses %s (%s)", async (url) => {
+      const sent = stubUpstream();
+      const response = await openGateway().fetch(new Request(url));
+
+      expect(response.status).toBe(403);
+      expect(sent).toHaveLength(0);
+    });
+
     it("says which rule refused it, so the log is actionable", async () => {
       const response = await openGateway().fetch(
         new Request("http://computer.internal/ws")
@@ -274,6 +292,70 @@ describe("the host restriction", () => {
       const body = (await response.json()) as { error: { message: string } };
       expect(body.error.message).toMatch(/names the egress gateway itself/);
     });
+  });
+});
+
+/**
+ * The host matched; the scheme is the rest of the question.
+ *
+ * Nothing stops a process in the container asking for
+ * `http://api.anthropic.com/…`, and this gateway would otherwise fetch it —
+ * putting the real subscription token on the wire in plaintext, from the Worker,
+ * at the request of code the workspace does not trust.
+ */
+describe("plaintext to Anthropic", () => {
+  it("refuses http, before the credential is even read", async () => {
+    const sent = stubUpstream();
+    const response = await claudeCodeEgress({
+      credential: () => {
+        throw new Error("the credential must not be read on this path");
+      },
+      restrictToHosts: []
+    }).fetch(
+      new Request(`http://${ANTHROPIC_HOST}/v1/messages`, { method: "POST" })
+    );
+
+    expect(response.status).toBe(403);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("refuses the plaintext preflight too", async () => {
+    const sent = stubUpstream();
+    const response = await openGateway().fetch(
+      new Request(`http://${ANTHROPIC_HOST}/api/hello`, { method: "HEAD" })
+    );
+
+    expect(response.status).toBe(403);
+    expect(sent).toHaveLength(0);
+  });
+
+  /**
+   * The trailing dot is the same destination, so it must take the same branch —
+   * otherwise it would slip past as an ordinary host: credential stripped (safe)
+   * but the budget gate skipped entirely (not).
+   */
+  it("treats a trailing-dot Anthropic host as Anthropic", async () => {
+    const sent = stubUpstream();
+    await openGateway().fetch(
+      new Request(`https://${ANTHROPIC_HOST}./v1/messages`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${PLACEHOLDER}` }
+      })
+    );
+
+    expect(sent[0]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
+  });
+
+  it("gates a trailing-dot Anthropic host on budget", async () => {
+    const sent = stubUpstream();
+    const response = await openGateway({
+      budget: { check: async () => ({ ok: false as const, reason: "cap" }) }
+    }).fetch(
+      new Request(`https://${ANTHROPIC_HOST}./v1/messages`, { method: "POST" })
+    );
+
+    expect(response.status).toBe(429);
+    expect(sent).toHaveLength(0);
   });
 });
 

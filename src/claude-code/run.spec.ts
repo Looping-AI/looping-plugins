@@ -6,10 +6,16 @@ import type {
 import {
   buildLaunch,
   drainRun,
+  execIdFor,
+  freshCursor,
+  startRun,
   CREDENTIAL_PLACEHOLDER,
-  FRESH_CURSOR,
-  type DrainCursor
+  type DrainCursor,
+  type SessionRuntime
 } from "./run.js";
+
+const EXEC = execIdFor(7);
+const FRESH = freshCursor(EXEC);
 
 /**
  * Launching and draining, and the two failures that are invisible until
@@ -25,14 +31,14 @@ import {
 type Event = WorkspaceRuntimeEvent<"utf8">;
 
 const stdout = (seq: number, value: string): Event => ({
-  id: "claude-code-run",
+  id: EXEC,
   seq,
   name: "stdout",
   value
 });
 
 const exit = (seq: number, code: number): Event => ({
-  id: "claude-code-run",
+  id: EXEC,
   seq,
   name: "exit",
   code
@@ -53,7 +59,7 @@ function fakeHandle(
     }
   });
   return Object.assign(stream, {
-    id: "claude-code-run",
+    id: EXEC,
     backend: "container",
     result: async () => {
       throw new Error("not used by the drain");
@@ -202,7 +208,7 @@ describe("drainRun", () => {
       exit(3, 0)
     ]);
 
-    const outcome = await drainRun(handle, FRESH_CURSOR, window);
+    const outcome = await drainRun(handle, FRESH, window);
 
     expect(outcome.done).toBe(true);
     if (!outcome.done) throw new Error("unreachable");
@@ -221,7 +227,7 @@ describe("drainRun", () => {
     const handle = fakeHandle([stdout(1, assistant("thinking"))], true);
     const started = Date.now();
 
-    const outcome = await drainRun(handle, FRESH_CURSOR, { windowMs: 60 });
+    const outcome = await drainRun(handle, FRESH, { windowMs: 60 });
 
     expect(outcome.done).toBe(false);
     expect(Date.now() - started).toBeGreaterThanOrEqual(50);
@@ -240,7 +246,7 @@ describe("drainRun", () => {
 
     const first = await drainRun(
       fakeHandle([stdout(1, whole.slice(0, cut))], true),
-      FRESH_CURSOR,
+      FRESH,
       { windowMs: 40 }
     );
     expect(first.progress).toHaveLength(0);
@@ -262,7 +268,7 @@ describe("drainRun", () => {
   it("continues the progress numbering across chunks", async () => {
     const first = await drainRun(
       fakeHandle([stdout(1, assistant("one") + assistant("two"))], true),
-      FRESH_CURSOR,
+      FRESH,
       { windowMs: 40 }
     );
     expect(first.cursor.emitted).toBe(2);
@@ -283,7 +289,7 @@ describe("drainRun", () => {
   it("treats a stream that ends without an exit event as a failure", async () => {
     const outcome = await drainRun(
       fakeHandle([stdout(1, assistant("half a job"))]),
-      FRESH_CURSOR,
+      FRESH,
       window
     );
 
@@ -294,7 +300,12 @@ describe("drainRun", () => {
   });
 
   it("resumes from a cursor without re-emitting what the last chunk showed", async () => {
-    const cursor: DrainCursor = { seq: 9, carry: "", emitted: 3 };
+    const cursor: DrainCursor = {
+      execId: EXEC,
+      seq: 9,
+      carry: "",
+      emitted: 3
+    };
     const outcome = await drainRun(
       fakeHandle([stdout(10, assistant("next")), exit(11, 0)]),
       cursor,
@@ -308,7 +319,7 @@ describe("drainRun", () => {
   it("reports a non-zero exit without a result line", async () => {
     const outcome = await drainRun(
       fakeHandle([stdout(1, "some stderr-ish noise\n"), exit(2, 143)]),
-      FRESH_CURSOR,
+      FRESH,
       window
     );
 
@@ -316,5 +327,223 @@ describe("drainRun", () => {
     if (!outcome.done) throw new Error("unreachable");
     expect(outcome.exitCode).toBe(143);
     expect(outcome.result).toBeUndefined();
+  });
+});
+
+/**
+ * A handle shaped like the one `@cloudflare/computer` actually returns.
+ *
+ * `withPostPull` wraps the runtime's event stream in a `ReadableStream` whose
+ * `pull` runs the **container-to-workspace filesystem sync** when the source
+ * reaches its end, and only then closes. That ordering is the whole reason the
+ * drain must read past `exit`: a consumer that stops early never triggers the
+ * pull, and the session's edits never reach the durable checkout.
+ *
+ * `cancel` deliberately does *not* run it — the real wrapper resolves its
+ * outcome as `pending` on that path — which is what makes the two tests below
+ * able to tell the behaviours apart.
+ */
+function handleWithPostPull(script: readonly Event[], open = false) {
+  const state = { synced: false, cancelled: false };
+  let i = 0;
+  const stream = new ReadableStream<Event>({
+    async pull(controller) {
+      if (i < script.length) {
+        controller.enqueue(script[i++]!);
+        return;
+      }
+      // `open` models a session still thinking: the source has nothing more yet,
+      // so `pull` never settles and the consumer's read stays pending until the
+      // window expires. Closing here instead would end the run.
+      if (open) return await new Promise<void>(() => {});
+      state.synced = true;
+      controller.close();
+    },
+    cancel() {
+      state.cancelled = true;
+    }
+  });
+  const handle = Object.assign(stream, {
+    id: EXEC,
+    backend: "container",
+    result: async () => {
+      throw new Error("not used by the drain");
+    },
+    kill: async () => {},
+    [Symbol.dispose]: () => {}
+  }) as unknown as WorkspaceRuntimeExecHandle<"utf8">;
+  return { handle, state };
+}
+
+describe("the filesystem sync", () => {
+  /**
+   * The most consequential test in this file. Returning on the `exit` event
+   * leaves the wrapped stream unread, so the post-exec pull never runs — the run
+   * reports success and the edits are simply not in the workspace.
+   */
+  it("reads past exit to the end of the stream, so the workspace pull runs", async () => {
+    const { handle, state } = handleWithPostPull([
+      stdout(1, assistant("edited a file")),
+      stdout(2, RESULT_LINE),
+      exit(3, 0)
+    ]);
+
+    const outcome = await drainRun(handle, FRESH, { windowMs: 5_000 });
+
+    expect(outcome.done).toBe(true);
+    expect(state.synced).toBe(true);
+  });
+
+  /**
+   * A window that ends mid-session must *not* trigger the pull — there is
+   * nothing to sync yet — but it must cancel, because merely releasing the
+   * reader lock leaves the attachment and its pending read alive on the far
+   * side, one per chunk.
+   */
+  it("cancels the attachment when the window expires, without syncing", async () => {
+    const { handle, state } = handleWithPostPull(
+      [stdout(1, assistant("still working"))],
+      true
+    );
+
+    const outcome = await drainRun(handle, FRESH, { windowMs: 50 });
+
+    expect(outcome.done).toBe(false);
+    // Cancelled, because merely releasing the reader lock leaves the attachment
+    // and its pending read alive on the far side — one stranded per chunk.
+    expect(state.cancelled).toBe(true);
+    // And not synced: there is nothing to pull back until the session ends.
+    expect(state.synced).toBe(false);
+  });
+});
+
+describe("one exec id per subtask", () => {
+  /**
+   * Subtasks are a flat concurrent fan-out, and a workspace is one container. A
+   * shared exec id would let two sessions spawn over each other, each drain
+   * attach to whichever won, and `stop` kill somebody else's run.
+   */
+  it("namespaces the id so two subtasks cannot collide", () => {
+    expect(execIdFor(7)).not.toBe(execIdFor(8));
+    expect(execIdFor(7)).toContain("7");
+  });
+
+  it("carries the id in the cursor rather than re-deriving it", () => {
+    expect(freshCursor(execIdFor(7)).execId).toBe(execIdFor(7));
+  });
+});
+
+describe("startRun", () => {
+  const handleFor = () => fakeHandle([exit(1, 0)]);
+
+  function runtimeThatIsBusy(): SessionRuntime & { attached: string[] } {
+    const attached: string[] = [];
+    return {
+      attached,
+      exec: async () => {
+        throw Object.assign(new Error("execution is running"), {
+          code: "EEXEC_BUSY"
+        });
+      },
+      getExec: async (id: string) => {
+        attached.push(id);
+        return handleFor();
+      },
+      killExec: async () => {}
+    };
+  }
+
+  /**
+   * `start` spawns and then drains for minutes, so a chunk that fails anywhere
+   * after the spawn is retried with no cursor to resume from — and the runtime
+   * refuses to reuse a live id. Without the fallback the retry throws, every
+   * later retry throws identically, and a healthy session becomes unreachable.
+   */
+  it("attaches instead of failing when the id is already live", async () => {
+    const runtime = runtimeThatIsBusy();
+    const handle = await startRun(runtime, {
+      prompt: "p",
+      dir: "/workspace/repo",
+      execId: EXEC,
+      timeoutMs: 1000
+    });
+
+    expect(runtime.attached).toEqual([EXEC]);
+    expect(handle.id).toBe(EXEC);
+  });
+
+  it("rethrows anything that is not a busy id", async () => {
+    const runtime: SessionRuntime = {
+      exec: async () => {
+        throw Object.assign(new Error("no container"), {
+          code: "ECONNREFUSED"
+        });
+      },
+      getExec: async () => handleFor(),
+      killExec: async () => {}
+    };
+
+    await expect(
+      startRun(runtime, {
+        prompt: "p",
+        dir: "/workspace/repo",
+        execId: EXEC,
+        timeoutMs: 1000
+      })
+    ).rejects.toThrow(/no container/);
+  });
+});
+
+describe("the reserved credential key", () => {
+  /**
+   * `env` is merged last so a deployment can add what a repository needs, and
+   * that merge is exactly how the placeholder could be replaced by a real
+   * credential — silently, and in every container from then on.
+   */
+  it("refuses a host trying to set the OAuth token", () => {
+    expect(() =>
+      buildLaunch({
+        prompt: "p",
+        dir: "/workspace/repo",
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-REAL" }
+      })
+    ).toThrow(/cannot be set through/);
+  });
+
+  it("keeps the placeholder even when other host env is merged", () => {
+    const { env } = buildLaunch({
+      prompt: "p",
+      dir: "/workspace/repo",
+      env: { CI: "1" }
+    });
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(CREDENTIAL_PLACEHOLDER);
+    expect(env.CI).toBe("1");
+  });
+});
+
+describe("the result across a chunk boundary", () => {
+  /**
+   * The `result` line and the `exit` event are two events, and a window can end
+   * between them. Losing the result means a successful session reports a
+   * terminal outcome with nothing in it — and `persistResult` turns an empty
+   * report into a failure.
+   */
+  it("carries a result seen in one window into the next", async () => {
+    const first = await drainRun(
+      fakeHandle([stdout(1, RESULT_LINE)], true),
+      FRESH,
+      { windowMs: 40 }
+    );
+
+    expect(first.done).toBe(false);
+    expect(first.cursor.result?.costUsd).toBe(1.25);
+
+    const second = await drainRun(fakeHandle([exit(2, 0)]), first.cursor, {
+      windowMs: 5_000
+    });
+
+    expect(second.done).toBe(true);
+    if (!second.done) throw new Error("unreachable");
+    expect(second.result?.costUsd).toBe(1.25);
   });
 });
