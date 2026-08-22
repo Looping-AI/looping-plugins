@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ANTHROPIC_HOST, claudeCodeEgress } from "./egress.js";
+import type { CredentialState, CredentialStore } from "./credentials.js";
 
 /**
  * The gateway is the whole of the containment, so every test here is a
@@ -14,25 +15,57 @@ import { ANTHROPIC_HOST, claudeCodeEgress } from "./egress.js";
 afterEach(() => vi.unstubAllGlobals());
 
 /** Capture what actually left, which is the only thing worth asserting. */
-function stubUpstream(status = 200) {
+function stubUpstream(status = 200, headers: Record<string, string> = {}) {
   const sent: Request[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       sent.push(new Request(input as RequestInfo, init));
-      return new Response("upstream", { status });
+      return new Response("upstream", { status, headers });
+    })
+  );
+  return sent;
+}
+
+/**
+ * An upstream that answers per credential, which is what a rotation test needs:
+ * the whole question is whether the *second* attempt carries a different token.
+ */
+function stubPerCredential(
+  answer: (token: string | null) => Response
+): Request[] {
+  const sent: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input as RequestInfo, init);
+      sent.push(request);
+      return answer(request.headers.get("authorization"));
     })
   );
   return sent;
 }
 
 const REAL = "sk-ant-oat01-REAL-CREDENTIAL";
+const SECOND = "sk-ant-oat01-SECOND-CREDENTIAL";
 const PLACEHOLDER = "sk-ant-oat01-000000000000";
+
+/** An in-memory pool store — the host supplies one over its own storage. */
+function memoryStore(initial: CredentialState[] = []): CredentialStore {
+  let states = initial;
+  return {
+    read: async () => states,
+    write: async (next) => {
+      states = next;
+    }
+  };
+}
 
 /** A gateway restricted to one host — most tests below are about restriction. */
 const gateway = (over: Partial<Parameters<typeof claudeCodeEgress>[0]> = {}) =>
   claudeCodeEgress({
-    credential: () => REAL,
+    credentials: () => [REAL],
+    store: memoryStore(),
     restrictToHosts: ["registry.npmjs.org"],
     ...over
   });
@@ -40,7 +73,12 @@ const gateway = (over: Partial<Parameters<typeof claudeCodeEgress>[0]> = {}) =>
 /** The shipped default: no restriction configured at all. */
 const openGateway = (
   over: Partial<Parameters<typeof claudeCodeEgress>[0]> = {}
-) => claudeCodeEgress({ credential: () => REAL, ...over });
+) =>
+  claudeCodeEgress({
+    credentials: () => [REAL],
+    store: memoryStore(),
+    ...over
+  });
 
 /** How Claude Code 2.1.238 actually sends a model call — see the Phase 0 capture. */
 function modelCall(): Request {
@@ -109,8 +147,12 @@ describe("the credential swap", () => {
 
   it("refuses rather than forwarding when no credential is configured", async () => {
     const sent = stubUpstream();
-    const response = await gateway({ credential: () => "" }).fetch(modelCall());
+    const response = await gateway({ credentials: () => [] }).fetch(
+      modelCall()
+    );
 
+    // 500, not 429: an empty pool does not recover on a timer, and a rate limit
+    // would have the client retry against a wall for the rest of the session.
     expect(response.status).toBe(500);
     // The important half: nothing left the boundary. Forwarding the placeholder
     // would come back as an authentication error and send an operator to rotate
@@ -182,7 +224,8 @@ describe("the host restriction", () => {
   it("allows api.anthropic.com without it being listed", async () => {
     const sent = stubUpstream();
     await claudeCodeEgress({
-      credential: () => REAL,
+      credentials: () => [REAL],
+      store: memoryStore(),
       restrictToHosts: []
     }).fetch(modelCall());
     expect(sent).toHaveLength(1);
@@ -225,20 +268,11 @@ describe("the host restriction", () => {
       expect(sent[0]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
     });
 
-    it("still refuses over budget", async () => {
-      const sent = stubUpstream();
-      const response = await openGateway({
-        budget: { check: async () => ({ ok: false as const, reason: "cap" }) }
-      }).fetch(modelCall());
-
-      expect(response.status).toBe(429);
-      expect(sent).toHaveLength(0);
-    });
-
     it("treats an empty array as Anthropic only, not as unrestricted", async () => {
       const sent = stubUpstream();
       const response = await claudeCodeEgress({
-        credential: () => REAL,
+        credentials: () => [REAL],
+        store: memoryStore(),
         restrictToHosts: []
       }).fetch(new Request("https://registry.npmjs.org/left-pad"));
 
@@ -307,9 +341,10 @@ describe("plaintext to Anthropic", () => {
   it("refuses http, before the credential is even read", async () => {
     const sent = stubUpstream();
     const response = await claudeCodeEgress({
-      credential: () => {
+      credentials: () => {
         throw new Error("the credential must not be read on this path");
       },
+      store: memoryStore(),
       restrictToHosts: []
     }).fetch(
       new Request(`http://${ANTHROPIC_HOST}/v1/messages`, { method: "POST" })
@@ -332,7 +367,7 @@ describe("plaintext to Anthropic", () => {
   /**
    * The trailing dot is the same destination, so it must take the same branch —
    * otherwise it would slip past as an ordinary host: credential stripped (safe)
-   * but the budget gate skipped entirely (not).
+   * but a spent bucket never noticed on that spelling (not).
    */
   it("treats a trailing-dot Anthropic host as Anthropic", async () => {
     const sent = stubUpstream();
@@ -346,94 +381,214 @@ describe("plaintext to Anthropic", () => {
     expect(sent[0]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
   });
 
-  it("gates a trailing-dot Anthropic host on budget", async () => {
-    const sent = stubUpstream();
-    const response = await openGateway({
-      budget: { check: async () => ({ ok: false as const, reason: "cap" }) }
-    }).fetch(
-      new Request(`https://${ANTHROPIC_HOST}./v1/messages`, { method: "POST" })
+  it("rotates on a trailing-dot Anthropic host too", async () => {
+    const sent = stubPerCredential((token) =>
+      token === `Bearer ${REAL}`
+        ? new Response("{}", {
+            status: 429,
+            headers: { "retry-after": "14400" }
+          })
+        : new Response("ok", { status: 200 })
     );
+    const rotating = claudeCodeEgress({
+      credentials: () => [REAL, SECOND],
+      store: memoryStore()
+    });
+    const url = `https://${ANTHROPIC_HOST}./v1/messages`;
 
-    expect(response.status).toBe(429);
-    expect(sent).toHaveLength(0);
+    await rotating.fetch(new Request(url, { method: "POST" }));
+    await rotating.fetch(new Request(url, { method: "POST" }));
+
+    expect(sent[1]!.headers.get("authorization")).toBe(`Bearer ${SECOND}`);
   });
 });
 
-describe("the budget gate", () => {
-  const overBudget = {
-    check: async () => ({ ok: false as const, reason: "cap reached" })
-  };
+/**
+ * Rotation is what replaced the budget gate, and the difference is the whole
+ * design: a budget *predicts* a bucket nobody can read, rotation *reads* the
+ * one place the bucket announces itself — Anthropic's own response.
+ *
+ * Every test here is about not overreacting. The expensive mistakes are
+ * symmetrical and both are cheap to make: retiring a working credential because
+ * of an ordinary slow-down, and failing to notice a spent one.
+ */
+describe("credential rotation", () => {
+  /** A spent 5-hour bucket, as far as anything here can know one. */
+  const EXHAUSTED = { status: 429, headers: { "retry-after": "14400" } };
 
-  it("refuses a model call over cap, with a rate limit the client understands", async () => {
-    const sent = stubUpstream();
-    const response = await gateway({ budget: overBudget }).fetch(modelCall());
-
-    expect(response.status).toBe(429);
-    expect(sent).toHaveLength(0);
-    expect(await response.json()).toEqual({
-      type: "error",
-      error: { type: "rate_limit_error", message: "cap reached" }
+  const rotating = (
+    over: Partial<Parameters<typeof claudeCodeEgress>[0]> = {}
+  ) =>
+    claudeCodeEgress({
+      credentials: () => [REAL, SECOND],
+      store: memoryStore(),
+      ...over
     });
+
+  it("moves the lead on when a credential's bucket is spent", async () => {
+    const sent = stubPerCredential((token) =>
+      token === `Bearer ${REAL}`
+        ? new Response("{}", EXHAUSTED)
+        : new Response("ok", { status: 200 })
+    );
+    const egress = rotating();
+
+    await egress.fetch(modelCall());
+    const second = await egress.fetch(modelCall());
+
+    expect(sent[0]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
+    expect(sent[1]!.headers.get("authorization")).toBe(`Bearer ${SECOND}`);
+    expect(second.status).toBe(200);
   });
 
   /**
-   * A `retry-after` we invented would make the client sleep inside the
-   * container, on the Looping chunk's clock — the one budget this gateway cannot
-   * see. Without it the client's own short backoff runs out and the run fails.
+   * The rewrite is what turns the client's own retry into the rotation, and it
+   * is the reason nothing here buffers a request body. Left at the upstream's
+   * value the client would sleep for four hours holding a chunk open, which is
+   * a stall rather than a rotation.
    */
-  it("sends no retry-after, so the client does not sleep on our clock", async () => {
-    const response = await gateway({ budget: overBudget }).fetch(modelCall());
-    expect(response.headers.get("retry-after")).toBeNull();
-  });
-
-  /**
-   * The opposite of core's `shouldHandleTurn`, which fails open. A gate that
-   * fails open there costs a wrong reply; one that failed open here would cost
-   * an unbounded spend against somebody's subscription.
-   */
-  it("treats a gate that throws as a refusal, not as permission", async () => {
-    const sent = stubUpstream();
-    const response = await gateway({
-      budget: {
-        check: async () => {
-          throw new Error("storage unavailable");
-        }
-      }
-    }).fetch(modelCall());
+  it("tells the client to retry in a second, not in four hours", async () => {
+    stubUpstream(429, { "retry-after": "14400" });
+    const response = await rotating().fetch(modelCall());
 
     expect(response.status).toBe(429);
-    expect(sent).toHaveLength(0);
+    expect(response.headers.get("retry-after")).toBe("1");
   });
 
   /**
-   * The preflight is unauthenticated and costs nothing. Gating it would fail a
-   * run at startup with a rate limit it never earned, before a single model call
-   * was attempted.
+   * An ordinary slow-down is not this credential's fault. Rotating on one would
+   * retire a perfectly good credential for whatever window the header named —
+   * and with a small pool, two speed bumps would empty it.
    */
-  it("lets the unauthenticated preflight through even when over cap", async () => {
-    const sent = stubUpstream();
-    const response = await gateway({ budget: overBudget }).fetch(
-      new Request(`https://${ANTHROPIC_HOST}/api/hello`, { method: "HEAD" })
+  it("does not rotate on a transient 429", async () => {
+    const sent = stubPerCredential(
+      () => new Response("{}", { status: 429, headers: { "retry-after": "5" } })
     );
+    const egress = rotating();
+
+    const first = await egress.fetch(modelCall());
+    await egress.fetch(modelCall());
+
+    // Passed through exactly as it came: same wait, same status.
+    expect(first.headers.get("retry-after")).toBe("5");
+    expect(sent[1]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
+  });
+
+  /**
+   * A revoked credential is a different claim from a spent one — it never
+   * recovers — so it is taken out for good rather than until a reset.
+   *
+   * The status is rewritten to 429 on the way out, and that is deliberate: a
+   * client does not retry a 401, so passing one through would fail the run on a
+   * credential the gateway has already stopped using.
+   */
+  it("retires a rejected credential and asks the client to retry", async () => {
+    const sent = stubPerCredential((token) =>
+      token === `Bearer ${REAL}`
+        ? new Response("{}", { status: 401 })
+        : new Response("ok", { status: 200 })
+    );
+    const egress = rotating();
+
+    const first = await egress.fetch(modelCall());
+    await egress.fetch(modelCall());
+
+    expect(first.status).toBe(429);
+    expect(first.headers.get("retry-after")).toBe("1");
+    expect(sent[1]!.headers.get("authorization")).toBe(`Bearer ${SECOND}`);
+  });
+
+  /**
+   * The give-up path, and the one place the short `retry-after` would be
+   * actively harmful: there is nothing left to rotate to, so a one-second wait
+   * would spin the client against a wall for the rest of the session.
+   */
+  it("passes the real wait through once every credential is spent", async () => {
+    stubUpstream(429, { "retry-after": "14400" });
+    const egress = rotating();
+
+    await egress.fetch(modelCall()); // spends REAL
+    await egress.fetch(modelCall()); // spends SECOND
+    const exhausted = await egress.fetch(modelCall());
+
+    expect(exhausted.status).toBe(429);
+    expect(Number(exhausted.headers.get("retry-after"))).toBeGreaterThan(1000);
+    const body = (await exhausted.json()) as { error: { message: string } };
+    expect(body.error.message).toMatch(/every Anthropic credential/);
+  });
+
+  /**
+   * A rejected pool does not recover on a timer, so it is a 500 rather than a
+   * rate limit — the operator has to act, and a 429 would hide that behind a
+   * retry loop.
+   */
+  it("reports an all-rejected pool as needing an operator", async () => {
+    stubUpstream(401);
+    const egress = rotating();
+
+    await egress.fetch(modelCall());
+    await egress.fetch(modelCall());
+    const dead = await egress.fetch(modelCall());
+
+    expect(dead.status).toBe(500);
+    expect(dead.headers.get("retry-after")).toBeNull();
+  });
+
+  /**
+   * The hot path. A successful model call is a streamed SSE body that must reach
+   * the container untouched — inspecting it, or cloning it to look, would be
+   * paid on every response rather than on the rare refusal.
+   */
+  it("passes a successful response straight through", async () => {
+    stubUpstream(200);
+    const response = await rotating().fetch(modelCall());
 
     expect(response.status).toBe(200);
-    expect(sent).toHaveLength(1);
+    expect(await response.text()).toBe("upstream");
   });
 
-  it("does not gate a non-Anthropic host", async () => {
-    const sent = stubUpstream();
-    await gateway({ budget: overBudget }).fetch(
-      new Request("https://registry.npmjs.org/left-pad")
+  /**
+   * An ordinary client error is not a statement about the credential. Rotating
+   * on one would empty the pool on a malformed request.
+   */
+  it("leaves an unrecognised 4xx alone", async () => {
+    const sent = stubPerCredential(
+      () => new Response("bad request", { status: 400 })
     );
-    expect(sent).toHaveLength(1);
+    const egress = rotating();
+
+    const response = await egress.fetch(modelCall());
+    await egress.fetch(modelCall());
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("bad request");
+    expect(sent[1]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
   });
 
-  it("forwards when the gate says there is budget", async () => {
-    const sent = stubUpstream();
-    await gateway({
-      budget: { check: async () => ({ ok: true as const }) }
-    }).fetch(modelCall());
-    expect(sent).toHaveLength(1);
+  /**
+   * A pool of one is the ordinary single-credential deployment, and it must not
+   * become unusable the moment it is refused once — it comes back at its reset,
+   * with no operator involvement and nothing to clear.
+   */
+  it("recovers a single-credential pool once its reset has passed", async () => {
+    stubUpstream(429, { "retry-after": "120" });
+    const store = memoryStore();
+    let clock = 1_000_000;
+    const egress = claudeCodeEgress({
+      credentials: () => [REAL],
+      store,
+      now: () => clock
+    });
+
+    const refused = await egress.fetch(modelCall());
+    expect(refused.status).toBe(429);
+
+    clock += 121_000;
+    const sent = stubUpstream(200);
+    const after = await egress.fetch(modelCall());
+
+    expect(after.status).toBe(200);
+    expect(sent[0]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
   });
 });
 

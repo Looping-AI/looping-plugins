@@ -1,3 +1,10 @@
+import {
+  credentialPool,
+  readRefusal,
+  type CredentialStore,
+  type Lead
+} from "./credentials.js";
+
 /**
  * `@loopingai/plugins/claude-code` — the container's only way out.
  *
@@ -18,18 +25,17 @@
  * 2. **Any restriction that is applied is total.** Not a policy the container
  *    cooperates with; the only route out. Restriction is **off by default** —
  *    see {@link EgressConfig.restrictToHosts} for why.
- * 3. **A budget can be refused.** `--max-turns` and the subagent caps are
- *    advisory and Claude Code's inner agent tree multiplies both. A gate here is
- *    a ceiling, because a model call that does not cross this function does not
- *    happen.
+ * 3. **Exhaustion is seen, so it can be routed around.** This is the only place
+ *    Anthropic's actual response is visible, and therefore the only place that
+ *    can learn a subscription bucket is empty. See {@link EgressConfig.store}
+ *    and `credentials.ts`.
  *
  * ## What this deliberately does not do
  *
- * It does not meter. The `result` event carries `usage` and a per-model cost
- * breakdown and is parsed anyway (see `events.ts`); making this parse SSE
- * `message_delta` frames to keep a running total would buy precision the gate
- * does not need — it only has to answer "is there budget left", and the answer
- * moves once per run. This reads the counter; the drain writes it.
+ * It does not meter. 0.5.0 had a budget gate that estimated spend in dollars and
+ * refused to start work over a cap; 0.6.0 deleted it. An estimate is a guess
+ * about a bucket nobody can read, it only moved once per run, and the bucket
+ * itself announces the answer exactly — see the docblock in `credentials.ts`.
  *
  * And it does not, by default, **bound exfiltration**. The container holds the
  * checkout, and with no restriction configured it can send it anywhere. That is
@@ -41,15 +47,6 @@
 
 /** Anthropic's API host — the one destination that gets a credential. */
 export const ANTHROPIC_HOST = "api.anthropic.com";
-
-/**
- * The path prefix that costs money.
- *
- * Claude Code also sends an unauthenticated `HEAD /api/hello` preflight, which
- * must pass through: gating it would make a run fail at startup with a rate
- * limit it never earned, before any model call was attempted.
- */
-const MESSAGES_PATH = "/v1/messages";
 
 /**
  * Hosts that name **this** side of the boundary, refused whatever the policy.
@@ -66,6 +63,14 @@ const MESSAGES_PATH = "/v1/messages";
  * should add that name here; the default is what the backend uses when nothing
  * says otherwise.
  */
+const NEVER_ALLOWED = new Set([
+  "computer.internal",
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "0.0.0.0"
+]);
+
 /**
  * The hostname a rule should be matched against, not the one the URL reports.
  *
@@ -79,8 +84,8 @@ const MESSAGES_PATH = "/v1/messages";
  *
  * The second one cuts both ways and is the more dangerous: an undotted
  * comparison against {@link ANTHROPIC_HOST} would send `api.anthropic.com.` down
- * the *non-Anthropic* branch — which is fail-safe for the credential, but skips
- * the budget gate entirely.
+ * the *non-Anthropic* branch, which strips the credential — fail-safe, but it
+ * also means a spent bucket is never noticed on that spelling.
  */
 function canonicalHost(url: URL): string {
   let host = url.hostname.toLowerCase();
@@ -89,14 +94,6 @@ function canonicalHost(url: URL): string {
   return host;
 }
 
-const NEVER_ALLOWED = new Set([
-  "computer.internal",
-  "localhost",
-  "127.0.0.1",
-  "::1",
-  "0.0.0.0"
-]);
-
 /** Headers that carry a credential, stripped from anything not Anthropic. */
 const CREDENTIAL_HEADERS = [
   "authorization",
@@ -104,28 +101,44 @@ const CREDENTIAL_HEADERS = [
   "proxy-authorization"
 ] as const;
 
-export interface EgressBudget {
-  /**
-   * Whether a model call may proceed. Consulted **before** forwarding, so a
-   * refusal costs nothing upstream.
-   *
-   * Failing here is treated as a refusal, not as permission, which is the
-   * opposite of core's `shouldHandleTurn` gate and deliberately so: a gate that
-   * fails open there costs a wrong reply, one that failed open here would cost
-   * an unbounded spend against somebody's subscription.
-   */
-  check: () => Promise<{ ok: true } | { ok: false; reason: string }>;
-}
+/**
+ * What a rotated request is told to wait.
+ *
+ * One second, not zero: the point is to get the client retrying promptly onto
+ * the credential that just became the lead, not to remove its backoff. Claude
+ * Code honours `retry-after`, so leaving the upstream value in place — four
+ * hours, on a spent 5-hour bucket — would stall the session rather than rotate
+ * it. This rewrite is what turns the client's own retry into the rotation, and
+ * it is why nothing here has to buffer a request body.
+ */
+const ROTATED_RETRY_AFTER = "1";
+
+/** How much of an unrecognised body to keep in the log. */
+const CAPTURE_BYTES = 2048;
 
 export interface EgressConfig {
   /**
-   * The real credential, as a thunk.
+   * The credential pool, in priority order — index 0 is tried first.
    *
-   * A thunk rather than a string so a rotated secret is picked up without
-   * rebuilding the plugin list — the same reason `ClaudeCodeConfig.credential`
-   * is one. Called per request; it must be cheap.
+   * A thunk so a rotated secret is picked up without rebuilding the plugin list.
+   * Called per request; it must be cheap. **None of these values enters the
+   * container**: the session is launched with `CREDENTIAL_PLACEHOLDER` and the
+   * swap happens here.
+   *
+   * An array of one is entirely valid and behaves as 0.5.0's single credential
+   * did — used until its bucket empties, after which requests are refused with
+   * the reset time.
    */
-  credential: () => string;
+  credentials: () => readonly string[];
+  /**
+   * Where the pool's `{ index → resetAt }` map is persisted.
+   *
+   * Supplied by the host because the state belongs to the host's storage: it is
+   * kept per workspace Durable Object, so each workspace learns a rotation
+   * independently. The cost of that is one wasted `429` per workspace per
+   * rotation; the saving is a Durable Object class, a binding and a migration.
+   */
+  store: CredentialStore;
   /**
    * Restrict the container to these hosts, plus `api.anthropic.com`.
    *
@@ -165,20 +178,34 @@ export interface EgressConfig {
    * restriction, the first time a host serves user-controlled subdomains.
    */
   restrictToHosts?: readonly string[];
-  budget?: EgressBudget;
   /** Named in log lines so one Worker's several gateways stay tellable apart. */
   label?: string;
+  now?: () => number;
 }
 
 /** The Anthropic error shape, so the client recognises what it is being told. */
-function apiError(type: string, message: string, status: number): Response {
+function apiError(
+  type: string,
+  message: string,
+  status: number,
+  headers: Record<string, string> = {}
+): Response {
   return new Response(
     JSON.stringify({ type: "error", error: { type, message } }),
     {
       status,
-      headers: { "content-type": "application/json" }
+      headers: { "content-type": "application/json", ...headers }
     }
   );
+}
+
+/** Every header on a response, for the capture log. */
+function headerMap(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    out[key] = value;
+  });
+  return out;
 }
 
 /**
@@ -200,6 +227,52 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
   const tag = config.label
     ? `claude-code-egress:${config.label}`
     : "claude-code-egress";
+  const now = config.now ?? Date.now;
+  const pool = credentialPool({
+    credentials: config.credentials,
+    store: config.store,
+    ...(config.now ? { now: config.now } : {})
+  });
+
+  /**
+   * What the client is told when no credential in the pool is usable.
+   *
+   * Two different answers, because they are two different situations and the
+   * client's correct reaction differs. A pool with a `retryAt` **will** recover
+   * on its own, so it is an honest `429` carrying the real wait — the client
+   * backs off, and if the wait outlives the session the run ends cleanly having
+   * said why. A pool with none will not: every entry was rejected as invalid, or
+   * none is configured. That needs an operator, and a `429` there would put the
+   * client in a retry loop against a wall for the rest of the session.
+   */
+  const spent = (lead: Extract<Lead, { ok: false }>): Response => {
+    if (lead.retryAt === undefined) {
+      console.error(
+        `[${tag}] no usable credential, and none will recover on its own`
+      );
+      return apiError(
+        "authentication_error",
+        "no Anthropic credential in this deployment's pool is usable and none " +
+          "will recover on its own — every entry was rejected as invalid, or " +
+          "none is configured",
+        500
+      );
+    }
+
+    const waitMs = lead.retryAt - now();
+    console.error(`[${tag}] every credential in the pool is rate limited`, {
+      retryAt: new Date(lead.retryAt).toISOString()
+    });
+    return apiError(
+      "rate_limit_error",
+      "every Anthropic credential in this deployment's pool is rate limited; " +
+        `the earliest resets at ${new Date(lead.retryAt).toISOString()}`,
+      429,
+      // The **real** wait, not the rotation's one second. There is nothing to
+      // rotate to, so shortening it here would only spin the client.
+      { "retry-after": String(Math.max(1, Math.ceil(waitMs / 1000))) }
+    );
+  };
 
   const handle = async (request: Request): Promise<Response> => {
     let url: URL;
@@ -253,12 +326,12 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
     /**
      * Anthropic over TLS, and only that, from here down.
      *
-     * Checked **before** the credential is read, let alone attached. Nothing
-     * stops a process in the container asking for `http://api.anthropic.com/…`,
-     * and this function would otherwise fetch it — putting the real
-     * subscription token on the wire in plaintext, from the Worker, at the
-     * request of code the workspace does not trust. The host matched; the
-     * scheme is the rest of the question.
+     * Checked **before** a credential is read, let alone attached. Nothing stops
+     * a process in the container asking for `http://api.anthropic.com/…`, and
+     * this function would otherwise fetch it — putting a real subscription token
+     * on the wire in plaintext, from the Worker, at the request of code the
+     * workspace does not trust. The host matched; the scheme is the rest of the
+     * question.
      */
     if (url.protocol !== "https:") {
       console.warn(`[${tag}] refused a plaintext request to Anthropic`, {
@@ -273,45 +346,8 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
       );
     }
 
-    if (config.budget && url.pathname.startsWith(MESSAGES_PATH)) {
-      const verdict = await config.budget
-        .check()
-        .catch((err: unknown) => ({ ok: false as const, reason: String(err) }));
-
-      if (!verdict.ok) {
-        console.warn(`[${tag}] refused a model call over budget`, {
-          reason: verdict.reason
-        });
-        /**
-         * 429, and **no `retry-after`**.
-         *
-         * The status is honest — this is a rate limit — and Claude Code renders
-         * it as a `system/api_retry` event with `error: "rate_limit"`, which the
-         * drain surfaces as progress, so the run that ends shortly afterwards is
-         * explained rather than mysterious.
-         *
-         * The missing header is the deliberate part. A `retry-after` we invent
-         * would make the client sleep *inside the container*, on the Looping
-         * chunk's clock — the one budget this gateway cannot see. Without it the
-         * client's own short backoff runs out quickly and the run fails cleanly,
-         * which is what an exhausted budget should look like.
-         */
-        return apiError("rate_limit_error", verdict.reason, 429);
-      }
-    }
-
-    const credential = config.credential();
-    if (!credential) {
-      // Fail rather than forward the placeholder. Upstream would refuse it
-      // anyway, and it would refuse it as an authentication error — sending an
-      // operator to rotate a credential when the real fault is a missing secret.
-      console.error(`[${tag}] no credential configured; refusing to forward`);
-      return apiError(
-        "authentication_error",
-        "the egress gateway has no Anthropic credential configured",
-        500
-      );
-    }
+    const lead = await pool.lead();
+    if (!lead.ok) return spent(lead);
 
     /**
      * The swap, and it is the whole point of the file.
@@ -323,11 +359,105 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
      * `claude-code-20250219` and `oauth-2025-04-20`, almost certainly part of
      * what marks the request as coming from the client) and the `user-agent`
      * are not ours to normalise or reorder.
+     *
+     * Claude Code also sends an unauthenticated `HEAD /api/hello` preflight.
+     * It gets a credential too, harmlessly, and nothing keys on the path: a
+     * bucket that is empty is empty for every endpoint.
      */
-    headers.set("authorization", `Bearer ${credential}`);
+    headers.set("authorization", `Bearer ${lead.token}`);
     headers.delete("x-api-key");
 
-    return await fetch(new Request(url, new Request(request, { headers })));
+    const response = await fetch(
+      new Request(url, new Request(request, { headers }))
+    );
+
+    // The overwhelming majority: a normal answer, streamed straight back with
+    // its body untouched. Nothing below this line runs on the hot path.
+    if (
+      response.status !== 429 &&
+      response.status !== 401 &&
+      response.status !== 403
+    ) {
+      return response;
+    }
+
+    return await rotate(request, response, lead.index);
+  };
+
+  /**
+   * Read a refusal, move the lead if it earned one, and shape what the client
+   * sees so its own retry lands on the new credential.
+   */
+  const rotate = async (
+    request: Request,
+    response: Response,
+    index: number
+  ): Promise<Response> => {
+    const at = now();
+    const verdict = readRefusal(response, at);
+
+    /**
+     * Capture the whole thing, every time.
+     *
+     * **No genuine subscription-exhaustion `429` has ever been observed through
+     * this path** — the Phase 0 spike's 429s were the raw-API refusal, which is
+     * a different response — so the rules in `readRefusal` are inferences from
+     * the documented API rate limits. This log is the instrument that replaces
+     * them with a fact, and it costs nothing: these statuses are rare, and the
+     * body of one is a few hundred bytes.
+     */
+    const body = await response
+      .clone()
+      .text()
+      .then((text) => text.slice(0, CAPTURE_BYTES))
+      .catch(() => "<unreadable>");
+    console.warn(`[${tag}] Anthropic refused a request`, {
+      status: response.status,
+      method: request.method,
+      credential: index,
+      verdict: verdict?.kind ?? "unrecognised",
+      headers: headerMap(response.headers),
+      body
+    });
+
+    // Unrecognised, or an ordinary slow-down: not this credential's fault, so
+    // forward it exactly as it came. Rotating on a speed bump would retire a
+    // working credential for whatever window the header happened to name.
+    if (!verdict || verdict.kind === "transient") return response;
+
+    const next =
+      verdict.kind === "invalid"
+        ? await pool.reject(index)
+        : await pool.spend(index, verdict.resetAt);
+
+    if (!next.ok) return spent(next);
+
+    console.warn(`[${tag}] rotated to the next credential`, {
+      from: index,
+      to: next.index,
+      reason: verdict.kind
+    });
+
+    /**
+     * A `429` with a one-second `retry-after`, whatever the upstream status was.
+     *
+     * The status is rewritten for the `invalid` case and that is deliberate: a
+     * client does not retry a `401`, so passing one through would fail the run
+     * on a credential we have already stopped using. From the client's point of
+     * view "this did not work, try again shortly" is exactly true — the next
+     * attempt carries a different credential — and the operator-facing detail is
+     * in the log line above, which names the rejection explicitly.
+     */
+    return apiError(
+      "rate_limit_error",
+      verdict.kind === "invalid"
+        ? "that Anthropic credential was rejected; the gateway has moved to " +
+            "the next one in the pool — retry"
+        : "that Anthropic credential's limit is reached; the gateway has moved " +
+            "to the next one in the pool — retry",
+      429,
+      { "retry-after": ROTATED_RETRY_AFTER }
+    );
   };
 
   return {
@@ -336,7 +466,7 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
     connect(): never {
       throw new Error(
         "the claude-code egress gateway is HTTP only; a raw socket cannot be " +
-          "credential-swapped or budget-gated, so it is refused rather than " +
+          "credential-swapped or rotated, so it is refused rather than " +
           "silently passed through"
       );
     }

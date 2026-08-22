@@ -1,5 +1,3 @@
-import type { EgressBudget } from "./egress.js";
-
 /**
  * Everything one `claude-coder` deployment tunes, in one shape.
  *
@@ -10,18 +8,38 @@ import type { EgressBudget } from "./egress.js";
  */
 export interface ClaudeCodeConfig {
   /**
-   * The real Anthropic credential, as a thunk.
+   * The credential pool, in priority order — index 0 is tried first.
    *
    * A thunk so a rotated secret is picked up without rebuilding the plugin list.
-   * **This value never enters the container** — it is read on the Worker side by
-   * the egress gateway and swapped into the outbound request. The container gets
-   * {@link file://./run.ts CREDENTIAL_PLACEHOLDER}.
+   * **These values never enter the container** — one is read on the Worker side
+   * by the egress gateway and swapped into the outbound request. The container
+   * gets {@link file://./run.ts CREDENTIAL_PLACEHOLDER}.
    *
-   * A `claude setup-token` OAuth credential. There is deliberately no API-key
+   * `claude setup-token` OAuth credentials. There is deliberately no API-key
    * path: the subscription credential is the one that reaches frontier models
    * through this client, and a second path would be a second thing to get wrong.
+   *
+   * **Why a pool.** A subscription has a rolling 5-hour bucket and a weekly one,
+   * neither readable. Rather than estimate spend against them, the gateway uses
+   * the first usable entry and moves on when Anthropic says that one is done —
+   * see {@link file://./credentials.ts}. An array of one is valid and behaves
+   * exactly as a single credential did: used until its bucket empties, then
+   * refused with the reset time.
    */
-  credential: () => string;
+  credentials: () => readonly string[];
+
+  /**
+   * Which workspace this agent's sessions run in.
+   *
+   * Resolved on the **parent**, where the verified caller is known: core
+   * dispatches `resolveRuntime` to the plugin that declared the subtask type,
+   * which is this one, and the value it writes is how the subagent facet learns
+   * which Durable Object holds its checkout. A facet cannot work this out for
+   * itself — `callerKey()` throws there by design — and it is deliberately not a
+   * subtask param, because a model-authored workspace name would let a model
+   * name somebody else's.
+   */
+  workspaceName: () => string;
 
   /** Which model the session runs. Unset, Claude Code picks its own default. */
   model?: string;
@@ -30,8 +48,8 @@ export interface ClaudeCodeConfig {
    * Ceiling on the *outer* session's turns.
    *
    * Advisory. Claude Code's own subagent tree multiplies whatever this says, and
-   * the tree is invisible to Looping's scheduler. {@link budget} is the ceiling
-   * that holds, because every inner call crosses the same gateway.
+   * the tree is invisible to Looping's scheduler. {@link timeoutMs} is the
+   * ceiling that actually holds, because the container runtime enforces it.
    */
   maxTurns?: number;
 
@@ -52,9 +70,6 @@ export interface ClaudeCodeConfig {
    * forge token stays on the Worker side.
    */
   restrictToHosts?: readonly string[];
-
-  /** The spend gate the egress gateway consults before every model call. */
-  budget?: EgressBudget;
 
   /**
    * How long one chunk blocks before checkpointing and yielding.
