@@ -381,7 +381,7 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
       return response;
     }
 
-    return await rotate(request, response, lead.index);
+    return await rotate(request, response, lead.id, lead.index);
   };
 
   /**
@@ -391,6 +391,9 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
   const rotate = async (
     request: Request,
     response: Response,
+    /** Which credential sent this — see `CredentialPool.spend`. */
+    id: string,
+    /** Its slot, for the log line only. An operator reads "1", not a hash. */
     index: number
   ): Promise<Response> => {
     const at = now();
@@ -427,8 +430,8 @@ export function claudeCodeEgress(config: EgressConfig): Fetcher {
 
     const next =
       verdict.kind === "invalid"
-        ? await pool.reject(index)
-        : await pool.spend(index, verdict.resetAt);
+        ? await pool.reject(id)
+        : await pool.spend(id, verdict.resetAt);
 
     if (!next.ok) return spent(next);
 

@@ -181,8 +181,13 @@ rotation and saves a Durable Object class, a binding and a migration.
   "migrations": [
     { "tag": "v5", "new_sqlite_classes": ["ClaudeCoderWorkspaceDO"] }
   ],
-  // The pool, in priority order. One is valid; more is what makes rotation
-  // worth having.
+  // The pool, in priority order — **exactly the credentials you have**.
+  //
+  // `secrets.required` drives type generation and `wrangler dev`'s
+  // missing-secret warnings, so a name listed here and left unset is typed as a
+  // definite string that is undefined at runtime, and warns on every local run.
+  // For a single-credential deployment, drop `_2` from this list *and* from the
+  // `credentials` array below — they are one change, not two.
   "secrets": {
     "required": ["CLAUDE_CODE_OAUTH_TOKEN_1", "CLAUDE_CODE_OAUTH_TOKEN_2"]
   }
@@ -201,8 +206,10 @@ The workspace Durable Object installs the gateway as its egress policy:
 
 ```ts
 readonly #session = claudeCodeSession({
-  // Order is priority. One entry is fine; `.filter(Boolean)` lets a deployment
-  // leave the second secret unset.
+  // Order is priority, and this example is a rotating deployment: two entries.
+  // One is a complete deployment too — it simply gives up when its bucket empties
+  // instead of rotating. `.filter(Boolean)` is defence against a secret that is
+  // declared and unset, not a substitute for declaring the right ones.
   credentials: () =>
     [
       this.env.CLAUDE_CODE_OAUTH_TOKEN_1,

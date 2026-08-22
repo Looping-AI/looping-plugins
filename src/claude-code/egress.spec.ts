@@ -535,6 +535,28 @@ describe("credential rotation", () => {
   });
 
   /**
+   * A 403 is a permission error for what was *asked for*, not a verdict on the
+   * credential. Retiring on it would turn a configuration mistake — a model the
+   * subscription cannot reach — into a permanent pool-wide outage, because every
+   * credential 403s in turn and `dead` is the one state nothing clears.
+   *
+   * The gateway still logs it whole, which is how a real one gets characterised.
+   */
+  it("does not drain the pool on a 403", async () => {
+    const sent = stubPerCredential(() => new Response("nope", { status: 403 }));
+    const egress = rotating();
+
+    const first = await egress.fetch(modelCall());
+    const second = await egress.fetch(modelCall());
+
+    // Forwarded exactly as it came, and the same credential is still the lead.
+    expect(first.status).toBe(403);
+    expect(await first.text()).toBe("nope");
+    expect(sent[1]!.headers.get("authorization")).toBe(`Bearer ${REAL}`);
+    expect(second.status).toBe(403);
+  });
+
+  /**
    * The hot path. A successful model call is a streamed SSE body that must reach
    * the container untouched — inspecting it, or cloning it to look, would be
    * paid on every response rather than on the rare refusal.

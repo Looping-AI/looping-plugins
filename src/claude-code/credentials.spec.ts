@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   credentialPool,
+  fingerprint,
   readRefusal,
   type CredentialState,
   type CredentialStore
@@ -45,17 +46,27 @@ function pool(tokens: readonly string[], at = 1_000_000) {
   };
 }
 
+/** The id a token will be stored under. */
+const idOf = (token: string) => fingerprint(token);
+
+/** Resolve a lead to the id it names, so mutations can be keyed on it. */
+async function leadId(p: { lead(): Promise<unknown> }): Promise<string> {
+  const lead = (await p.lead()) as { ok: boolean; id?: string };
+  if (!lead.ok || !lead.id) throw new Error("expected a usable lead");
+  return lead.id;
+}
+
 describe("picking a lead", () => {
   it("uses the first entry, because order is priority", async () => {
     const { pool: p } = pool([A, B]);
-    expect(await p.lead()).toEqual({ ok: true, index: 0, token: A });
+    expect(await p.lead()).toMatchObject({ ok: true, index: 0, token: A });
   });
 
   it("skips an empty slot rather than handing back an empty token", async () => {
     // `[env.TOKEN_1, env.TOKEN_2]` with the second secret unset is the ordinary
     // one-credential deployment, and it must not forward an empty `Bearer `.
     const { pool: p } = pool(["", B]);
-    expect(await p.lead()).toEqual({ ok: true, index: 1, token: B });
+    expect(await p.lead()).toMatchObject({ ok: true, index: 1, token: B });
   });
 
   it("reports nothing recoverable when the pool is empty", async () => {
@@ -69,17 +80,17 @@ describe("picking a lead", () => {
 describe("spending an entry", () => {
   it("advances the lead and says where it landed", async () => {
     const { pool: p } = pool([A, B]);
-    const next = await p.spend(0, 1_000_000 + 60 * 60_000);
-    expect(next).toEqual({ ok: true, index: 1, token: B });
+    const next = await p.spend(await idOf(A), 1_000_000 + 60 * 60_000);
+    expect(next).toMatchObject({ ok: true, index: 1, token: B });
   });
 
   it("brings a spent entry back by itself once its reset passes", async () => {
     const { pool: p, advance } = pool([A]);
-    await p.spend(0, 1_000_000 + 120_000);
+    await p.spend(await idOf(A), 1_000_000 + 120_000);
 
     expect(await p.lead()).toEqual({ ok: false, retryAt: 1_120_000 });
     advance(121_000);
-    expect(await p.lead()).toEqual({ ok: true, index: 0, token: A });
+    expect(await p.lead()).toMatchObject({ ok: true, index: 0, token: A });
   });
 
   /**
@@ -89,8 +100,8 @@ describe("spending an entry", () => {
    */
   it("never shortens a reset that is already further out", async () => {
     const { pool: p, store } = pool([A]);
-    await p.spend(0, 1_000_000 + 4 * 60 * 60_000);
-    await p.spend(0, 1_000_000 + 60_000);
+    await p.spend(await idOf(A), 1_000_000 + 4 * 60 * 60_000);
+    await p.spend(await idOf(A), 1_000_000 + 60_000);
 
     expect(store.states()[0]!.resetAt).toBe(1_000_000 + 4 * 60 * 60_000);
   });
@@ -101,9 +112,9 @@ describe("spending an entry", () => {
    */
   it("reports the earliest reset when everything is spent", async () => {
     const { pool: p } = pool([A, B, C]);
-    await p.spend(0, 5_000_000);
-    await p.spend(1, 2_000_000);
-    const last = await p.spend(2, 9_000_000);
+    await p.spend(await idOf(A), 5_000_000);
+    await p.spend(await idOf(B), 2_000_000);
+    const last = await p.spend(await idOf(C), 9_000_000);
 
     expect(last).toEqual({ ok: false, retryAt: 2_000_000 });
   });
@@ -112,67 +123,188 @@ describe("spending an entry", () => {
 describe("rejecting an entry", () => {
   it("takes it out for good, not until a reset", async () => {
     const { pool: p, advance } = pool([A, B]);
-    await p.reject(0);
+    await p.reject(await idOf(A));
     advance(365 * 24 * 60 * 60_000);
 
     // A revoked credential does not heal on a timer. Collapsing `dead` into a
     // very distant `resetAt` would resurrect it eventually — quietly, and long
     // after anyone remembers why it was retired.
-    expect(await p.lead()).toEqual({ ok: true, index: 1, token: B });
+    expect(await p.lead()).toMatchObject({ ok: true, index: 1, token: B });
   });
 
   it("reports an all-rejected pool as unrecoverable, not as a wait", async () => {
     const { pool: p } = pool([A, B]);
-    await p.reject(0);
-    expect(await p.reject(1)).toEqual({ ok: false });
+    await p.reject(await idOf(A));
+    expect(await p.reject(await idOf(B))).toEqual({ ok: false });
   });
 });
 
 /**
- * Stored state is keyed by position and nothing else, so it can disagree with
- * the configured credentials the moment an operator edits the secrets. Trusting
- * it would leave a stale `resetAt` governing whichever token slid into that
- * index — quiet, and wrong in the direction of not calling the model.
+ * State follows the **credential**, not the slot.
+ *
+ * Position-keyed state looks fine until an operator edits the secrets, and it is
+ * then wrong at the worst possible moment: rotating a spent token is exactly
+ * what an operator does when the pool has stalled, and the fresh credential
+ * would inherit the old one's `resetAt` — or its `dead` flag, which nothing
+ * clears. The tests below are that failure, from three directions.
  */
 describe("state that no longer matches the credentials", () => {
-  it("ignores state past the end of a shortened pool", async () => {
-    const store = memoryStore([{ resetAt: 0 }, { resetAt: 9_999_999_999 }]);
+  /** The one that matters most: recovery by rotating a secret must work. */
+  it("does not hand a replaced credential its predecessor's state", async () => {
+    const store = memoryStore();
+    let token = A;
+    const p = credentialPool({
+      credentials: () => [token],
+      store,
+      now: () => 1_000_000
+    });
+
+    await p.reject(await idOf(A));
+    expect(await p.lead()).toEqual({ ok: false });
+
+    // The operator mints a fresh credential into the same secret. It must be
+    // tried — under position keys it would inherit `dead: true` and the pool
+    // would stay unusable with no way to clear it short of wiping storage.
+    token = B;
+    expect(await p.lead()).toMatchObject({ ok: true, index: 0, token: B });
+  });
+
+  /**
+   * The `.filter(Boolean)` case, which the README documents and which makes
+   * this a one-character mistake: drop the first secret and the second slides
+   * into index 0, inheriting a `resetAt` that was never about it.
+   */
+  it("keeps a credential's state with it when the pool shifts", async () => {
+    const store = memoryStore();
+    let tokens: string[] = [A, B];
+    const p = credentialPool({
+      credentials: () => tokens,
+      store,
+      now: () => 1_000_000
+    });
+
+    await p.spend(await idOf(A), 9_999_999_999);
+    tokens = [B];
+
+    // B is untouched, so it leads — and it must not have picked up A's reset.
+    expect(await p.lead()).toMatchObject({ ok: true, index: 0, token: B });
+  });
+
+  it("ignores state for a credential that is no longer configured", async () => {
+    const store = memoryStore([
+      { id: await idOf(C), resetAt: 9_999_999_999, dead: true }
+    ]);
     const p = credentialPool({
       credentials: () => [A],
       store,
       now: () => 1_000_000
     });
-    await p.spend(0, 1_000_000 + 60_000);
-    expect(store.states()).toHaveLength(1);
+    expect(await p.lead()).toMatchObject({ ok: true, index: 0, token: A });
   });
 
   it("treats a newly added credential as usable", async () => {
-    const store = memoryStore([{ resetAt: 9_999_999_999 }]);
+    const store = memoryStore([{ id: await idOf(A), resetAt: 9_999_999_999 }]);
     const p = credentialPool({
       credentials: () => [A, B],
       store,
       now: () => 1_000_000
     });
-    expect(await p.lead()).toEqual({ ok: true, index: 1, token: B });
+    expect(await p.lead()).toMatchObject({ ok: true, index: 1, token: B });
   });
 
   /**
-   * A store that cannot be read is not a reason to refuse every request: the
-   * cost of retrying the pool from the top is one 429 per entry, and the cost of
-   * failing closed is a workspace that can never call a model again.
+   * A refusal arrives after an `await`, so the pool can be reconfigured between
+   * the request going out and the answer coming back. Marking the *slot* would
+   * then spend whichever credential had moved into it.
    */
-  it("falls back to an empty map when the store throws", async () => {
+  it("is a no-op when the refused credential is gone", async () => {
+    const store = memoryStore();
+    let tokens: string[] = [A];
     const p = credentialPool({
-      credentials: () => [A],
-      store: {
-        read: async () => {
-          throw new Error("storage unavailable");
-        },
-        write: async () => {}
-      },
+      credentials: () => tokens,
+      store,
       now: () => 1_000_000
     });
-    expect(await p.lead()).toEqual({ ok: true, index: 0, token: A });
+    const stale = await idOf(C);
+
+    tokens = [A];
+    expect(await p.spend(stale, 9_999_999_999)).toMatchObject({
+      ok: true,
+      token: A
+    });
+  });
+});
+
+/**
+ * A storage outage must not become a hot retry loop.
+ *
+ * This is the failure mode both halves below share, and it is worse than losing
+ * the state: the gateway rotates, tells the client to retry in a second, and the
+ * retry lands on the same spent credential — a one-second loop against a bucket
+ * already known to be empty, for as long as the outage lasts.
+ *
+ * The fix is a process-local mirror, merged with storage rather than chosen
+ * over it. Both fields are monotonic, so the merge cannot lose information in
+ * either direction.
+ */
+describe("when storage is unavailable", () => {
+  const brokenRead = (): CredentialStore => ({
+    read: async () => {
+      throw new Error("storage unavailable");
+    },
+    write: async () => {}
+  });
+
+  // Reads fine, never persists — so storage stays permanently empty and only the
+  // mirror carries what the gateway has already promised the client.
+  const brokenWrite = (): CredentialStore => ({
+    read: async () => [],
+    write: async () => {
+      throw new Error("storage unavailable");
+    }
+  });
+
+  /**
+   * Failing open on the *first* read is deliberate: the cost of being wrong is
+   * one 429 per entry, and the cost of failing closed is a workspace that can
+   * never call a model again.
+   */
+  it("still hands out a lead on a read failure", async () => {
+    const p = credentialPool({
+      credentials: () => [A],
+      store: brokenRead(),
+      now: () => 1_000_000
+    });
+    expect(await p.lead()).toMatchObject({ ok: true, index: 0, token: A });
+  });
+
+  it("remembers a rotation across a read failure", async () => {
+    const p = credentialPool({
+      credentials: () => [A, B],
+      store: brokenRead(),
+      now: () => 1_000_000
+    });
+
+    await p.spend(await leadId(p), 9_999_999_999);
+
+    // Without the mirror this snaps back to A on every request, and the client
+    // retries into it once a second until the session times out.
+    expect(await p.lead()).toMatchObject({ ok: true, index: 1, token: B });
+  });
+
+  it("remembers a rotation the write could not persist", async () => {
+    const p = credentialPool({
+      credentials: () => [A, B],
+      store: brokenWrite(),
+      now: () => 1_000_000
+    });
+
+    const next = await p.spend(await leadId(p), 9_999_999_999);
+
+    // The gateway has already told the client "retry, I have moved on". That
+    // promise has to survive the next request, or it was a lie.
+    expect(next).toMatchObject({ ok: true, token: B });
+    expect(await p.lead()).toMatchObject({ ok: true, index: 1, token: B });
   });
 });
 
@@ -267,10 +399,30 @@ describe("reading a refusal", () => {
     expect(verdict?.kind).toBe("exhausted");
   });
 
-  it.each([401, 403])("reads %i as an invalid credential", (status) => {
-    expect(readRefusal(new Response(null, { status }), NOW)).toEqual({
+  it("reads 401 as an invalid credential", () => {
+    expect(readRefusal(new Response(null, { status: 401 }), NOW)).toEqual({
       kind: "invalid"
     });
+  });
+
+  /**
+   * **403 is not 401**, and conflating them is how a typo becomes an outage.
+   *
+   * Anthropic returns `401 authentication_error` for a credential it does not
+   * accept, and `403 permission_error` for a credential that is fine but may not
+   * have the thing being asked for. Retiring on the second turns a
+   * *configuration* mistake — a model the subscription cannot reach — into a
+   * permanent, pool-wide failure: every credential 403s in turn, every one is
+   * marked `dead`, and `dead` is the one state nothing clears on its own. An
+   * operator would have to delete Durable Object storage to recover from it.
+   *
+   * So it is left unclassified, which forwards it untouched and logs it whole —
+   * the same treatment every other unrecognised refusal gets.
+   */
+  it("does not retire a credential on a 403", () => {
+    expect(
+      readRefusal(new Response(null, { status: 403 }), NOW)
+    ).toBeUndefined();
   });
 
   /**

@@ -40,8 +40,46 @@
  * on a timer or retire a good one permanently.
  */
 export interface CredentialState {
+  /**
+   * Which credential this state describes — see {@link fingerprint}.
+   *
+   * **It binds the state to a credential rather than to a slot**, and that is
+   * the whole reason it exists. State keyed by array position looks fine until
+   * an operator edits the secrets, and then it is quietly wrong at the worst
+   * possible moment: rotating a spent token — the exact thing an operator does
+   * when the pool has stalled — would leave the fresh credential inheriting the
+   * old one's `resetAt`, or its `dead` flag, which nothing clears. Removing the
+   * first secret so the second slides down has the same effect, and the
+   * documented `.filter(Boolean)` pattern makes that a one-character change.
+   *
+   * Keying on the credential fixes reordering for free, and makes a replaced
+   * credential simply *unknown* — which is the fail-open direction, and the
+   * right one: an unknown credential gets tried.
+   */
+  id: string;
   resetAt: number;
   dead?: boolean;
+}
+
+/**
+ * A stable, non-secret identifier for a credential.
+ *
+ * The first eight bytes of its SHA-256, hex-encoded. **Not the token, and not a
+ * slice of it** — this is written to durable storage, so anything derived by
+ * truncating the credential itself would put credential material there, which is
+ * the one thing this whole package exists to avoid.
+ *
+ * Truncated because the job is telling two or three credentials apart, not
+ * resisting a preimage attack.
+ */
+export async function fingerprint(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(token)
+  );
+  return [...new Uint8Array(digest).slice(0, 8)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /**
@@ -66,18 +104,25 @@ export interface CredentialStore {
  * second as the first.
  */
 export type Lead =
-  { ok: true; index: number; token: string } | { ok: false; retryAt?: number };
+  | { ok: true; index: number; id: string; token: string }
+  | { ok: false; retryAt?: number };
 
 export interface CredentialPool {
   /** The entry to use for the next request. Reads storage; writes nothing. */
   lead(): Promise<Lead>;
   /**
-   * Entry `index`'s bucket is empty until `resetAt`. Returns the new lead, so a
-   * caller learns in one round trip whether rotation actually got it anywhere.
+   * This credential's bucket is empty until `resetAt`. Returns the new lead, so
+   * a caller learns in one round trip whether rotation got it anywhere.
+   *
+   * Keyed on {@link Lead.id}, never on the index the caller was handed. A
+   * refusal arrives after an `await`, and the pool can have been reconfigured in
+   * between — an index would then mark whichever credential had moved into that
+   * slot, which is the same class of mistake `id` exists to prevent. An id no
+   * longer in the pool is a no-op, which is exactly right.
    */
-  spend(index: number, resetAt: number): Promise<Lead>;
-  /** Entry `index` is not a valid credential — revoked or malformed, not spent. */
-  reject(index: number): Promise<Lead>;
+  spend(id: string, resetAt: number): Promise<Lead>;
+  /** This credential is not valid — revoked, not spent. See {@link spend}. */
+  reject(id: string): Promise<Lead>;
 }
 
 export interface CredentialPoolConfig {
@@ -85,10 +130,16 @@ export interface CredentialPoolConfig {
    * The pool, in priority order. Index 0 is tried first.
    *
    * A thunk for the same reason the single credential was one: a rotated secret
-   * is picked up without rebuilding the plugin list. Empty strings are ignored,
-   * so a deployment with one token can pass
-   * `[env.TOKEN_1, env.TOKEN_2].filter(Boolean)` — or not filter at all — and
-   * the pool degrades to today's single-credential behaviour.
+   * is picked up without rebuilding the plugin list — and rotating one **does**
+   * work, because state is keyed on the credential rather than the slot (see
+   * {@link CredentialState.id}).
+   *
+   * Empty strings are skipped rather than sent as a bare `Bearer `, which is
+   * defence against a secret that is declared and unset. It is not a substitute
+   * for declaring the right ones: a host that lists a secret it does not have
+   * gets a definite-string type for an undefined value, and a warning on every
+   * local run. An array of one is a complete deployment — it simply gives up
+   * when its bucket empties instead of rotating.
    */
   credentials: () => readonly string[];
   store: CredentialStore;
@@ -96,44 +147,92 @@ export interface CredentialPoolConfig {
 }
 
 /**
- * Line up persisted state with the configured credentials.
+ * Fold two views of one credential's state together.
  *
- * The two can disagree — an operator adds a third token, or removes the second —
- * and the stored array is keyed by nothing but position. So it is truncated and
- * padded to the current length rather than trusted. The failure this avoids is
- * quiet and bad: a shortened pool would otherwise leave a stale `resetAt`
- * governing whichever credential slid into that index.
+ * Safe to apply in any order and any number of times, because both fields are
+ * **monotonic**: `resetAt` only moves later (a bucket does not un-empty early)
+ * and `dead` only turns on. That is what lets storage and the in-memory mirror
+ * below be merged rather than one of them being chosen — there is no ordering in
+ * which the merge loses information.
  */
-function align(
-  stored: readonly CredentialState[],
-  count: number
-): CredentialState[] {
-  return Array.from({ length: count }, (_, i) => stored[i] ?? { resetAt: 0 });
+function merge(a: CredentialState, b: CredentialState): CredentialState {
+  const dead = a.dead === true || b.dead === true;
+  return {
+    id: a.id,
+    resetAt: Math.max(a.resetAt, b.resetAt),
+    ...(dead ? { dead: true } : {})
+  };
 }
 
 export function credentialPool(config: CredentialPoolConfig): CredentialPool {
   const now = config.now ?? Date.now;
 
+  /** Fingerprints are stable per token; hashing every request would be waste. */
+  const ids = new Map<string, string>();
+  const idFor = async (token: string): Promise<string> => {
+    const known = ids.get(token);
+    if (known !== undefined) return known;
+    const id = await fingerprint(token);
+    ids.set(token, id);
+    return id;
+  };
+
+  /**
+   * The last state this isolate knows of, held in memory.
+   *
+   * Not a cache — storage is still read every time and wins where it is ahead.
+   * This is what makes a **storage failure survivable** rather than a hot loop,
+   * and both directions matter:
+   *
+   * - A failed *read* would otherwise report every credential fresh, so the lead
+   *   snaps back to entry 0 on every request. The gateway rotates, tells the
+   *   client to retry in a second, and the retry lands on entry 0 again — a
+   *   one-second loop against a bucket already known to be empty, for as long as
+   *   the outage lasts.
+   * - A failed *write* would otherwise let the gateway advertise a rotation that
+   *   the next request cannot see, which is the same loop reached the other way.
+   *
+   * Merging rather than preferring either side is what makes this correct
+   * without tracking which of the two is stale; see {@link merge}.
+   */
+  let mirror: CredentialState[] = [];
+
   const load = async (): Promise<{
     tokens: readonly string[];
+    keys: string[];
     states: CredentialState[];
   }> => {
     const tokens = config.credentials();
+    const keys = await Promise.all(
+      tokens.map((token) => (token ? idFor(token) : Promise.resolve("")))
+    );
+
     const stored = await config.store.read().catch((err: unknown) => {
-      // A store that cannot be read is not a reason to refuse every request:
-      // treat it as "nothing known yet", which retries the whole pool from the
-      // top. The cost of being wrong is one 429 per entry; the cost of failing
-      // closed here is a workspace that can never call a model again.
       console.error("[claude-code] could not read the credential pool", {
         err: String(err)
       });
       return [] as CredentialState[];
     });
-    return { tokens, states: align(stored, tokens.length) };
+
+    // Keyed by credential, never by slot. State for a credential that is no
+    // longer configured is simply never looked up, and a credential with no
+    // state is unknown — which is the fail-open direction, and the right one: an
+    // unknown credential gets tried.
+    const known = new Map<string, CredentialState>();
+    for (const state of [...stored, ...mirror]) {
+      if (!state?.id) continue;
+      const previous = known.get(state.id);
+      known.set(state.id, previous ? merge(previous, state) : state);
+    }
+
+    const states = keys.map((id) => known.get(id) ?? { id, resetAt: 0 });
+    mirror = states;
+    return { tokens, keys, states };
   };
 
   const pick = (
     tokens: readonly string[],
+    keys: readonly string[],
     states: readonly CredentialState[]
   ): Lead => {
     const at = now();
@@ -144,7 +243,9 @@ export function credentialPool(config: CredentialPoolConfig): CredentialPool {
       const state = states[i];
       if (!token || state?.dead) continue;
       const resetAt = state?.resetAt ?? 0;
-      if (resetAt <= at) return { ok: true, index: i, token };
+      if (resetAt <= at) {
+        return { ok: true, index: i, id: keys[i] ?? "", token };
+      }
       // Not usable yet, but it will be — a candidate for what to tell a human.
       if (earliest === undefined || resetAt < earliest) earliest = resetAt;
     }
@@ -155,33 +256,39 @@ export function credentialPool(config: CredentialPoolConfig): CredentialPool {
   };
 
   const update = async (
-    index: number,
+    id: string,
     change: (state: CredentialState) => CredentialState
   ): Promise<Lead> => {
-    const { tokens, states } = await load();
-    if (index >= 0 && index < states.length) {
-      states[index] = change(states[index] ?? { resetAt: 0 });
+    const { tokens, keys, states } = await load();
+    const index = keys.indexOf(id);
+
+    // An id that is no longer configured: the operator replaced that credential
+    // between the request going out and its refusal coming back. There is
+    // nothing to mark, and marking the slot instead is the bug `id` exists to
+    // prevent — so this returns the current lead and moves on.
+    if (id && index >= 0) {
+      states[index] = change(states[index] ?? { id, resetAt: 0 });
+      // The mirror is updated **before** the write is attempted, so a write that
+      // fails still changes what this isolate does next.
+      mirror = states;
       await config.store.write(states).catch((err: unknown) => {
-        // Losing the write costs one wasted 429 the next time round, which the
-        // next refusal corrects. Failing the request over it would turn a
-        // recoverable rotation into a failed run.
         console.error("[claude-code] could not persist the credential pool", {
-          index,
+          id,
           err: String(err)
         });
       });
     }
-    return pick(tokens, states);
+    return pick(tokens, keys, states);
   };
 
   return {
     async lead(): Promise<Lead> {
-      const { tokens, states } = await load();
-      return pick(tokens, states);
+      const { tokens, keys, states } = await load();
+      return pick(tokens, keys, states);
     },
 
-    spend(index: number, resetAt: number): Promise<Lead> {
-      return update(index, (state) => ({
+    spend(id: string, resetAt: number): Promise<Lead> {
+      return update(id, (state) => ({
         ...state,
         // `max`, never plain assignment. Two concurrent requests can both be
         // refused and both report a reset, and the staler one must not make a
@@ -190,8 +297,8 @@ export function credentialPool(config: CredentialPoolConfig): CredentialPool {
       }));
     },
 
-    reject(index: number): Promise<Lead> {
-      return update(index, (state) => ({ ...state, dead: true }));
+    reject(id: string): Promise<Lead> {
+      return update(id, (state) => ({ ...state, dead: true }));
     }
   };
 }
@@ -207,6 +314,24 @@ export type Refusal =
   | { kind: "exhausted"; resetAt: number }
   | { kind: "invalid" }
   | { kind: "transient"; retryAfterMs: number };
+
+/**
+ * The only status that retires a credential.
+ *
+ * **401 alone, and deliberately not 403.** Anthropic returns `401
+ * authentication_error` for a credential it does not accept, and `403
+ * permission_error` for a credential that is fine but may not have the thing
+ * being asked for. Reading the second as "this credential is bad" turns a
+ * *configuration* mistake — a model the subscription cannot reach, say — into a
+ * permanent, pool-wide outage: every credential 403s in turn, every one is
+ * retired, and `dead` is the one state nothing clears on its own. An operator
+ * would have to delete Durable Object storage to recover from a typo.
+ *
+ * A 403 is therefore left unclassified: forwarded to the client untouched, and
+ * logged whole by the gateway. That is the same treatment every other
+ * unrecognised refusal gets, and for the same reason — see {@link readRefusal}.
+ */
+const INVALID_STATUS = 401;
 
 /**
  * Below this, a `429` is a speed bump rather than an empty bucket.
@@ -271,8 +396,7 @@ export function readRefusal(
   response: Response,
   at: number
 ): Refusal | undefined {
-  if (response.status === 401 || response.status === 403)
-    return { kind: "invalid" };
+  if (response.status === INVALID_STATUS) return { kind: "invalid" };
   if (response.status !== 429) return undefined;
 
   const headers = response.headers;
