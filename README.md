@@ -128,7 +128,7 @@ Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the ha
 `@loopingai/core/testing`.
 
 ```bash
-npm test          # 580 specs, no credentials and no network
+npm test          # the whole suite, no credentials and no network
 npm run check     # prettier + eslint + tsc + build
 npm run verify:exports
 ```
