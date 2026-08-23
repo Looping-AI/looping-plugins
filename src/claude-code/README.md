@@ -247,6 +247,70 @@ storage. Making it a field would force both of them to invent one.
 > the registry does not degrade the agent — it stops the container installing
 > anything. This is the main reason the default is open.
 
+### Your image must trust the interception CA
+
+This is the step that is easy to miss and expensive to diagnose, because
+nothing in this package can do it for you.
+
+`http-gateway` is implemented with `container.interceptAllOutboundHttp(…)` and
+`container.interceptOutboundHttps("*", …)`. Both take a `Fetcher`, so what is
+intercepted is the container's **HTTP and HTTPS** traffic, for every host — and
+the HTTPS half is _terminated and re-originated_ by Cloudflare's runtime rather
+than tunnelled. It presents a certificate signed by an ephemeral CA it mounts at
+`/etc/cloudflare/certs/cloudflare-containers-ca.crt`. The file exists only while
+the container runs, so it cannot be baked into the image — it has to be
+installed from the entrypoint, before anything starts:
+
+```dockerfile
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      'set -e' \
+      'CA=/etc/cloudflare/certs/cloudflare-containers-ca.crt' \
+      'if [ -r "$CA" ]; then' \
+      '  install -m 644 "$CA" /usr/local/share/ca-certificates/cf-containers-ca.crt' \
+      '  update-ca-certificates > /dev/null' \
+      '  NODE_EXTRA_CA_CERTS="$CA"; export NODE_EXTRA_CA_CERTS' \
+      'fi' \
+      'exec /usr/local/bin/computerd "$@"' \
+    > /usr/local/bin/entrypoint.sh \
+  && chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+```
+
+> **`update-ca-certificates` on its own is not enough.** Node carries its own
+> bundled root store and ignores the system one, and the two clients that
+> matter here are both Node: `npm ci` and Claude Code itself.
+> `NODE_EXTRA_CA_CERTS` is the line that actually unblocks them. The trust-store
+> update covers everything else a session shells out to — `curl`, `git` over
+> https, `pip`.
+
+No `|| true` on that line, deliberately. It is a required step, not a
+nicety — swallowing its failure leaves `curl`, `git` and `pip` unable to
+use intercepted HTTPS while the container comes up looking healthy, which
+resurfaces later as exactly the class of unattributable TLS error this whole
+section exists to prevent. `set -e` fails the entrypoint instead, and stderr is
+left alone so the reason is in the container's logs.
+
+Skip the CA entirely and the container has no working HTTPS client at all,
+which surfaces as two unrelated-looking failures with no mention of egress in
+either:
+
+| Client      | What you see                                                                                                            |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `npm ci`    | `npm error code SELF_SIGNED_CERT_IN_CHAIN`                                                                              |
+| `claude -p` | `API Error: Unable to connect to API: Self-signed certificate detected. Check your proxy or corporate SSL certificates` |
+
+Keep it conditional on the file being readable, as above, so one image can also
+serve a `mode: "direct"` agent and `wrangler dev`, where nothing is intercepted
+and the path does not exist.
+
+> **Non-HTTP TLS is a different question, not a solved one.** Interception is
+> HTTP-shaped, so a raw TLS connection — a database, SMTP — is not re-signed
+> with this CA and this section does not make it work. Under `http-gateway` the
+> container starts with `enableInternet: false`, so such a connection has
+> nowhere to go at all. Plan for that rather than expecting a certificate error.
+
 And the subagent drives the session:
 
 ```ts

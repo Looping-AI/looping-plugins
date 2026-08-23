@@ -14,6 +14,13 @@ import {
  * here. So this function sits on the **Worker side of the trust boundary** and
  * sees the whole of what the container tries to reach.
  *
+ * Intercepting HTTPS means terminating it, which has a cost this file does not
+ * pay and the container does: the runtime presents its own certificate, so an
+ * image that has not installed the interception CA has no working HTTPS client
+ * at all — not even `npm`. Nothing here can fix that from the Worker side; the
+ * image's entrypoint has to, and the README's "Your image must trust the
+ * interception CA" section is the whole of what that takes.
+ *
  * That position is what makes three otherwise-hard things easy, and they are the
  * reason this file exists rather than a plain allowlist:
  *
