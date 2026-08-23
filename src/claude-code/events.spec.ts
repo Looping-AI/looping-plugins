@@ -383,7 +383,7 @@ describe("toProgress", () => {
     expect(toProgress(events, 0)).toEqual([]);
   });
 
-  it("prefixes a turn with the tools it called", () => {
+  it("drops the tool names from a turn that also has text", () => {
     const buffer = line({
       type: "assistant",
       message: {
@@ -395,10 +395,27 @@ describe("toProgress", () => {
       }
     });
 
-    // De-duplicated: two Bash calls in one turn are one tool, named once.
-    expect(toProgress(parseStream(buffer).events, 0)[0]?.text).toBe(
-      "[Bash] checking"
-    );
+    // The tool names add nothing a reader can act on; only the prose posts.
+    expect(toProgress(parseStream(buffer).events, 0)[0]?.text).toBe("checking");
+  });
+
+  /**
+   * The actual bug this pair of tests guards: a turn that only calls tools —
+   * no text block at all — used to post as a bare `[Bash]`, one Slack message
+   * per tool call with nothing a reader could act on. It must produce no note.
+   */
+  it("says nothing for a turn that only calls tools", () => {
+    const buffer = line({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Bash", input: {} },
+          { type: "tool_use", name: "Read", input: {} }
+        ]
+      }
+    });
+
+    expect(toProgress(parseStream(buffer).events, 0)).toEqual([]);
   });
 
   it("clips a long turn rather than pasting an essay into the parent", () => {
