@@ -82,9 +82,17 @@ Two consequences worth stating outright:
 `binding` points at a class that owns the workspace and exposes two methods:
 
 - `__getWorkspaceStub()` — what `withWorkspace` from `@cloudflare/computer` installs.
-- `installStatus()` — how the dependency install is going, or `{ state: "idle" }`.
-  Required rather than optional: a host that installs but forgets to expose it would
-  otherwise get an `sb_exec` running against a half-built `node_modules`.
+- `advisories()` — everything currently true about the workspace that a caller must
+  not assume away, or `[]`. Required rather than optional: a host that forgets to
+  expose it would otherwise get an `sb_exec` running against a half-built
+  `node_modules`, or against a workspace silently dropping every write.
+
+  Build it with `deriveAdvisories({ install, storage, dependenciesPresent })` rather
+  than by hand — implementing this is gathering three values the host already has,
+  not writing policy. Which advisories reach which commands, whether one may hold a
+  command back, and how each is worded are decided here, in one place each. A host
+  that renders its own wording is re-deriving severity from an error string, which
+  is what this replaced.
 
 One workspace is one container is one repository, so `workspaceName` should derive
 from the verified caller and the repository — never from model input, or a model

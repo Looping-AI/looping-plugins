@@ -5,7 +5,6 @@ import { definePlugin } from "@loopingai/core";
 import type { AgentPlugin } from "@loopingai/core";
 import { getWorkspace, shellQuote } from "@cloudflare/computer";
 import type { WorkspaceClient, WorkspaceStub } from "@cloudflare/computer";
-import type { InstallState } from "./install.js";
 import { guardPath } from "./paths.js";
 import {
   cancelledNote,
@@ -21,12 +20,8 @@ import {
   readBounded,
   readWindow
 } from "./read.js";
-import {
-  execLostNote,
-  installGate,
-  needsDependencies,
-  type InstallGate
-} from "./gate.js";
+import { execGate, execLostNote, type ExecGate } from "./gate.js";
+import type { WorkspaceAdvisory } from "./advisory.js";
 
 /**
  * `@loopingai/plugins/computer` — a Linux container whose filesystem outlives it.
@@ -94,7 +89,25 @@ export {
   renderResult,
   truncateOutput
 } from "./render.js";
-export { needsDependencies } from "./gate.js";
+export { execGate, needsDependencies, type ExecGate } from "./gate.js";
+/**
+ * The workspace-advisory vocabulary, which a host needs all of: the type to
+ * return over RPC, `deriveAdvisories` to build it from what it already knows,
+ * and `sessionAdvisory` for a host driving a whole session rather than one
+ * command. `shapeOf` and `renderAdvisory` are exported for the specs that hold
+ * their exhaustiveness — a host has no reason to call either, since calling them
+ * would mean writing policy or wording that has one home already.
+ */
+export {
+  deriveAdvisories,
+  renderAdvisory,
+  sessionAdvisory,
+  shapeOf,
+  type AdvisoryAudience,
+  type AdvisoryInput,
+  type AdvisoryShape,
+  type WorkspaceAdvisory
+} from "./advisory.js";
 // A host implementing `InstallProbe` needs exactly this, and hand-rolling it
 // loses the fast path: across a Durable Object boundary `fs` is a stub carrying
 // `exists`, which a `stat`-only probe never asks for.
@@ -208,15 +221,19 @@ export interface WorkspaceHost extends Rpc.DurableObjectBranded {
   // Durable Object class fail to satisfy this interface.
   __getWorkspaceStub(): Promise<WorkspaceStub>;
   /**
-   * Where the host's dependency install has got to.
+   * Everything currently true about the workspace that a caller must not assume
+   * away — see {@link file://./advisory.ts}. An empty array is the good case.
    *
    * Required rather than optional, and not only because Workers RPC types an
-   * optional method as a union nothing can call. A host that installs nothing
-   * returns `{ state: "idle" }` in one line; a host that installs but forgot to
-   * expose it gets a compile error instead of an `sb_exec` that silently runs
-   * against a half-built `node_modules`.
+   * optional method as a union nothing can call. A host with nothing to report
+   * returns `[]` in one line; a host that forgot to expose it gets a compile
+   * error instead of an `sb_exec` that silently runs against a half-built
+   * `node_modules`, or against a workspace whose writes are being dropped.
+   *
+   * `deriveAdvisories` builds the array from what the host already knows, so
+   * implementing this is gathering three values rather than writing policy.
    */
-  installStatus(): Promise<InstallState>;
+  advisories(): Promise<WorkspaceAdvisory[]>;
 }
 
 /**
@@ -415,7 +432,7 @@ export interface ComputerConfig {
 export function buildComputerTools(
   workspace: () => Promise<WorkspaceClient>,
   config: ComputerConfig,
-  installStatus?: () => Promise<InstallState | undefined>
+  advisories?: () => Promise<readonly WorkspaceAdvisory[]>
 ): ToolSet {
   const cwd = config.cwd ?? DEFAULT_CWD;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -424,32 +441,33 @@ export function buildComputerTools(
   const env = config.env;
 
   /**
-   * Wait for a running install, up to the gate, and report a blockage if one
-   * outlives it.
+   * Wait out anything transient, up to the gate, and report whatever is left.
    *
-   * Polled rather than subscribed: the status lives in another Durable Object,
+   * Polled rather than subscribed: the state lives in another Durable Object,
    * there is no event to wait on, and the whole window is under two minutes.
    *
-   * **Only commands that need `node_modules` wait.** Holding every command means
-   * a `tail -c 200 README.md` queues behind an `npm ci` it has no use for.
-   * Reading a file, inspecting the tree and reading git history are exactly what
-   * a subagent can usefully do *while* an install runs, which is the reason the
-   * install is not in the round loop at all.
+   * **Read for every command, including the ones that need no dependencies.**
+   * That is a change of shape, not a slip. The filter that spares `cat
+   * README.md` from queueing behind an `npm ci` lives in `execGate`, where it
+   * applies per advisory — because a dependency install and a full workspace are
+   * not relevant to the same commands, and applying one filter to both is what
+   * made a workspace at its ceiling silent for exactly the commands whose writes
+   * it was dropping. The cost is one same-colo RPC on commands that previously
+   * skipped it, against a class of silent data loss.
    */
-  const awaitInstall = async (command: string): Promise<InstallGate> => {
-    if (!installStatus) return {};
-    if (!needsDependencies(command)) return {};
+  const awaitAdvisories = async (command: string): Promise<ExecGate> => {
+    if (!advisories) return {};
 
     // Fails **open**, and that belongs here rather than at the call site: this
-    // is a gate on somebody else's job, read over RPC to another Durable
-    // Object. An error reading it must not take out a working shell — running
-    // the command is exactly what would have happened before the gate existed,
-    // and a spurious "install still running" would strand the subagent.
-    const read = async (): Promise<InstallState | undefined> => {
+    // is a read of another Durable Object's state. An error must not take out a
+    // working shell — running the command is exactly what would have happened
+    // before the gate existed, and a spurious blockage would strand the
+    // subagent.
+    const read = async (): Promise<readonly WorkspaceAdvisory[]> => {
       try {
-        return await installStatus();
+        return await advisories();
       } catch {
-        return undefined;
+        return [];
       }
     };
 
@@ -458,13 +476,16 @@ export function buildComputerTools(
     // documented to be: at a 100 ms gate the loop still slept the full three
     // seconds before looking again, so a public timeout overshot by 30×.
     const deadline = Date.now() + gateMs;
-    let status = await read();
-    while (status?.state === "running" && Date.now() < deadline) {
+    let current = await read();
+    // Keyed on the gate's own verdict rather than on a state name, so "what is
+    // worth waiting for" has one definition and it is the one that will decide
+    // the outcome.
+    while (execGate(current, command).block && Date.now() < deadline) {
       const wait = Math.min(INSTALL_POLL_MS, deadline - Date.now());
       await new Promise((resolve) => setTimeout(resolve, wait));
-      status = await read();
+      current = await read();
     }
-    return installGate(status);
+    return execGate(current, command);
   };
 
   /**
@@ -567,10 +588,10 @@ export function buildComputerTools(
         // source, which is in the workspace and unaffected by an install in
         // flight — blocking them would stop the subagent doing the reading it
         // could usefully do while it waits.
-        const gate = await awaitInstall(command);
+        const gate = await awaitAdvisories(command);
         const gateMsWaited = Date.now() - startedAtMs;
         if (gate.block) {
-          console.info("[computer] sb_exec blocked by install", {
+          console.info("[computer] sb_exec blocked by a workspace advisory", {
             command,
             gateMs: gateMsWaited
           });
@@ -1083,7 +1104,7 @@ export function computer(config: ComputerConfig): AgentPlugin {
       // No try/catch here: `buildComputerTools` fails the gate open itself, so
       // wrapping again would only make it look like the guarantee lives in two
       // places.
-      () => host(runtime).installStatus()
+      () => host(runtime).advisories()
     );
 
   return definePlugin({
