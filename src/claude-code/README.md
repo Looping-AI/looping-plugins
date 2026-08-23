@@ -353,6 +353,46 @@ from the stub's byte stream, so the drain works across a Durable Object boundary
 and the container→workspace filesystem sync still fires when the stream reaches
 `done`.
 
+## The permission mode, and why it bypasses
+
+`-p` is headless. There is no terminal, so nothing can answer a permission
+prompt — and Claude Code's headless path does not wait for one, it **auto-denies**.
+
+That makes the CLI's default mode unusable here, in a way that does not look like
+a failure. `default` gates Write, Edit and every Bash command, so a session left
+on it reads the repository perfectly, cannot change one byte of it, and reports
+prose that reads like considered reluctance rather than a blocked tool. It exits 0. The subtask is recorded as completed. Nothing in the logs says "denied".
+
+So `permissionMode` defaults to `bypassPermissions`, and the narrower modes are
+not alternatives:
+
+| mode                | what a session can do                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------ |
+| `default`           | read only — everything else is auto-denied                                                             |
+| `acceptEdits`       | edit files; `npm ci`, `git` and the test suite still denied                                            |
+| `dontAsk`           | "deny if not pre-approved" — the default's behaviour, named                                            |
+| `auto`              | a model classifier rules on each call, spending the same subscription bucket the session is drawing on |
+| `bypassPermissions` | the whole job                                                                                          |
+
+What makes bypassing acceptable is not the flag being careful. It is that the
+container has nothing left to protect: it holds no credential — the real one is
+swapped in by the egress gateway on the Worker side — and it already runs a
+cloned repository's `postinstall` and its test suite, which is arbitrary code
+execution by design. Gating the agent's own edits while those doors stand open
+costs the agent its job and buys nothing. Containment is the credential swap.
+
+> **The container runs as root, and that changes how the flag has to be passed.**
+> The CLI refuses to bypass its permission checks under uid 0 unless `IS_SANDBOX=1`
+> is set — it exits 1 _before_ its first JSON line, with the only explanation on
+> stderr. `buildLaunch` writes both in one branch so they cannot drift, and applies
+> the variable after a host's `env` so a host cannot unset it. If you run an image
+> that does not exec as root, that variable is the line to delete.
+
+A deployment that wants a different posture sets `permissionMode` and gets it —
+including `default`, if what it wants is a session that can only read. Denials
+are reported either way: each one arrives as a `permission denied for <Tool>: …`
+progress note, and the session's own denial count rides on the result.
+
 ## Costs
 
 Two numbers drive the sizing here — not a spend cap, which this package

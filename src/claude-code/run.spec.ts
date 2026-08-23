@@ -13,6 +13,7 @@ import {
   type DrainCursor,
   type SessionRuntime
 } from "./run.js";
+import { DEFAULT_PERMISSION_MODE } from "./config.js";
 
 const EXEC = execIdFor(7);
 const FRESH = freshCursor(EXEC);
@@ -42,6 +43,13 @@ const exit = (seq: number, code: number): Event => ({
   seq,
   name: "exit",
   code
+});
+
+const stderrOut = (seq: number, value: string): Event => ({
+  id: EXEC,
+  seq,
+  name: "stderr",
+  value
 });
 
 /**
@@ -196,6 +204,61 @@ describe("buildLaunch", () => {
     expect(env.CI).toBe("1");
     expect(env.DISABLE_AUTOUPDATER).toBe("0");
   });
+
+  /**
+   * The whole point of the option. `-p` is headless, so a mode that would prompt
+   * auto-denies instead — a session left on the default reads the repository
+   * perfectly and cannot write to it.
+   */
+  describe("the permission mode", () => {
+    it("is always passed, so headless never falls back to auto-deny", () => {
+      expect(launch().command).toContain(
+        `--permission-mode ${DEFAULT_PERMISSION_MODE}`
+      );
+    });
+
+    it("defaults to the only mode that can edit a checkout", () => {
+      expect(DEFAULT_PERMISSION_MODE).toBe("bypassPermissions");
+    });
+
+    it("carries a host's choice through instead", () => {
+      expect(launch({ permissionMode: "acceptEdits" }).command).toContain(
+        "--permission-mode acceptEdits"
+      );
+    });
+
+    /**
+     * The root guard, and the reason these two live in one branch.
+     *
+     * The container runs as uid 0, and the CLI exits 1 — before its first JSON
+     * line, explaining itself only on stderr — if asked to bypass permissions
+     * under root without this. The flag alone is a worse failure than no flag.
+     */
+    it("clears the root guard whenever it bypasses", () => {
+      expect(launch().env.IS_SANDBOX).toBe("1");
+      expect(
+        launch({ permissionMode: "bypassPermissions" }).env.IS_SANDBOX
+      ).toBe("1");
+    });
+
+    it("sets nothing for a mode that does not need it", () => {
+      for (const mode of ["default", "acceptEdits", "plan", "auto"] as const) {
+        expect(launch({ permissionMode: mode }).env).not.toHaveProperty(
+          "IS_SANDBOX"
+        );
+      }
+    });
+
+    /**
+     * `env` is merged last so a deployment can add what a repository needs, and
+     * that merge is exactly how this could be switched off from a config file —
+     * silently, leaving a session that exits 1 for a reason nothing reports.
+     */
+    it("is not something a host's own environment can unset", () => {
+      const { env } = launch({ env: { IS_SANDBOX: "0" } });
+      expect(env.IS_SANDBOX).toBe("1");
+    });
+  });
 });
 
 describe("drainRun", () => {
@@ -327,6 +390,91 @@ describe("drainRun", () => {
     if (!outcome.done) throw new Error("unreachable");
     expect(outcome.exitCode).toBe(143);
     expect(outcome.result).toBeUndefined();
+  });
+
+  /**
+   * The failure this exists for: a CLI that rejects its own arguments prints one
+   * line on stderr and exits before writing any JSON. Reported as an exit code
+   * alone — which is what happened before this — the cause is unrecoverable from
+   * the logs, and the operator sees only "exited with code 1".
+   */
+  it("keeps stderr when the process dies before reporting anything", async () => {
+    const outcome = await drainRun(
+      fakeHandle([stderrOut(1, "cannot be used with root/sudo\n"), exit(2, 1)]),
+      FRESH,
+      window
+    );
+
+    expect(outcome.done).toBe(true);
+    if (!outcome.done) throw new Error("unreachable");
+    expect(outcome.result).toBeUndefined();
+    expect(outcome.stderr).toContain("root/sudo");
+  });
+
+  /**
+   * A session that reported for itself has said everything worth saying. Its
+   * stderr is the CLI's own chatter, and surfacing it beside a good report only
+   * buries the report.
+   */
+  it("says nothing about stderr when the session reported a result", async () => {
+    const outcome = await drainRun(
+      fakeHandle([
+        stderrOut(1, "a deprecation warning nobody needs\n"),
+        stdout(2, RESULT_LINE),
+        exit(3, 0)
+      ]),
+      FRESH,
+      window
+    );
+
+    expect(outcome.done).toBe(true);
+    if (!outcome.done) throw new Error("unreachable");
+    expect(outcome.result).toBeDefined();
+    expect(outcome.stderr).toBeUndefined();
+  });
+
+  /**
+   * The death and the exit can land in different windows, so the tail rides on
+   * the cursor rather than living in one drain's locals.
+   */
+  it("carries stderr across a window boundary", async () => {
+    const first = await drainRun(
+      fakeHandle([stderrOut(1, "first half ")], true),
+      FRESH,
+      { windowMs: 40 }
+    );
+    expect(first.done).toBe(false);
+    expect(first.cursor.stderr).toBe("first half ");
+
+    const outcome = await drainRun(
+      fakeHandle([stderrOut(2, "second half"), exit(3, 1)]),
+      first.cursor,
+      window
+    );
+
+    if (!outcome.done) throw new Error("unreachable");
+    expect(outcome.stderr).toBe("first half second half");
+  });
+
+  /**
+   * Bounded on every append, not once at the end: an unbounded tail is a
+   * Durable Object holding whatever a runaway build decided to print.
+   */
+  it("bounds a runaway stderr while keeping both ends of it", async () => {
+    const outcome = await drainRun(
+      fakeHandle(
+        [stderrOut(1, `HEAD${"x".repeat(50_000)}TAIL`), exit(2, 1)],
+        false
+      ),
+      FRESH,
+      window
+    );
+
+    if (!outcome.done) throw new Error("unreachable");
+    const kept = outcome.stderr ?? "";
+    expect(kept.length).toBeLessThanOrEqual(2_000);
+    expect(kept.startsWith("HEAD")).toBe(true);
+    expect(kept.endsWith("TAIL")).toBe(true);
   });
 });
 

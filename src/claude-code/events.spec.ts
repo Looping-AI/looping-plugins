@@ -181,6 +181,32 @@ describe("parseStream", () => {
     expect(skipped).toBe(2);
   });
 
+  /**
+   * A count alone told an operator that something was being dropped and nothing
+   * about what — so `skipped: 1` fired on every session in a deployment for a
+   * release and was read as noise. The first line is kept because a stream that
+   * has gone wrong repeats the same shape, and the earliest instance is closest
+   * to whatever changed.
+   */
+  it("keeps the first skipped line so the warning can be acted on", () => {
+    const buffer = `${line({ type: "control_request", subtype: "can_use_tool" })}not json\n`;
+    const { skipped, sample } = parseStream(buffer);
+
+    expect(skipped).toBe(2);
+    expect(sample).toContain("can_use_tool");
+  });
+
+  it("offers no sample when nothing was skipped", () => {
+    expect(parseStream(init()).sample).toBeUndefined();
+  });
+
+  it("clips a runaway line rather than logging the whole of it", () => {
+    const { sample } = parseStream(`${"z".repeat(5_000)}\n`);
+
+    expect(sample?.length).toBeLessThanOrEqual(200);
+    expect(sample?.endsWith("…")).toBe(true);
+  });
+
   it("is silent about system subtypes it does not recognise", () => {
     // Not a skip — nothing is wrong, there is simply nothing to say. Counting
     // these would make the skip signal useless as soon as a release adds one.
@@ -189,6 +215,76 @@ describe("parseStream", () => {
 
     expect(events).toEqual([]);
     expect(skipped).toBe(0);
+  });
+
+  /**
+   * The subtype that spent a release inside "informational", saying nothing
+   * while every session in the deployment was refused every write.
+   *
+   * A refused tool call is invisible in the transcript — the model narrates an
+   * alternative approach and moves on — so this line is the only place a
+   * permission problem is stated rather than inferred.
+   */
+  describe("a denied tool call", () => {
+    const denial = (over: Record<string, unknown> = {}) =>
+      line({
+        type: "system",
+        subtype: "permission_denied",
+        tool_name: "Write",
+        tool_use_id: "toolu_1",
+        decision_reason_type: "mode",
+        decision_reason: "permission mode is default",
+        message: "Claude requested permissions to use Write",
+        ...over
+      });
+
+    it("names the tool and what it was told", () => {
+      const { events, skipped } = parseStream(denial());
+
+      expect(skipped).toBe(0);
+      expect(events).toEqual([
+        {
+          kind: "denied",
+          tool: "Write",
+          reason: "Claude requested permissions to use Write"
+        }
+      ]);
+    });
+
+    it("falls back through the reasons a denial may carry", () => {
+      const [withReason] = parseStream(denial({ message: undefined })).events;
+      expect(withReason).toMatchObject({
+        reason: "permission mode is default"
+      });
+
+      const [withType] = parseStream(
+        denial({ message: undefined, decision_reason: undefined })
+      ).events;
+      expect(withType).toMatchObject({ reason: "mode" });
+
+      const [bare] = parseStream(
+        line({ type: "system", subtype: "permission_denied" })
+      ).events;
+      expect(bare).toEqual({ kind: "denied", reason: "no reason given" });
+    });
+
+    /**
+     * Unlike the `parent_tool_use_id` filter, an inner subagent's denial is kept.
+     * A subagent that cannot write is the same misconfiguration as the outer
+     * session, found one level down — dropping it would hide the fault in
+     * exactly the runs that delegate.
+     */
+    it("keeps a denial raised inside Claude Code's own subagent tree", () => {
+      const { events } = parseStream(denial({ agent_id: "agent-3" }));
+      expect(events).toHaveLength(1);
+    });
+
+    it("reaches the parent as a progress note", () => {
+      const notes = toProgress(parseStream(denial()).events, 0);
+      expect(notes.map((n) => n.text)).toEqual([
+        "permission denied for Write: Claude requested permissions to use Write"
+      ]);
+    });
   });
 
   describe("the result line", () => {

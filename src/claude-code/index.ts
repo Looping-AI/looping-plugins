@@ -102,6 +102,9 @@ export function claudeCodeSession(config: ClaudeCodeConfig) {
     ...(config.maxConcurrentSubagents === undefined
       ? {}
       : { maxConcurrentSubagents: config.maxConcurrentSubagents }),
+    // Forwarded only when set, so `buildLaunch` owns the default in one place
+    // rather than this line resolving it and the flag being written twice.
+    ...(config.permissionMode ? { permissionMode: config.permissionMode } : {}),
     ...(config.env ? { env: config.env } : {})
   });
 
@@ -284,5 +287,9 @@ export {
   CLAUDE_CODE_TYPE,
   WORKSPACE_RUNTIME_KEY
 } from "./recipe.js";
-export { DEFAULT_TIMEOUT_MS, DEFAULT_WINDOW_MS } from "./config.js";
-export type { ClaudeCodeConfig } from "./config.js";
+export {
+  DEFAULT_PERMISSION_MODE,
+  DEFAULT_TIMEOUT_MS,
+  DEFAULT_WINDOW_MS
+} from "./config.js";
+export type { ClaudeCodeConfig, PermissionMode } from "./config.js";
