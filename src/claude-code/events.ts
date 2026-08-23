@@ -408,13 +408,18 @@ export function toProgress(
 /** One line of progress, or nothing when the event is not worth a note. */
 function describe(event: ClaudeCodeEvent): string | undefined {
   switch (event.kind) {
-    case "assistant": {
-      const tools =
-        event.tools.length > 0 ? `[${unique(event.tools).join(", ")}] ` : "";
-      const body = event.text ? clip(event.text) : "";
-      const line = `${tools}${body}`.trim();
-      return line || undefined;
-    }
+    // Tool calls are not narration. A turn that only called tools said nothing
+    // the reader can act on, and it cost one Slack message per Bash/Read/Edit —
+    // nine of them for a one-line README edit. The tool names added nothing to
+    // the turns that *did* have text either, so the prefix goes with them.
+    //
+    // Same policy the in-process agents already apply in the gateway
+    // (src/agents/shared/loop.ts: "Tool-only steps stay silent in Slack").
+    // Deliberately narrower than silencing the whole channel: `denied` and
+    // `retry` below stay, because they are the only evidence of a session that
+    // is being refused or throttled.
+    case "assistant":
+      return event.text ? clip(event.text) : undefined;
     case "denied":
       // The one progress note that is more useful than the session's own
       // account of itself. A refused tool call is invisible in the transcript —
@@ -434,10 +439,6 @@ function describe(event: ClaudeCodeEvent): string | undefined {
     case "result":
       return undefined;
   }
-}
-
-function unique(values: readonly string[]): string[] {
-  return [...new Set(values)];
 }
 
 function clip(text: string, max: number = PROGRESS_MAX_CHARS): string {
