@@ -1,16 +1,16 @@
-import type { InstallState } from "./install.js";
-import { humanMs } from "./render.js";
+import { renderAdvisory, shapeOf, type WorkspaceAdvisory } from "./advisory.js";
 
 /**
- * What a command has to wait for, and what to say when it never ran.
+ * What one shell command has to wait for, and what to say when it never ran.
  *
- * `node_modules` lives in the container and dies with it, so a dependency
- * install is something in flight that a few commands need and most do not.
- * {@link needsDependencies} decides which, and {@link installGate} decides
- * whether that is worth blocking a command over — a distinction that deadlocked
- * a production run when it was got wrong. {@link execLostNote} covers the other
- * failure a model cannot diagnose from the error alone: a container replaced
- * underneath a command that was running.
+ * {@link file://./advisory.ts} decides what is true about the workspace and how
+ * to word it; this file decides what that means for a command about to run.
+ * {@link needsDependencies} is the part that cannot move there — it is a
+ * question about the *command*, and it is what stops `cat README.md` queueing
+ * behind an `npm ci` it has no use for.
+ *
+ * {@link execLostNote} covers a failure with no advisory behind it: a container
+ * replaced underneath a command that was running.
  */
 
 /**
@@ -41,58 +41,121 @@ export function execLostNote(err: unknown): string | undefined {
 }
 
 /**
- * What the install state means for a command about to run.
+ * What the workspace's advisories mean for a command about to run.
  *
  * The distinction between the two fields is the whole point:
  *
- * - `block` — the command was **not run**. Only ever set while an install is
- *   genuinely in flight, which is a state that resolves on its own.
- * - `warn` — the command **was run**, with a note prepended saying the tree it
- *   ran against may be incomplete.
+ * - `block` — the command was **not run**.
+ * - `warn` — the command **was run**, with this prepended to its output.
  *
- * A *failed* install must never block, and the reason is that it deadlocks:
- * nothing clears the record except another checkout, so one failure disables the
- * shell for the rest of the session — `echo hello` included — while the message
- * tells the model to re-run the install with the tool that is refusing to run.
+ * ## Only something transient may block
  *
- * A failed install is a fact about `node_modules`, not about the shell. The
- * container is fine; `git status`, `ls`, `cat` and the install command itself all
- * work. So it is reported rather than enforced, and the model decides.
+ * Enforced here by reading {@link AdvisoryShape.transient} rather than by
+ * matching on a state, because getting it wrong deadlocked a production run.
+ * Nothing clears a failed install record except another checkout, so blocking on
+ * one disables the shell for the rest of the session — `echo hello` included —
+ * while the message tells the model to re-run the install with the tool that is
+ * refusing to run. The same argument covers a full workspace, which is
+ * permanent in exactly the same way and would take the shell down with it,
+ * including the commands an operator would use to look.
+ *
+ * So anything permanent is reported and the model decides. Blocking is reserved
+ * for a state that resolves on its own, where waiting is a real answer.
+ *
+ * ## What a command is told depends on the command
+ *
+ * A dependency advisory reaches only commands that read `node_modules`; a
+ * universal one reaches everything. That asymmetry is the reason a full
+ * workspace used to say nothing at all to `echo hi > file.txt` — the write being
+ * lost is usually not a dependency's, and the filter that was right for installs
+ * was silently applied to capacity too.
  */
-export interface InstallGate {
-  /** Set only for an install still in flight: the command did not run. */
+export interface ExecGate {
+  /** Set only for something transient: the command did not run. */
   block?: string;
-  /** Set for a failed install: the command ran, with this prepended. */
+  /** Set for anything permanent: the command ran, with this prepended. */
   warn?: string;
 }
 
-export function installGate(status: InstallState | undefined): InstallGate {
-  if (!status) return {};
+/** Which advisories this particular command needs to hear about. */
+function relevantTo(
+  advisories: readonly WorkspaceAdvisory[],
+  command: string
+): readonly WorkspaceAdvisory[] {
+  // Computed once for the whole set rather than per advisory: it parses the
+  // command, and it is the same answer for all of them.
+  const dependencyCommand = needsDependencies(command);
+  return advisories.filter(
+    (advisory) => shapeOf(advisory).universal || dependencyCommand
+  );
+}
 
-  if (status.state === "running") {
-    const tail = status.tail ? `\nlast output:\n${status.tail}` : "";
-    return {
-      block:
-        `dependency install still running (${humanMs(Date.now() - status.startedAt)}` +
-        `, \`${status.command}\`). Nothing was run — call again in a moment.${tail}`
-    };
-  }
+/**
+ * Turn what is true about the workspace into what happens to this command.
+ *
+ * Every relevant advisory is rendered, not just the one that decided the
+ * outcome. A command blocked behind an install in a workspace that is also full
+ * needs to hear about the ceiling — that is the fact that makes waiting
+ * pointless, and reporting only the blockage would send it round the loop again.
+ */
+export function execGate(
+  advisories: readonly WorkspaceAdvisory[],
+  command: string
+): ExecGate {
+  const relevant = relevantTo(advisories, command);
+  if (relevant.length === 0) return {};
 
-  if (status.state === "failed") {
-    const code =
-      status.exitCode === undefined ? "" : ` (exit ${status.exitCode})`;
-    return {
-      warn:
-        `⚠ the dependency install \`${status.command}\` failed${code}: ` +
-        `${status.error}\nThe command below still ran. If you have not already ` +
-        `re-run that install yourself, anything importing from node_modules ` +
-        `will fail — if you have, and it succeeded, this note is stale and you ` +
-        `can ignore it. The host cannot see an install it did not start, so it ` +
-        `keeps reporting the last one it did.`
-    };
-  }
+  /**
+   * The outcome is decided **before** anything is worded, and stated once.
+   *
+   * `renderAdvisory` deliberately makes no claim about whether the command ran,
+   * because no single advisory is in a position to know: the verdict comes from
+   * the whole set. Letting each one say so produced a straight contradiction the
+   * moment two coexisted — a full workspace explaining that "the command below
+   * still ran" inside a message that had just blocked it on an install in
+   * flight. One sentence, from the one place that has the answer.
+   */
+  const blocked = relevant.some((a) => shapeOf(a).transient);
+  const text = [
+    ...relevant.map((a) => renderAdvisory(a, "tool-call")),
+    blocked
+      ? "Nothing was run — call again in a moment."
+      : "The command below still ran."
+  ].join("\n\n");
 
-  return {};
+  return blocked ? { block: text } : { warn: text };
+}
+
+/**
+ * Whether a write should happen at all, and what to say when it should not.
+ *
+ * `sb_write` and `sb_edit` do not go through {@link execGate}: they run no
+ * command, and a dependency install has nothing to do with writing source. One
+ * thing does reach them, and it is the worst of the set — a workspace that
+ * accepts no further writes takes an edit, reports the character count, and
+ * drops it. The file tools are how a coding agent writes, so leaving them out
+ * would have missed the data loss where most of it happens.
+ *
+ * **Refused rather than warned**, which is the opposite of `execGate`'s rule for
+ * everything permanent, and the difference is what the caller can still do. A
+ * shell under a permanent advisory can do real work — `git status`, `ls`, the
+ * install itself — so refusing it would take away the diagnosis with the
+ * failure. A write under `writesPersist: false` has no successful outcome
+ * available: the only thing refusing costs is a false "wrote 120 characters",
+ * and that message is worse than nothing because it is believed.
+ */
+export function writeGate(
+  advisories: readonly WorkspaceAdvisory[]
+): string | undefined {
+  // Keyed on the axis, not on the kind: any future advisory that loses writes
+  // stops them here without this function being revisited.
+  const losing = advisories.filter((a) => !shapeOf(a).writesPersist);
+  if (losing.length === 0) return undefined;
+
+  return [
+    ...losing.map((a) => renderAdvisory(a, "tool-call")),
+    "Nothing was written."
+  ].join("\n\n");
 }
 
 /**

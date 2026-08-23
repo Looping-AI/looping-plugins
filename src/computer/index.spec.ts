@@ -9,7 +9,7 @@ import {
   workspaceNameFromRuntime,
   WORKSPACE_RUNTIME_KEY,
   type ComputerConfig,
-  type InstallState
+  type WorkspaceAdvisory
 } from "./index.js";
 
 /** What the stub records off an `fs.grep` call. `@cloudflare/computer` declares
@@ -688,16 +688,18 @@ describe("sb_grep", () => {
     const tools = buildComputerTools(
       workspace,
       { ...config, installGateMs: 0 },
-      async () => ({
-        state: "running" as const,
-        command: "npm ci",
-        startedAt: Date.now()
-      })
+      async () => [
+        {
+          kind: "deps-building" as const,
+          command: "npm ci",
+          startedAt: Date.now()
+        }
+      ]
     );
 
     const out = await run(tools, "sb_grep", { query: "const" });
     expect(out).toContain("const a = 1;");
-    expect(out).not.toContain("still running");
+    expect(out).not.toContain("still installing");
   });
 });
 
@@ -1166,22 +1168,22 @@ describe("sb_exec", () => {
   });
 });
 
-describe("the install gate on sb_exec", () => {
+describe("the advisory gate on sb_exec", () => {
   const gated = (
-    status: InstallState | undefined,
+    advisories: WorkspaceAdvisory[],
     extra: Partial<ComputerConfig> = {}
   ) => {
     const { workspace, execs } = stub();
     const tools = buildComputerTools(
       workspace,
       { ...config, installGateMs: 0, ...extra },
-      async () => status
+      async () => advisories
     );
     return { tools, execs };
   };
 
-  it("runs the command when nothing is installing", async () => {
-    const { tools, execs } = gated({ state: "idle" });
+  it("runs the command when there is nothing to say", async () => {
+    const { tools, execs } = gated([]);
     // The verdict line rides along on every result now, including this one.
     expect(await run(tools, "sb_exec", { command: "npm test" })).toBe(
       "ok\n--- exit 0 ---"
@@ -1196,15 +1198,17 @@ describe("the install gate on sb_exec", () => {
    * instead of a misdiagnosis.
    */
   it("runs nothing while an install is in flight, and says why", async () => {
-    const { tools, execs } = gated({
-      state: "running",
-      command: "npm ci",
-      startedAt: Date.now() - 65_000,
-      tail: "added 200 packages"
-    });
+    const { tools, execs } = gated([
+      {
+        kind: "deps-building",
+        command: "npm ci",
+        startedAt: Date.now() - 65_000,
+        tail: "added 200 packages"
+      }
+    ]);
 
     const out = await run(tools, "sb_exec", { command: "npm test" });
-    expect(out).toContain("still running");
+    expect(out).toContain("still installing");
     expect(out).toContain("npm ci");
     expect(out).toContain("1m05s");
     expect(out).toContain("call again");
@@ -1212,48 +1216,175 @@ describe("the install gate on sb_exec", () => {
   });
 
   /**
-   * A failed install **warns and runs**, unlike the `running` case above, and
-   * the asymmetry is what stops a deadlock. `running` resolves on its own;
-   * `failed` does not, since nothing clears that record except another checkout
-   * — so refusing on it disables the shell for the rest of the session, `echo
-   * hello` included, while the refusal tells the model to re-run the install with
-   * the tool that is refusing.
+   * A broken install **warns and runs**, unlike the building case above, and the
+   * asymmetry is what stops a deadlock. Building resolves on its own; broken
+   * does not, since nothing clears that record except another checkout — so
+   * refusing on it disables the shell for the rest of the session, `echo hello`
+   * included, while the refusal tells the model to re-run the install with the
+   * tool that is refusing.
    *
-   * A failed install says something about `node_modules`, not about the shell.
+   * Read off `shapeOf().transient` rather than off a state name, which is what
+   * makes the rule hold for every advisory rather than for the two somebody
+   * remembered.
    */
-  it("warns about a failed install but still runs the command", async () => {
-    const { tools, execs } = gated({
-      state: "failed",
-      command: "npm ci",
-      finishedAt: Date.now(),
-      exitCode: 1,
-      error: "ERESOLVE could not resolve"
-    });
+  it("warns about a broken install but still runs the command", async () => {
+    const { tools, execs } = gated([
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        exitCode: 1,
+        error: "ERESOLVE could not resolve",
+        treePresent: false
+      }
+    ]);
 
     const out = await run(tools, "sb_exec", { command: "npm test" });
     expect(execs).toHaveLength(1);
     // The real output is there...
     expect(out).toContain("ok");
     // ...and so is the reason it might not mean what it looks like.
-    expect(out).toContain("dependency install `npm ci` failed");
-    expect(out).toContain("npm ci");
+    expect(out).toContain("dependency install `npm ci` **failed**");
     expect(out).toContain("exit 1");
     expect(out).toContain("ERESOLVE");
   });
 
   /** The escape hatch has to actually work — it is what the warning advises. */
   it("lets the model re-run the install itself after a failure", async () => {
-    const { tools, execs } = gated({
-      state: "failed",
-      command: "npm ci",
-      finishedAt: Date.now(),
-      exitCode: 1,
-      error: "ERESOLVE could not resolve"
-    });
+    const { tools, execs } = gated([
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        exitCode: 1,
+        error: "ERESOLVE could not resolve",
+        treePresent: false
+      }
+    ]);
 
     await run(tools, "sb_exec", { command: "npm ci --force" });
     expect(execs).toHaveLength(1);
     expect(execs[0]!.command).toBe("npm ci --force");
+  });
+
+  /**
+   * A dependency advisory reaches only commands that read `node_modules`. This
+   * is the behaviour `needsDependencies` exists for, and the reason the filter
+   * cannot simply be applied to every advisory — see the next case.
+   */
+  it("says nothing about dependencies to a command that needs none", async () => {
+    const { tools, execs } = gated([
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        error: "ERESOLVE",
+        treePresent: false
+      }
+    ]);
+
+    const out = await run(tools, "sb_exec", { command: "cat README.md" });
+    expect(out).not.toContain("ERESOLVE");
+    expect(execs).toHaveLength(1);
+  });
+
+  /**
+   * **The case that was silent.** A workspace over its ceiling accepts no
+   * further writes, and the write being lost is almost never a dependency's —
+   * so an advisory filtered by `needsDependencies` reached every command except
+   * the ones that mattered. `universal` is what exempts it from that filter.
+   */
+  it("warns a plain file write that its writes are being dropped", async () => {
+    const { tools, execs } = gated([
+      { kind: "storage-exhausted", bytes: 8.6e9, capBytes: 8e9 }
+    ]);
+
+    const out = await run(tools, "sb_exec", { command: "echo hi > /tmp/f" });
+    // It ran — permanent things never block, for the deadlock reason above.
+    expect(execs).toHaveLength(1);
+    expect(out).toContain("nothing further can be written");
+    expect(out).toContain("8.6 GB");
+  });
+
+  /**
+   * **The file tools are where the writes are.**
+   *
+   * `sb_exec` is not how a coding agent edits source — `sb_write` and `sb_edit`
+   * are, and they went straight to `fs.writeFile` and reported a character
+   * count. Against a workspace that accepts no more writes that count is a
+   * fabrication the model has no way to doubt, which is the same silent data
+   * loss this whole mechanism is about, at the entry point where most of it
+   * happens.
+   */
+  it("refuses a write when the workspace cannot keep it", async () => {
+    const path = "/workspace/repo/a.ts";
+    const { workspace, files } = stub();
+    const tools = buildComputerTools(workspace, { ...config }, async () => [
+      { kind: "storage-exhausted", bytes: 8.6e9, capBytes: 8e9 }
+    ]);
+
+    const out = await run(tools, "sb_write", { path, content: "x" });
+    expect(out).toContain("nothing further can be written");
+    expect(out).toContain("Nothing was written");
+    // The half that matters: no success report, and nothing on disk for a later
+    // read to find and conclude the edit had landed.
+    expect(out).not.toContain("character");
+    expect(files.has(path)).toBe(false);
+  });
+
+  it("refuses an edit on the same grounds, leaving the file alone", async () => {
+    const path = "/workspace/repo/a.ts";
+    const { workspace, files } = stub({ [path]: "const a = 1;\n" });
+    const tools = buildComputerTools(workspace, { ...config }, async () => [
+      { kind: "storage-exhausted", bytes: 8.6e9, capBytes: 8e9 }
+    ]);
+
+    const out = await run(tools, "sb_edit", { path, find: "1", replace: "2" });
+    expect(out).toContain("Nothing was written");
+    expect(files.get(path)).toBe("const a = 1;\n");
+  });
+
+  /**
+   * A dependency advisory must not reach a write. Source is not `node_modules`,
+   * the write will persist perfectly well, and refusing it would take away the
+   * one thing an agent can still usefully do while an install is broken.
+   */
+  it("still writes when the only trouble is dependencies", async () => {
+    const path = "/workspace/repo/a.ts";
+    const { workspace, files } = stub();
+    const tools = buildComputerTools(workspace, { ...config }, async () => [
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        error: "ERESOLVE",
+        treePresent: false
+      }
+    ]);
+
+    expect(await run(tools, "sb_write", { path, content: "x" })).toContain(
+      "wrote"
+    );
+    expect(files.get(path)).toBe("x");
+  });
+
+  /**
+   * Both true at once, which the single-slot record this replaced could not
+   * represent: it kept whichever was written last and silently dropped the
+   * other. A command that waits out the install and never hears about the
+   * ceiling comes back to a workspace that still cannot keep its work.
+   */
+  it("reports a full workspace and an install together", async () => {
+    const { tools, execs } = gated([
+      { kind: "storage-exhausted", bytes: 8.6e9, capBytes: 8e9 },
+      { kind: "deps-building", command: "npm ci", startedAt: Date.now() }
+    ]);
+
+    const out = await run(tools, "sb_exec", { command: "npm test" });
+    expect(execs).toHaveLength(0);
+    expect(out).toContain("still installing");
+    expect(out).toContain("nothing further can be written");
+    // The verdict is stated once, by the only thing that knows it. Rendering it
+    // per advisory produced a message that blocked the command and then told the
+    // model it had run.
+    expect(out).toContain("Nothing was run");
+    expect(out).not.toContain("still ran");
   });
 
   /** A command that throws still carries the warning — it explains the throw. */
@@ -1262,16 +1393,18 @@ describe("the install gate on sb_exec", () => {
     const tools = buildComputerTools(
       workspace,
       { ...config, installGateMs: 0 },
-      async () => ({
-        state: "failed" as const,
-        command: "npm ci",
-        finishedAt: Date.now(),
-        error: "boom"
-      })
+      async () => [
+        {
+          kind: "deps-broken" as const,
+          command: "npm ci",
+          error: "boom",
+          treePresent: false
+        }
+      ]
     );
 
     const out = await run(tools, "sb_exec", { command: "npm test" });
-    expect(out).toContain("dependency install `npm ci` failed");
+    expect(out).toContain("dependency install `npm ci` **failed**");
     expect(out).toContain("container unreachable");
     expect(execs).toHaveLength(0);
   });
@@ -1283,7 +1416,7 @@ describe("the install gate on sb_exec", () => {
    */
   it("gives the turn back within the gate, not within a poll interval", async () => {
     const { tools, execs } = gated(
-      { state: "running", command: "npm ci", startedAt: Date.now() },
+      [{ kind: "deps-building", command: "npm ci", startedAt: Date.now() }],
       { installGateMs: 100 }
     );
 
@@ -1291,7 +1424,7 @@ describe("the install gate on sb_exec", () => {
     const out = await run(tools, "sb_exec", { command: "npm test" });
     const elapsed = Date.now() - started;
 
-    expect(out).toContain("still running");
+    expect(out).toContain("still installing");
     expect(execs).toHaveLength(0);
     // The poll interval is three seconds and the gate is a tenth of one. Before
     // the clamp this waited for the former.
@@ -1315,11 +1448,13 @@ describe("the install gate on sb_exec", () => {
     const tools = buildComputerTools(
       workspace,
       { ...config, installGateMs: 0 },
-      async () => ({
-        state: "running" as const,
-        command: "npm ci",
-        startedAt: Date.now()
-      })
+      async () => [
+        {
+          kind: "deps-building" as const,
+          command: "npm ci",
+          startedAt: Date.now()
+        }
+      ]
     );
     expect(await run(tools, "sb_read", { path })).toBe("x");
   });

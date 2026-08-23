@@ -4,9 +4,10 @@ import { needsDependencies } from "./gate.js";
 /**
  * The half of the install gate that is a decision rather than a wait.
  *
- * `installGate` and `execLostNote` are asserted through `sb_exec` in
- * `index.spec.ts`, where the state they read actually comes from — this file is
- * the command classifier, which is pure and has the sharpest failure modes.
+ * `execGate` and `execLostNote` are asserted through `sb_exec` in
+ * `index.spec.ts`, where the advisories they read actually come from, and what
+ * each advisory *means* is asserted in `advisory.spec.ts` — this file is the
+ * command classifier, which is pure and has the sharpest failure modes.
  */
 
 /**
