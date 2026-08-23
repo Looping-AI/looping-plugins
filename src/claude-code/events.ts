@@ -74,6 +74,16 @@ export type ClaudeCodeEvent =
   | { kind: "init"; sessionId: string; model?: string }
   | { kind: "assistant"; text: string; tools: string[] }
   | { kind: "retry"; detail: string }
+  /**
+   * A tool call the session was not allowed to make.
+   *
+   * Surfaced rather than counted, because the count is useless on its own and
+   * the wording is the whole diagnosis: a session denied `Write` is
+   * misconfigured, a session denied one `Bash(curl …)` by a deny rule is working
+   * as intended, and `permissionDenials: 3` cannot tell them apart. This is the
+   * event that says which.
+   */
+  | { kind: "denied"; tool?: string; reason: string }
   | { kind: "result"; result: ClaudeCodeResult };
 
 export interface ParsedStream {
@@ -88,6 +98,19 @@ export interface ParsedStream {
   carry: string;
   /** Lines that were not JSON, or were JSON of no recognised shape. */
   skipped: number;
+  /**
+   * The first skipped line, clipped — absent when nothing was skipped.
+   *
+   * A count alone says a schema moved and refuses to say how. That is the
+   * position this package spent a production incident in: `skipped: 1` on every
+   * single session, for days, naming nothing. One clipped line is the difference
+   * between a warning an operator can act on and a warning they learn to scroll
+   * past.
+   *
+   * Clipped rather than whole because an unrecognised line is exactly the one
+   * with no size contract — and it lands in a log, not a context window.
+   */
+  sample?: string;
   /** Lines dropped for carrying `parent_tool_use_id`. See {@link parseStream}. */
   nested: number;
 }
@@ -153,6 +176,31 @@ function readAssistant(message: Record<string, unknown>): {
 }
 
 /**
+ * Read a `system`/`permission_denied` line into something worth reporting.
+ *
+ * Claude Code emits one per auto-denied tool call — the headless path denies
+ * rather than prompts, so this is what a permission problem looks like from
+ * outside the container. Three fields carry the answer and any of them may be
+ * absent, so they are tried in order of how much they explain: the message the
+ * model was given, then the deciding component's own words, then the bare
+ * discriminator (`mode`, `rule`, `classifier`, `asyncAgent`).
+ *
+ * `agent_id` is deliberately not read. It marks a denial inside Claude Code's
+ * own subagent tree, and unlike the `parent_tool_use_id` filter above there is
+ * no case for dropping those: an inner subagent that cannot write is the same
+ * misconfiguration as an outer one, discovered one level down.
+ */
+function readDenial(event: Record<string, unknown>): ClaudeCodeEvent {
+  const tool = str(event.tool_name);
+  const reason =
+    str(event.message) ??
+    str(event.decision_reason) ??
+    str(event.decision_reason_type) ??
+    "no reason given";
+  return { kind: "denied", reason, ...(tool ? { tool } : {}) };
+}
+
+/**
  * Parse whatever has arrived so far into complete events plus a carry.
  *
  * **Messages carrying `parent_tool_use_id` are dropped**, and this is the single
@@ -169,6 +217,20 @@ export function parseStream(buffer: string): ParsedStream {
   const events: ClaudeCodeEvent[] = [];
   let skipped = 0;
   let nested = 0;
+  let sample: string | undefined;
+
+  /**
+   * Count an unrecognised line, and remember the first one.
+   *
+   * First rather than last: a stream that has gone wrong systematically repeats
+   * the same shape, and the earliest instance is the one closest to whatever
+   * changed. Every `skipped++` in this function goes through here so that a
+   * later branch cannot quietly count without sampling.
+   */
+  const skip = (line: string): void => {
+    skipped++;
+    sample ??= clip(line, SAMPLE_MAX_CHARS);
+  };
 
   const newline = buffer.lastIndexOf("\n");
   const carry = newline === -1 ? buffer : buffer.slice(newline + 1);
@@ -182,13 +244,13 @@ export function parseStream(buffer: string): ParsedStream {
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      skipped++;
+      skip(trimmed);
       continue;
     }
 
     const event = asRecord(parsed);
     if (!event) {
-      skipped++;
+      skip(trimmed);
       continue;
     }
 
@@ -204,7 +266,7 @@ export function parseStream(buffer: string): ParsedStream {
         if (event.subtype === "init") {
           const sessionId = str(event.session_id);
           if (!sessionId) {
-            skipped++;
+            skip(trimmed);
             break;
           }
           const model = str(event.model);
@@ -213,6 +275,10 @@ export function parseStream(buffer: string): ParsedStream {
             sessionId,
             ...(model ? { model } : {})
           });
+          break;
+        }
+        if (event.subtype === "permission_denied") {
+          events.push(readDenial(event));
           break;
         }
         if (event.subtype === "api_retry") {
@@ -227,13 +293,19 @@ export function parseStream(buffer: string): ParsedStream {
         }
         // Other `system` subtypes are informational and grow between releases.
         // Not "skipped": nothing is wrong, there is simply nothing to say.
+        //
+        // That reading is right for the rest of them and was wrong for
+        // `permission_denied` above, which sat in here for a release saying
+        // nothing while every session in the deployment was being refused every
+        // write. A new subtype belongs here only once somebody has read what it
+        // carries; the default is silence, not the conclusion that it is noise.
         break;
       }
 
       case "assistant": {
         const message = asRecord(event.message);
         if (!message) {
-          skipped++;
+          skip(trimmed);
           break;
         }
         const { text, tools } = readAssistant(message);
@@ -256,11 +328,11 @@ export function parseStream(buffer: string): ParsedStream {
       }
 
       default:
-        skipped++;
+        skip(trimmed);
     }
   }
 
-  return { events, carry, skipped, nested };
+  return { events, carry, skipped, nested, ...(sample ? { sample } : {}) };
 }
 
 /** Read a `result` line. Total by construction — a missing field reads as zero. */
@@ -290,6 +362,16 @@ function readResult(event: Record<string, unknown>): ClaudeCodeResult {
 
 /** How much of one progress note the parent is shown. */
 const PROGRESS_MAX_CHARS = 240;
+
+/**
+ * How much of an unrecognised line is kept for the logs.
+ *
+ * Shorter than a progress note and for a different reason: a note is read by a
+ * model deciding what to do next, whereas this is read by a person deciding
+ * whether a schema moved. The discriminating part of a stream-json line is its
+ * `type` and `subtype`, both of which are at the front.
+ */
+const SAMPLE_MAX_CHARS = 200;
 
 /**
  * Turn events into progress notes the parent can post.
@@ -333,6 +415,14 @@ function describe(event: ClaudeCodeEvent): string | undefined {
       const line = `${tools}${body}`.trim();
       return line || undefined;
     }
+    case "denied":
+      // The one progress note that is more useful than the session's own
+      // account of itself. A refused tool call is invisible in the transcript —
+      // the model simply narrates an alternative approach — so without this the
+      // parent sees a subagent being resourceful and never learns it was fenced
+      // in. Named tool first, because that is what distinguishes a broken
+      // configuration from a deny rule doing its job.
+      return `permission denied${event.tool ? ` for ${event.tool}` : ""}: ${clip(event.reason)}`;
     case "retry":
       // Surfaced deliberately. This is what a budget refusal from the egress
       // gateway looks like from inside the container, and a run that ends
@@ -350,8 +440,6 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
-function clip(text: string): string {
-  return text.length <= PROGRESS_MAX_CHARS
-    ? text
-    : `${text.slice(0, PROGRESS_MAX_CHARS - 1)}…`;
+function clip(text: string, max: number = PROGRESS_MAX_CHARS): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }

@@ -12,6 +12,7 @@ import {
   type ClaudeCodeEvent,
   type ClaudeCodeResult
 } from "./events.js";
+import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./config.js";
 
 /**
  * Launching Claude Code in the workspace container, and draining it in windows.
@@ -133,6 +134,15 @@ export interface LaunchOptions {
   maxSubagentDepth?: number;
   maxConcurrentSubagents?: number;
   /**
+   * How the session answers its own permission prompts.
+   *
+   * Defaults to {@link DEFAULT_PERMISSION_MODE}. See
+   * {@link file://./config.ts ClaudeCodeConfig.permissionMode} for why the
+   * default is the permissive one, and {@link buildLaunch} for the root guard
+   * that decides how it has to be passed.
+   */
+  permissionMode?: PermissionMode;
+  /**
    * Merged last, so a host can add what a repository needs.
    *
    * **Never secrets**, and {@link RESERVED_ENV_KEY} is refused outright rather
@@ -166,6 +176,39 @@ export interface Launch {
  * the spike: `http-gateway` egress intercepts transparently, so the client talks
  * to the real hostname and the gateway sees it. Nothing has to be told to use a
  * proxy, which means nothing in the container can be told *not* to.
+ *
+ * ## `--permission-mode`, and the root guard behind it
+ *
+ * `-p` is headless. There is no terminal, so there is nobody to answer a
+ * permission prompt — and Claude Code's headless path does not wait for one, it
+ * **auto-denies**. Left unset the mode is `default`, and `default` gates Write,
+ * Edit and every Bash command. A session in that state reads the repository
+ * perfectly and cannot change one byte of it, while reporting prose that reads
+ * like considered reluctance rather than a blocked tool. That cost this
+ * deployment a day of "the container is fixed but nothing lands".
+ *
+ * So the mode is passed explicitly, and {@link DEFAULT_PERMISSION_MODE} is
+ * `bypassPermissions` — see
+ * {@link file://./config.ts ClaudeCodeConfig.permissionMode} for why the
+ * permissive value is the correct default here rather than a concession.
+ *
+ * **`IS_SANDBOX=1` ships in the same branch as the flag, and separating the two
+ * breaks a session harder than passing no flag at all.** The container runs as
+ * root, and the CLI refuses to bypass its permission checks under uid 0 unless
+ * that variable is set: it calls `process.exit(1)` **before the first JSON
+ * line**, with the only explanation on stderr. The failure then surfaces as
+ * "exited with code 1 without reporting a result" and names nothing. One branch
+ * below writes both so they cannot drift, and the variable is applied *after* a
+ * host's `env` so a host cannot unset the thing making its own mode work.
+ *
+ * `IS_SANDBOX` has one other documented effect in this client: a repeated API
+ * `529` stops raising the custom overload error and keeps retrying instead.
+ * Harmless here — the egress gateway is what decides when to give up.
+ *
+ * The alternative is an image that does not run as root, which is a real option
+ * and a much larger one: the FUSE mount, the checkout and every install path
+ * currently assume uid 0. If that ever changes, this variable is the line to
+ * delete.
  */
 export function buildLaunch(options: LaunchOptions): Launch {
   /**
@@ -186,8 +229,11 @@ export function buildLaunch(options: LaunchOptions): Launch {
     );
   }
 
+  const permissionMode = options.permissionMode ?? DEFAULT_PERMISSION_MODE;
+
   const argv = ["claude", "-p", shellQuote(options.prompt)];
   argv.push("--output-format", "stream-json", "--verbose");
+  argv.push("--permission-mode", permissionMode);
   if (options.model) argv.push("--model", shellQuote(options.model));
   if (options.maxTurns !== undefined)
     argv.push("--max-turns", String(options.maxTurns));
@@ -210,9 +256,18 @@ export function buildLaunch(options: LaunchOptions): Launch {
 
   return {
     command: argv.join(" "),
-    // The placeholder is applied **after** the host's environment, not before,
-    // so the guard above is a second line rather than the only one.
-    env: { ...env, ...options.env, [RESERVED_ENV_KEY]: CREDENTIAL_PLACEHOLDER }
+    // The last two are applied **after** the host's environment rather than
+    // before it. For the placeholder that makes the guard above a second line
+    // rather than the only one; for `IS_SANDBOX` it means a host cannot unset
+    // the variable its own permission mode depends on — see the note above.
+    env: {
+      ...env,
+      ...options.env,
+      ...(permissionMode === "bypassPermissions"
+        ? { IS_SANDBOX: "1" }
+        : undefined),
+      [RESERVED_ENV_KEY]: CREDENTIAL_PLACEHOLDER
+    }
   };
 }
 
@@ -241,6 +296,21 @@ export interface DrainCursor {
    * successful session would be recorded as a failed one.
    */
   result?: ClaudeCodeResult;
+  /**
+   * A bounded slice of the session's stderr, for the runs that explain
+   * themselves nowhere else.
+   *
+   * stderr is not the protocol stream and is never parsed as one — see
+   * `consume` below. It is kept for exactly one case: a process that exits
+   * **before** emitting a `result` line, where the JSON stream holds nothing and
+   * the only account of what happened is the text the CLI printed on its way
+   * out. A bad flag, a refused permission mode under root, a Node crash. Without
+   * this the caller can only report an exit code.
+   *
+   * Carried on the cursor rather than kept local because the death and the exit
+   * event can land in different windows.
+   */
+  stderr?: string;
 }
 
 /** A cursor for a session that has not started yet. */
@@ -260,6 +330,12 @@ export type DrainOutcome =
       exitCode: number;
       /** Absent when the process died without ever emitting a `result` line. */
       result?: ClaudeCodeResult;
+      /**
+       * What the process printed on stderr, bounded — only when there is no
+       * `result` to explain the exit. Present on the terminal outcome alone
+       * because that is the only place a caller has nothing else to report.
+       */
+      stderr?: string;
     };
 
 export interface DrainOptions {
@@ -347,6 +423,7 @@ export async function drainRun(
   let buffer = cursor.carry;
   let seq = cursor.seq;
   let result = cursor.result;
+  let stderr = cursor.stderr ?? "";
   let exitCode: number | undefined;
 
   /**
@@ -369,8 +446,16 @@ export async function drainRun(
       // Not fatal, and deliberately not silent: a systematic schema change
       // shows up here as a rising count long before it shows up as a run that
       // reports nothing.
+      //
+      // **The sample is the half that makes this actionable.** For a release
+      // this warning fired on every session in the deployment with
+      // `skipped: 1`, which told an operator that something was being dropped
+      // and nothing whatever about what — so it was read as background noise
+      // while it was in fact the only trace of a real fault. A count says a
+      // schema moved; the line says which way.
       console.warn("[claude-code] unparsed lines in the session stream", {
-        skipped: parsed.skipped
+        skipped: parsed.skipped,
+        ...(parsed.sample ? { sample: parsed.sample } : {})
       });
     }
   };
@@ -382,7 +467,8 @@ export async function drainRun(
       seq,
       carry: buffer,
       emitted: cursor.emitted + progress.length,
-      ...(result ? { result } : {})
+      ...(result ? { result } : {}),
+      ...(stderr ? { stderr } : {})
     };
     return code === undefined
       ? { done: false, cursor: next, progress }
@@ -391,7 +477,12 @@ export async function drainRun(
           cursor: next,
           progress,
           exitCode: code,
-          ...(result ? { result } : {})
+          ...(result ? { result } : {}),
+          // Only when there is no result. A session that reported for itself has
+          // said everything worth saying, and its stderr is the CLI's own
+          // diagnostic chatter — surfacing that beside a perfectly good report
+          // would bury the report.
+          ...(!result && stderr ? { stderr } : {})
         };
   };
 
@@ -452,7 +543,12 @@ export async function drainRun(
       absorb();
     }
     // stderr is Claude Code's own diagnostics, not the protocol stream. Kept out
-    // of the parser so a warning line cannot be mistaken for an event.
+    // of the parser so a warning line cannot be mistaken for an event — but
+    // **kept**, which it was not, because a process that dies before its first
+    // JSON line leaves nothing else behind. See `DrainCursor.stderr`.
+    if (event.name === "stderr" && event.value !== undefined) {
+      stderr = boundStderr(stderr + event.value);
+    }
     if (event.name === "exit") exitCode = event.code ?? -1;
   }
 
@@ -476,6 +572,32 @@ export async function drainRun(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** How much stderr is worth carrying, in characters. */
+const STDERR_MAX = 2_000;
+
+/**
+ * Keep stderr bounded, from both ends.
+ *
+ * Applied on every append rather than once at the end, so a session that prints
+ * megabytes to stderr — a verbose build, a runaway loop — cannot grow a Durable
+ * Object's memory while it does it.
+ *
+ * Head *and* tail because which end carries the answer depends on how the
+ * process died, and the caller cannot know in advance: a Node crash puts its
+ * error first and a stack after it, while a CLI that validates its arguments and
+ * gives up prints one line and exits, making that line the last thing there is.
+ * Keeping both ends costs a few hundred characters and removes the guess.
+ *
+ * Not a re-implementation of `/computer`'s `truncateOutput`: reaching across the
+ * subpath boundary for it would merge two realms `verify:exports` keeps apart,
+ * which is the same reason `/repo` carries its own.
+ */
+function boundStderr(text: string): string {
+  if (text.length <= STDERR_MAX) return text;
+  const half = Math.floor((STDERR_MAX - 1) / 2);
+  return `${text.slice(0, half)}…${text.slice(-half)}`;
 }
 
 /**

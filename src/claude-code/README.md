@@ -353,6 +353,56 @@ from the stub's byte stream, so the drain works across a Durable Object boundary
 and the container→workspace filesystem sync still fires when the stream reaches
 `done`.
 
+## The permission mode, and why it bypasses
+
+`-p` is headless. There is no terminal, so nothing can answer a permission
+prompt — and Claude Code's headless path does not wait for one, it **auto-denies**.
+
+That makes the CLI's default mode unusable here, in a way that does not look like
+a failure. `default` gates Write, Edit and every Bash command, so a session left
+on it reads the repository perfectly, cannot change one byte of it, and reports
+prose that reads like considered reluctance rather than a blocked tool. It exits
+0, and the subtask is recorded as completed.
+
+Both of those are still true, and they are why the mode is set explicitly rather
+than left to a reader of the report to notice. What has changed is that the
+denial is no longer silent: each refused call now arrives as a
+`permission denied for <Tool>: …` progress note and the count lands in the
+session's footer, so a run that did nothing says so somewhere. Before that, the
+only trace was a `permission_denials` field nothing read — which is how a
+deployment spent a release refusing every write while reporting success.
+
+So `permissionMode` defaults to `bypassPermissions`, and the narrower modes are
+not alternatives:
+
+| mode                | what a session can do                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------ |
+| `default`           | read only — everything else is auto-denied                                                             |
+| `acceptEdits`       | edit files; `npm ci`, `git` and the test suite still denied                                            |
+| `dontAsk`           | "deny if not pre-approved" — the default's behaviour, named                                            |
+| `plan`              | reads and produces a plan, changing nothing — and there is no interactive session here to approve it   |
+| `auto`              | a model classifier rules on each call, spending the same subscription bucket the session is drawing on |
+| `bypassPermissions` | the whole job                                                                                          |
+
+What makes bypassing acceptable is not the flag being careful. It is that the
+container has nothing left to protect: it holds no credential — the real one is
+swapped in by the egress gateway on the Worker side — and it already runs a
+cloned repository's `postinstall` and its test suite, which is arbitrary code
+execution by design. Gating the agent's own edits while those doors stand open
+costs the agent its job and buys nothing. Containment is the credential swap.
+
+> **The container runs as root, and that changes how the flag has to be passed.**
+> The CLI refuses to bypass its permission checks under uid 0 unless `IS_SANDBOX=1`
+> is set — it exits 1 _before_ its first JSON line, with the only explanation on
+> stderr. `buildLaunch` writes both in one branch so they cannot drift, and applies
+> the variable after a host's `env` so a host cannot unset it. If you run an image
+> that does not exec as root, that variable is the line to delete.
+
+A deployment that wants a different posture sets `permissionMode` and gets it —
+including `default`, if what it wants is a session that can only read. Whatever
+it picks, the denials are reported rather than inferred, which is what makes
+picking something other than the default a decision rather than a surprise.
+
 ## Costs
 
 Two numbers drive the sizing here — not a spend cap, which this package

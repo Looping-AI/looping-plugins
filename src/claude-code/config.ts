@@ -6,6 +6,28 @@
  * generates into a *consumer's* app and does not exist here, and on Workers
  * there is no module-scope `env` to read anyway.
  */
+/**
+ * The permission modes `claude --permission-mode` accepts.
+ *
+ * Spelled out rather than `string`, because a typo is otherwise a run that
+ * starts, denies everything, and reports prose about being unable to proceed —
+ * the exact failure this option exists to end. The CLI validates the value too,
+ * but it does so by exiting 1 with a message on stderr, and stderr reaches an
+ * operator far less reliably than a type error reaches a developer.
+ */
+export type PermissionMode =
+  "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk" | "auto";
+
+/**
+ * What a session runs under when a deployment says nothing.
+ *
+ * A default rather than a required field, and deliberately the permissive one:
+ * every other value produces a session that cannot edit the checkout it was
+ * given, so an unset mode is not a conservative choice, it is a broken one. See
+ * {@link ClaudeCodeConfig.permissionMode}.
+ */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions";
+
 export interface ClaudeCodeConfig {
   /**
    * The credential pool, in priority order — index 0 is tried first.
@@ -56,6 +78,36 @@ export interface ClaudeCodeConfig {
   /** Caps on Claude Code's own subagent tree. Advisory, like `maxTurns`. */
   maxSubagentDepth?: number;
   maxConcurrentSubagents?: number;
+
+  /**
+   * How the session answers its own permission prompts.
+   *
+   * **Defaults to `bypassPermissions`, and anything else breaks the session.**
+   * That reads like a strong claim for a security-shaped setting, so here is the
+   * measurement behind it: `claude -p` is headless, there is nobody to answer a
+   * prompt, and Claude Code's headless path *auto-denies* whatever `default`
+   * mode would have asked about. That is Write, Edit and every Bash command — so
+   * a session left on the default can read the repository and report on it, and
+   * cannot change one byte of it. It does not fail, either: it spends its turns
+   * rephrasing the same edit and reports what looks like a considered refusal.
+   *
+   * The narrower modes do not help. `acceptEdits` clears Write and Edit and
+   * leaves `npm ci`, `git` and the test suite denied; `dontAsk` is today's
+   * behaviour under another name; `auto` puts a model classifier in front of
+   * every tool call, spending the same subscription bucket the session is
+   * already drawing on to arrive at an answer it may still refuse.
+   *
+   * What makes bypassing acceptable is not this flag being careful. It is that
+   * the container has nothing to protect: it holds no credential — the real one
+   * is swapped in by the egress gateway on the Worker side — and it already runs
+   * a cloned repository's `postinstall` and its test suite, which is arbitrary
+   * code execution by design. Gating the agent's own edits while that stands
+   * open buys nothing. Containment is the credential swap.
+   *
+   * See {@link file://./run.ts buildLaunch} for the root guard this mode trips,
+   * which is the other half of making it work.
+   */
+  permissionMode?: PermissionMode;
 
   /**
    * Restrict the container's egress to these hosts, plus `api.anthropic.com`.
