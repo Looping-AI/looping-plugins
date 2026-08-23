@@ -361,7 +361,16 @@ prompt — and Claude Code's headless path does not wait for one, it **auto-deni
 That makes the CLI's default mode unusable here, in a way that does not look like
 a failure. `default` gates Write, Edit and every Bash command, so a session left
 on it reads the repository perfectly, cannot change one byte of it, and reports
-prose that reads like considered reluctance rather than a blocked tool. It exits 0. The subtask is recorded as completed. Nothing in the logs says "denied".
+prose that reads like considered reluctance rather than a blocked tool. It exits
+0, and the subtask is recorded as completed.
+
+Both of those are still true, and they are why the mode is set explicitly rather
+than left to a reader of the report to notice. What has changed is that the
+denial is no longer silent: each refused call now arrives as a
+`permission denied for <Tool>: …` progress note and the count lands in the
+session's footer, so a run that did nothing says so somewhere. Before that, the
+only trace was a `permission_denials` field nothing read — which is how a
+deployment spent a release refusing every write while reporting success.
 
 So `permissionMode` defaults to `bypassPermissions`, and the narrower modes are
 not alternatives:
@@ -371,6 +380,7 @@ not alternatives:
 | `default`           | read only — everything else is auto-denied                                                             |
 | `acceptEdits`       | edit files; `npm ci`, `git` and the test suite still denied                                            |
 | `dontAsk`           | "deny if not pre-approved" — the default's behaviour, named                                            |
+| `plan`              | reads and produces a plan, changing nothing — and there is no interactive session here to approve it   |
 | `auto`              | a model classifier rules on each call, spending the same subscription bucket the session is drawing on |
 | `bypassPermissions` | the whole job                                                                                          |
 
@@ -389,9 +399,9 @@ costs the agent its job and buys nothing. Containment is the credential swap.
 > that does not exec as root, that variable is the line to delete.
 
 A deployment that wants a different posture sets `permissionMode` and gets it —
-including `default`, if what it wants is a session that can only read. Denials
-are reported either way: each one arrives as a `permission denied for <Tool>: …`
-progress note, and the session's own denial count rides on the result.
+including `default`, if what it wants is a session that can only read. Whatever
+it picks, the denials are reported rather than inferred, which is what makes
+picking something other than the default a decision rather than a surprise.
 
 ## Costs
 
