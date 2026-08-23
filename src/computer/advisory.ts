@@ -23,7 +23,9 @@ import { humanMs } from "./render.js";
  *   {@link file://./gate.ts needsDependencies}, so a full workspace said nothing
  *   at all to `echo hi > file.txt` — the command whose write is being lost.
  * - "The tree is fine now", after a subagent installed by hand, had no way to be
- *   said except by fabricating a `done` with an invented exit code.
+ *   said except by fabricating a `done` with an invented exit code — and the
+ *   probe it rested on, a bare `test -d node_modules`, is satisfied by the
+ *   wreckage of the very install it was overriding.
  *
  * So an advisory is **derived at read time** and describes the workspace, not a
  * job. Its absence is the good case, which is what removes the need to invent
@@ -54,6 +56,18 @@ export type WorkspaceAdvisory =
       error: string;
       exitCode?: number;
       tail?: string;
+      /**
+       * Whether a `node_modules` directory is nevertheless sitting there.
+       *
+       * Reported rather than acted on, because its presence proves nothing in
+       * either direction. A half-finished `npm ci` leaves the directory behind
+       * with an incomplete tree, so treating existence as success hides the
+       * common failure outright; and a subagent that re-ran the install by hand
+       * leaves a record the host cannot update, since the host cannot see an
+       * install it did not start. Both look identical from here, so the reader
+       * is told which way the ambiguity runs rather than being handed a guess.
+       */
+      treePresent: boolean;
     }
   | { kind: "deps-absent"; reason: string }
   | { kind: "storage-exhausted"; bytes: number; capBytes: number };
@@ -156,7 +170,8 @@ export function renderAdvisory(
         `The host is still installing this checkout's dependencies ` +
         `(\`${advisory.command}\`, ${elapsed} so far).${quoted(advisory.tail)}`;
       return to === "tool-call"
-        ? `${fact}\n\nNothing was run — call again in a moment.`
+        ? `${fact}\n\nAnything importing from \`node_modules\` will fail until ` +
+            "it finishes."
         : `${fact}\n\nAnything importing from \`node_modules\` may fail until ` +
             "it finishes. Wait and retry rather than starting a second install " +
             "on top of the one already running.";
@@ -165,13 +180,22 @@ export function renderAdvisory(
     case "deps-broken": {
       const code =
         advisory.exitCode === undefined ? "" : ` (exit ${advisory.exitCode})`;
+      // Said once, for both audiences: the tree being there is not evidence the
+      // install worked, and a reader that assumes either way gets it wrong half
+      // the time.
+      const ambiguity = advisory.treePresent
+        ? " A `node_modules` directory is present, which settles nothing — a " +
+          "failed install leaves a partial one behind. If you re-ran the " +
+          "install yourself and it succeeded, this is stale; otherwise the tree " +
+          "is incomplete."
+        : "";
       const fact =
         `The host's dependency install \`${advisory.command}\` **failed**` +
         `${code}: ${advisory.error}${quoted(advisory.tail)}`;
       return to === "tool-call"
-        ? `${fact}\n\nThe command below still ran. Anything importing from ` +
-            "`node_modules` will fail until that install is re-run."
-        : `${fact}\n\nSo \`node_modules\` is missing or incomplete. Read that ` +
+        ? `${fact}\n\nAnything importing from \`node_modules\` will fail until ` +
+            `that install is re-run.${ambiguity}`
+        : `${fact}\n\nSo \`node_modules\` is missing or incomplete.${ambiguity} Read that ` +
             "output before treating a build or test failure as your own. If it " +
             "looks transient, re-run the install yourself. If it is an " +
             "environment fault you cannot fix from in here — no network, a " +
@@ -183,8 +207,8 @@ export function renderAdvisory(
     case "deps-absent": {
       const fact = `The host installed no dependencies: ${advisory.reason}.`;
       return to === "tool-call"
-        ? `${fact}\n\nThe command below still ran. If it needs \`node_modules\`, ` +
-            "install them yourself first."
+        ? `${fact}\n\nIf this command needs \`node_modules\`, install them ` +
+            "yourself first."
         : `${fact}\n\nIf you need \`node_modules\`, install them yourself first.`;
     }
 
@@ -194,8 +218,8 @@ export function renderAdvisory(
         `${gb(advisory.capBytes)} ceiling, so nothing further can be written ` +
         "to it.";
       return to === "tool-call"
-        ? `${fact}\n\nThe command below still ran, but any file it wrote is ` +
-            "gone. Stop and report this rather than retrying."
+        ? `${fact}\n\nNothing written to this workspace survives. Stop and ` +
+            "report this rather than retrying."
         : `${fact}\n\n**Nothing you write here will survive**, including every ` +
             "edit you are about to make. Report this and stop; an operator has " +
             "to reclaim the space or point this caller at a smaller repository.";
@@ -215,15 +239,21 @@ export interface AdvisoryInput {
   /** Set only when the workspace is over its ceiling. */
   storage?: { bytes: number; capBytes: number };
   /**
-   * Whether `node_modules` is on disk right now.
+   * Whether a `node_modules` directory exists — **existence only, not health**.
    *
-   * This is what makes a fabricated record unnecessary. A subagent that ran
-   * `npm ci` by hand leaves a `failed` record the host cannot update, because
-   * the host cannot see an install it did not start — so the record stays wrong
-   * and the *probe* is what corrects it. Reported as an absence rather than
-   * written back as a success with an invented exit code.
+   * Named for what it can actually observe. A host probes this with the
+   * equivalent of `test -d`, and that answers a narrower question than
+   * "are the dependencies fine": a `npm ci` that died partway leaves the
+   * directory behind holding an incomplete tree, so a `true` here is entirely
+   * consistent with the install having failed for real.
+   *
+   * So it never suppresses a proven failure. It travels onto the advisory as
+   * {@link WorkspaceAdvisory} `treePresent` and the reader is told which way the
+   * ambiguity runs. The alternative — treating it as proof of success — is what
+   * made a durable record of a failed install disappear on exactly the failure
+   * mode it was recording.
    */
-  dependenciesPresent: boolean;
+  dependencyTreePresent: boolean;
 }
 
 /**
@@ -263,20 +293,19 @@ export function deriveAdvisories(
       break;
 
     case "failed":
-      // Suppressed by the probe rather than by rewriting the record: the tree is
-      // the fact a caller cares about, and it is the one thing here that can be
-      // checked directly.
-      if (!input.dependenciesPresent) {
-        advisories.push({
-          kind: "deps-broken",
-          command: install.command,
-          error: install.error,
-          ...(install.exitCode === undefined
-            ? {}
-            : { exitCode: install.exitCode }),
-          ...(install.tail ? { tail: install.tail } : {})
-        });
-      }
+      // Always reported. The record is durable evidence that an install failed,
+      // and nothing available here is evidence that a later one succeeded — so
+      // the presence of a tree qualifies the advisory instead of deleting it.
+      advisories.push({
+        kind: "deps-broken",
+        command: install.command,
+        error: install.error,
+        treePresent: input.dependencyTreePresent,
+        ...(install.exitCode === undefined
+          ? {}
+          : { exitCode: install.exitCode }),
+        ...(install.tail ? { tail: install.tail } : {})
+      });
       break;
 
     case "skipped":

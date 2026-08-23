@@ -105,10 +105,57 @@ export function execGate(
   const relevant = relevantTo(advisories, command);
   if (relevant.length === 0) return {};
 
-  const text = relevant.map((a) => renderAdvisory(a, "tool-call")).join("\n\n");
-  return relevant.some((a) => shapeOf(a).transient)
-    ? { block: text }
-    : { warn: text };
+  /**
+   * The outcome is decided **before** anything is worded, and stated once.
+   *
+   * `renderAdvisory` deliberately makes no claim about whether the command ran,
+   * because no single advisory is in a position to know: the verdict comes from
+   * the whole set. Letting each one say so produced a straight contradiction the
+   * moment two coexisted — a full workspace explaining that "the command below
+   * still ran" inside a message that had just blocked it on an install in
+   * flight. One sentence, from the one place that has the answer.
+   */
+  const blocked = relevant.some((a) => shapeOf(a).transient);
+  const text = [
+    ...relevant.map((a) => renderAdvisory(a, "tool-call")),
+    blocked
+      ? "Nothing was run — call again in a moment."
+      : "The command below still ran."
+  ].join("\n\n");
+
+  return blocked ? { block: text } : { warn: text };
+}
+
+/**
+ * Whether a write should happen at all, and what to say when it should not.
+ *
+ * `sb_write` and `sb_edit` do not go through {@link execGate}: they run no
+ * command, and a dependency install has nothing to do with writing source. One
+ * thing does reach them, and it is the worst of the set — a workspace that
+ * accepts no further writes takes an edit, reports the character count, and
+ * drops it. The file tools are how a coding agent writes, so leaving them out
+ * would have missed the data loss where most of it happens.
+ *
+ * **Refused rather than warned**, which is the opposite of `execGate`'s rule for
+ * everything permanent, and the difference is what the caller can still do. A
+ * shell under a permanent advisory can do real work — `git status`, `ls`, the
+ * install itself — so refusing it would take away the diagnosis with the
+ * failure. A write under `writesPersist: false` has no successful outcome
+ * available: the only thing refusing costs is a false "wrote 120 characters",
+ * and that message is worse than nothing because it is believed.
+ */
+export function writeGate(
+  advisories: readonly WorkspaceAdvisory[]
+): string | undefined {
+  // Keyed on the axis, not on the kind: any future advisory that loses writes
+  // stops them here without this function being revisited.
+  const losing = advisories.filter((a) => !shapeOf(a).writesPersist);
+  if (losing.length === 0) return undefined;
+
+  return [
+    ...losing.map((a) => renderAdvisory(a, "tool-call")),
+    "Nothing was written."
+  ].join("\n\n");
 }
 
 /**

@@ -20,7 +20,7 @@ import {
   readBounded,
   readWindow
 } from "./read.js";
-import { execGate, execLostNote, type ExecGate } from "./gate.js";
+import { execGate, execLostNote, writeGate, type ExecGate } from "./gate.js";
 import type { WorkspaceAdvisory } from "./advisory.js";
 
 /**
@@ -89,7 +89,12 @@ export {
   renderResult,
   truncateOutput
 } from "./render.js";
-export { execGate, needsDependencies, type ExecGate } from "./gate.js";
+export {
+  execGate,
+  needsDependencies,
+  writeGate,
+  type ExecGate
+} from "./gate.js";
 /**
  * The workspace-advisory vocabulary, which a host needs all of: the type to
  * return over RPC, `deriveAdvisories` to build it from what it already knows,
@@ -233,7 +238,7 @@ export interface WorkspaceHost extends Rpc.DurableObjectBranded {
    * `deriveAdvisories` builds the array from what the host already knows, so
    * implementing this is gathering three values rather than writing policy.
    */
-  advisories(): Promise<WorkspaceAdvisory[]>;
+  advisories(): Promise<readonly WorkspaceAdvisory[]>;
 }
 
 /**
@@ -489,6 +494,26 @@ export function buildComputerTools(
   };
 
   /**
+   * Whether a write can succeed at all, asked once and not polled.
+   *
+   * Separate from {@link awaitAdvisories} because the question is different:
+   * there is no command to classify and nothing worth waiting for. An install in
+   * flight does not stop a file being written, and the one thing that does —
+   * a workspace that no longer accepts writes — never resolves on its own.
+   *
+   * Fails **open** for the same reason the exec gate does: a read of another
+   * Durable Object's state must not take out a working tool.
+   */
+  const refuseWrite = async (): Promise<string | undefined> => {
+    if (!advisories) return undefined;
+    try {
+      return writeGate(await advisories());
+    } catch {
+      return undefined;
+    }
+  };
+
+  /**
    * Host-supplied environment, with the undefined entries dropped.
    *
    * `RuntimeExecOptions.env` is `Record<string, string>`, and a config thunk
@@ -584,10 +609,12 @@ export function buildComputerTools(
          */
         const startedAtMs = Date.now();
 
-        // Only `sb_exec` consults the install. The file tools read and write
+        // Only `sb_exec` waits on an install. The file tools read and write
         // source, which is in the workspace and unaffected by an install in
         // flight — blocking them would stop the subagent doing the reading it
-        // could usefully do while it waits.
+        // could usefully do while it waits. They do consult `writeGate`, which
+        // is a different question: not "is the tree ready" but "does a write
+        // survive at all".
         const gate = await awaitAdvisories(command);
         const gateMsWaited = Date.now() - startedAtMs;
         if (gate.block) {
@@ -707,6 +734,10 @@ export function buildComputerTools(
       execute: async ({ path, content }) => {
         const refusal = guardPath(path, "sb_write");
         if (refusal) return refusal;
+        // Before the write, not after: the point is to not report a success that
+        // did not happen.
+        const lost = await refuseWrite();
+        if (lost) return lost;
         return inWorkspace("writing", path, async (fs) => {
           const dir = path.slice(0, path.lastIndexOf("/"));
           if (dir) await fs.mkdir(dir, { recursive: true });
@@ -743,6 +774,8 @@ export function buildComputerTools(
       execute: async ({ path, find, replace }) => {
         const refusal = guardPath(path, "sb_edit");
         if (refusal) return refusal;
+        const lost = await refuseWrite();
+        if (lost) return lost;
         return inWorkspace("editing", path, async (fs) => {
           const content = await fs.readFile(path, "utf8");
           const occurrences = content.split(find).length - 1;

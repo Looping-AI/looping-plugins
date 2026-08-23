@@ -1233,7 +1233,8 @@ describe("the advisory gate on sb_exec", () => {
         kind: "deps-broken",
         command: "npm ci",
         exitCode: 1,
-        error: "ERESOLVE could not resolve"
+        error: "ERESOLVE could not resolve",
+        treePresent: false
       }
     ]);
 
@@ -1254,7 +1255,8 @@ describe("the advisory gate on sb_exec", () => {
         kind: "deps-broken",
         command: "npm ci",
         exitCode: 1,
-        error: "ERESOLVE could not resolve"
+        error: "ERESOLVE could not resolve",
+        treePresent: false
       }
     ]);
 
@@ -1270,7 +1272,12 @@ describe("the advisory gate on sb_exec", () => {
    */
   it("says nothing about dependencies to a command that needs none", async () => {
     const { tools, execs } = gated([
-      { kind: "deps-broken", command: "npm ci", error: "ERESOLVE" }
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        error: "ERESOLVE",
+        treePresent: false
+      }
     ]);
 
     const out = await run(tools, "sb_exec", { command: "cat README.md" });
@@ -1297,6 +1304,67 @@ describe("the advisory gate on sb_exec", () => {
   });
 
   /**
+   * **The file tools are where the writes are.**
+   *
+   * `sb_exec` is not how a coding agent edits source — `sb_write` and `sb_edit`
+   * are, and they went straight to `fs.writeFile` and reported a character
+   * count. Against a workspace that accepts no more writes that count is a
+   * fabrication the model has no way to doubt, which is the same silent data
+   * loss this whole mechanism is about, at the entry point where most of it
+   * happens.
+   */
+  it("refuses a write when the workspace cannot keep it", async () => {
+    const path = "/workspace/repo/a.ts";
+    const { workspace, files } = stub();
+    const tools = buildComputerTools(workspace, { ...config }, async () => [
+      { kind: "storage-exhausted", bytes: 8.6e9, capBytes: 8e9 }
+    ]);
+
+    const out = await run(tools, "sb_write", { path, content: "x" });
+    expect(out).toContain("nothing further can be written");
+    expect(out).toContain("Nothing was written");
+    // The half that matters: no success report, and nothing on disk for a later
+    // read to find and conclude the edit had landed.
+    expect(out).not.toContain("character");
+    expect(files.has(path)).toBe(false);
+  });
+
+  it("refuses an edit on the same grounds, leaving the file alone", async () => {
+    const path = "/workspace/repo/a.ts";
+    const { workspace, files } = stub({ [path]: "const a = 1;\n" });
+    const tools = buildComputerTools(workspace, { ...config }, async () => [
+      { kind: "storage-exhausted", bytes: 8.6e9, capBytes: 8e9 }
+    ]);
+
+    const out = await run(tools, "sb_edit", { path, find: "1", replace: "2" });
+    expect(out).toContain("Nothing was written");
+    expect(files.get(path)).toBe("const a = 1;\n");
+  });
+
+  /**
+   * A dependency advisory must not reach a write. Source is not `node_modules`,
+   * the write will persist perfectly well, and refusing it would take away the
+   * one thing an agent can still usefully do while an install is broken.
+   */
+  it("still writes when the only trouble is dependencies", async () => {
+    const path = "/workspace/repo/a.ts";
+    const { workspace, files } = stub();
+    const tools = buildComputerTools(workspace, { ...config }, async () => [
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        error: "ERESOLVE",
+        treePresent: false
+      }
+    ]);
+
+    expect(await run(tools, "sb_write", { path, content: "x" })).toContain(
+      "wrote"
+    );
+    expect(files.get(path)).toBe("x");
+  });
+
+  /**
    * Both true at once, which the single-slot record this replaced could not
    * represent: it kept whichever was written last and silently dropped the
    * other. A command that waits out the install and never hears about the
@@ -1312,6 +1380,11 @@ describe("the advisory gate on sb_exec", () => {
     expect(execs).toHaveLength(0);
     expect(out).toContain("still installing");
     expect(out).toContain("nothing further can be written");
+    // The verdict is stated once, by the only thing that knows it. Rendering it
+    // per advisory produced a message that blocked the command and then told the
+    // model it had run.
+    expect(out).toContain("Nothing was run");
+    expect(out).not.toContain("still ran");
   });
 
   /** A command that throws still carries the warning — it explains the throw. */
@@ -1324,7 +1397,8 @@ describe("the advisory gate on sb_exec", () => {
         {
           kind: "deps-broken" as const,
           command: "npm ci",
-          error: "boom"
+          error: "boom",
+          treePresent: false
         }
       ]
     );

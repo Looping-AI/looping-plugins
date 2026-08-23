@@ -82,17 +82,27 @@ Two consequences worth stating outright:
 `binding` points at a class that owns the workspace and exposes two methods:
 
 - `__getWorkspaceStub()` — what `withWorkspace` from `@cloudflare/computer` installs.
-- `advisories()` — everything currently true about the workspace that a caller must
-  not assume away, or `[]`. Required rather than optional: a host that forgets to
-  expose it would otherwise get an `sb_exec` running against a half-built
-  `node_modules`, or against a workspace silently dropping every write.
+- `advisories(): Promise<readonly WorkspaceAdvisory[]>` — everything currently true
+  about the workspace that a caller must not assume away, or `[]`. Required rather
+  than optional: a host that forgets to expose it would otherwise get an `sb_exec`
+  running against a half-built `node_modules`, or an `sb_edit` reporting a character
+  count for an edit the workspace threw away.
 
-  Build it with `deriveAdvisories({ install, storage, dependenciesPresent })` rather
+  Build it with `deriveAdvisories({ install, storage, dependencyTreePresent })` rather
   than by hand — implementing this is gathering three values the host already has,
   not writing policy. Which advisories reach which commands, whether one may hold a
   command back, and how each is worded are decided here, in one place each. A host
   that renders its own wording is re-deriving severity from an error string, which
   is what this replaced.
+
+  `dependencyTreePresent` is existence only — `test -d node_modules` — and is
+  reported to the reader rather than acted on, because a `npm ci` that died partway
+  leaves the directory behind. It qualifies a failure; it never cancels one.
+
+  Two tools consult this. `sb_exec` waits out anything transient and warns about the
+  rest; `sb_write` and `sb_edit` **refuse** when an advisory says writes do not
+  survive, since a write has no successful outcome available there and reporting one
+  is worse than refusing.
 
 One workspace is one container is one repository, so `workspaceName` should derive
 from the verified caller and the repository — never from model input, or a model

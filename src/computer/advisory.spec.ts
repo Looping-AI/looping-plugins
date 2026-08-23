@@ -47,7 +47,12 @@ describe("what each advisory means", () => {
   it("makes an install in flight the only thing worth waiting for", () => {
     const kinds: WorkspaceAdvisory[] = [
       { kind: "deps-building", command: "npm ci", startedAt: Date.now() },
-      { kind: "deps-broken", command: "npm ci", error: "boom" },
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        error: "boom",
+        treePresent: false
+      },
       { kind: "deps-absent", reason: "no package.json" },
       full
     ];
@@ -59,7 +64,12 @@ describe("what each advisory means", () => {
   /** A dependency problem is not a reason to interrupt `cat README.md`. */
   it("keeps dependency advisories off commands that need no dependencies", () => {
     expect(
-      shapeOf({ kind: "deps-broken", command: "x", error: "y" }).universal
+      shapeOf({
+        kind: "deps-broken",
+        command: "x",
+        error: "y",
+        treePresent: false
+      }).universal
     ).toBe(false);
   });
 });
@@ -70,15 +80,60 @@ describe("who is being told", () => {
    * have is worse than silence: a session has no command that failed to run, so
    * "call again in a moment" would be an instruction it cannot follow.
    */
-  it("offers a tool call a retry and a session a wait", () => {
+  it("tells a session to wait, which a tool call cannot be told", () => {
     const building: WorkspaceAdvisory = {
       kind: "deps-building",
       command: "npm ci",
       startedAt: Date.now()
     };
-    expect(renderAdvisory(building, "tool-call")).toContain("call again");
-    expect(renderAdvisory(building, "session")).not.toContain("call again");
     expect(renderAdvisory(building, "session")).toContain("Wait and retry");
+    expect(renderAdvisory(building, "tool-call")).not.toContain(
+      "Wait and retry"
+    );
+  });
+
+  /**
+   * No advisory claims the command ran or did not, in either audience.
+   *
+   * It is not in a position to know — the verdict comes from the whole set, so
+   * two coexisting advisories would contradict each other outright. `execGate`
+   * says it once. This is the assertion that keeps the claim from creeping back
+   * into the wording.
+   */
+  it("never says whether the command ran", () => {
+    const all: WorkspaceAdvisory[] = [
+      { kind: "deps-building", command: "npm ci", startedAt: Date.now() },
+      { kind: "deps-broken", command: "npm ci", error: "x", treePresent: true },
+      { kind: "deps-absent", reason: "no package.json" },
+      full
+    ];
+    for (const advisory of all) {
+      for (const to of ["tool-call", "session"] as const) {
+        const text = renderAdvisory(advisory, to);
+        expect(text).not.toContain("still ran");
+        expect(text).not.toContain("Nothing was run");
+      }
+    }
+  });
+
+  /**
+   * A present `node_modules` is not evidence the install worked — a failed one
+   * leaves a partial tree behind. So the reader is told the ambiguity rather
+   * than handed a verdict either way.
+   */
+  it("flags a surviving tree as settling nothing", () => {
+    const broken = (treePresent: boolean): WorkspaceAdvisory => ({
+      kind: "deps-broken",
+      command: "npm ci",
+      error: "ERESOLVE",
+      treePresent
+    });
+    expect(renderAdvisory(broken(true), "session")).toContain(
+      "settles nothing"
+    );
+    expect(renderAdvisory(broken(false), "session")).not.toContain(
+      "settles nothing"
+    );
   });
 
   /**
@@ -94,8 +149,8 @@ describe("who is being told", () => {
 });
 
 describe("deriving what is true from what the host knows", () => {
-  const present = { dependenciesPresent: true };
-  const absent = { dependenciesPresent: false };
+  const present = { dependencyTreePresent: true };
+  const absent = { dependencyTreePresent: false };
 
   it("says nothing when the install succeeded", () => {
     expect(
@@ -137,27 +192,33 @@ describe("deriving what is true from what the host knows", () => {
   });
 
   /**
-   * The probe corrects the record instead of the record being rewritten.
+   * A durable record of a failure is never deleted by a weaker signal.
    *
-   * A subagent that runs `npm ci` by hand leaves a `failed` the host cannot
-   * update, because the host cannot see an install it did not start. Answering
-   * that by writing back a `done` meant inventing an exit code and a duration
-   * for a command that never ran, and putting editorial text in the field that
-   * holds an install's own output. Reported as an absence, none of that is
-   * needed.
+   * The probe behind `dependencyTreePresent` is `test -d node_modules`, which a
+   * `npm ci` that died halfway satisfies perfectly. Treating it as proof of
+   * success made the advisory vanish on precisely the failure it existed to
+   * report — so it qualifies the advisory instead, and the reader is told which
+   * way the ambiguity runs.
    */
-  it("drops a stale failure when the dependencies are actually there", () => {
-    expect(
-      deriveAdvisories({
-        install: {
-          state: "failed",
-          command: "npm ci",
-          finishedAt: Date.now(),
-          error: "ERESOLVE"
-        },
-        ...present
-      })
-    ).toEqual([]);
+  it("keeps reporting a failed install even when a tree is sitting there", () => {
+    const advisories = deriveAdvisories({
+      install: {
+        state: "failed",
+        command: "npm ci",
+        finishedAt: Date.now(),
+        error: "ERESOLVE"
+      },
+      ...present
+    });
+
+    expect(advisories).toEqual([
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        error: "ERESOLVE",
+        treePresent: true
+      }
+    ]);
   });
 
   /**
@@ -209,7 +270,12 @@ describe("what a session is told", () => {
   it("joins everything true into one brief", () => {
     const brief = sessionAdvisory([
       full,
-      { kind: "deps-broken", command: "npm ci", error: "ERESOLVE" }
+      {
+        kind: "deps-broken",
+        command: "npm ci",
+        error: "ERESOLVE",
+        treePresent: false
+      }
     ]);
     expect(brief).toContain("nothing further can be written");
     expect(brief).toContain("ERESOLVE");
