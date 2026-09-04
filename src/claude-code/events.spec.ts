@@ -92,9 +92,9 @@ describe("parseStream", () => {
 
   /**
    * The single most important line in the module. Claude Code runs its own
-   * subagents and they talk on this same stream; they are invisible to Looping's
-   * scheduler and unreachable by its cancellation sweep, so their chatter is
-   * noise the parent can neither act on nor stop.
+   * subagents and they talk on this same stream; they are invisible to Dynamic
+   * Agents' scheduler and unreachable by its cancellation sweep, so their
+   * chatter is noise the parent can neither act on nor stop.
    */
   it("drops messages belonging to Claude Code's own subagents", () => {
     const buffer =
@@ -365,7 +365,7 @@ describe("toProgress", () => {
    *
    * A chunk that dies mid-drain is retried, the re-attach replays the tail, and
    * the same turns are parsed again. Re-parsing from the same offset must
-   * produce the same keys, so the gateway drops the repeats.
+   * produce the same keys, so the gatekeeper drops the repeats.
    */
   it("produces identical keys when a replayed tail is parsed twice", () => {
     const tail = assistant("running tests") + assistant("running tests");

@@ -1,9 +1,9 @@
-# `@loopingai/plugins/computer`
+# `@dynamicagents/plugins/computer`
 
 A Linux container whose filesystem outlives it.
 
 ```ts
-import { computer } from "@loopingai/plugins/computer";
+import { computer } from "@dynamicagents/plugins/computer";
 
 computer({
   binding: env.WORKSPACE,

@@ -27,7 +27,7 @@
  * `packageManager` pin, then lockfiles in the order the plan lists them.
  */
 
-import type { JobState } from "@loopingai/core/job";
+import type { JobState } from "@dynamicagents/core/job";
 
 /** Just enough of a workspace filesystem to inspect a checkout. */
 export interface InstallProbe {
@@ -59,7 +59,7 @@ export interface InstallProbe {
  * hand-written union it replaced. Every reader still spells `status.command` at
  * the top level and no call site moved.
  *
- * The `/job` subpath landed in `@loopingai/core` **0.8.1**, which is why the
+ * The `/job` subpath landed in `@dynamicagents/core` **0.8.1**, which is why the
  * peer range is `^0.8.1` rather than the `^0.8.0` the rest of this package would
  * otherwise be content with. A consumer resolving 0.8.0 does not get a subtly
  * wrong type here, it gets an unresolvable import — so the floor is stated in

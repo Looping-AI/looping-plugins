@@ -6,7 +6,7 @@ import {
 } from "./credentials.js";
 
 /**
- * `@loopingai/plugins/claude-code` — the container's only way out.
+ * `@dynamicagents/plugins/claude-code` — the container's only way out.
  *
  * `egress: { mode: "http-gateway", gateway }` makes `computerd` intercept every
  * outbound request in the container and tunnel it back to the workspace Durable

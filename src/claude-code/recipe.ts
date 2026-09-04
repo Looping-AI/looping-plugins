@@ -1,4 +1,4 @@
-import type { ResolvedRecipe, SubtaskTypeSpec } from "@loopingai/core";
+import type { ResolvedRecipe, SubtaskTypeSpec } from "@dynamicagents/core";
 
 /** The Subtask type a "make this change" request decomposes into. */
 export const CLAUDE_CODE_TYPE = "claude-code";
@@ -39,8 +39,8 @@ export const WORKSPACE_RUNTIME_KEY = "workspaceName";
  *   Nothing sends it to a model.
  * - `limits.maxTurns` — the budget core would meter if it were driving. It is
  *   not, so what actually bounds a session is `timeoutMs`, enforced by the
- *   container runtime. Set to 1 to say so: one Looping "turn" is one whole
- *   Claude Code session.
+ *   container runtime. Set to 1 to say so: one Dynamic Agents "turn" is one
+ *   whole Claude Code session.
  */
 export const CLAUDE_CODE_RECIPE: ResolvedRecipe = {
   key: CLAUDE_CODE_TYPE,

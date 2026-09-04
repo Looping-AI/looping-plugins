@@ -1,9 +1,9 @@
-# `@loopingai/plugins/recall`
+# `@dynamicagents/plugins/recall`
 
 Episodic memory over Cloudflare Vectorize.
 
 ```ts
-import { recall } from "@loopingai/plugins/recall";
+import { recall } from "@dynamicagents/plugins/recall";
 
 recall({
   ai: env.AI,

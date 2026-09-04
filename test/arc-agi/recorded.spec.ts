@@ -34,7 +34,7 @@ import { makeArcClient } from "../../src/arc-agi/client.js";
 import { parseGrid } from "../../src/arc-agi/analysis.js";
 import type { ArcSession } from "../../src/arc-agi/types.js";
 import { ctx, callTool, memStore } from "./helpers.js";
-import { setupRecording } from "@loopingai/core/testing";
+import { setupRecording } from "@dynamicagents/core/testing";
 
 setupRecording();
 

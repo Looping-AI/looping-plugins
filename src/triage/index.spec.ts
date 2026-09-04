@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
-import { TEST_MODELS } from "@loopingai/core/testing";
+import { TEST_MODELS } from "@dynamicagents/core/testing";
 import type { LanguageModel } from "ai";
 import type { SessionMessage } from "agents/experimental/memory/session";
-import { createAgentRuntime } from "@loopingai/core";
-import { mockModel } from "@loopingai/core/testing";
+import { createAgentRuntime } from "@dynamicagents/core";
+import { mockModel } from "@dynamicagents/core/testing";
 import {
   buildTriagePrompt,
   isNoReplyTurn,
@@ -27,7 +27,7 @@ function msg(role: "user" | "assistant", text: string): SessionMessage {
   } as SessionMessage;
 }
 
-/** A user turn wrapped in the gateway's provenance tag, as production stores it. */
+/** A user turn wrapped in the gatekeeper's provenance tag, as production stores it. */
 function turn(from: string, body: string): SessionMessage {
   return msg(
     "user",

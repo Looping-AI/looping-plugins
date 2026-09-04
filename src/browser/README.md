@@ -1,9 +1,9 @@
-# `@loopingai/plugins/browser`
+# `@dynamicagents/plugins/browser`
 
 Read the web, via Cloudflare Browser Rendering Quick Actions.
 
 ```ts
-import { browser } from "@loopingai/plugins/browser";
+import { browser } from "@dynamicagents/plugins/browser";
 
 browser({ binding: env.BROWSER });
 ```

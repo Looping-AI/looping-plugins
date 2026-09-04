@@ -1,8 +1,8 @@
 import { tool } from "ai";
 import type { ToolSet } from "ai";
 import { z } from "zod";
-import { definePlugin } from "@loopingai/core";
-import type { AgentPlugin } from "@loopingai/core";
+import { definePlugin } from "@dynamicagents/core";
+import type { AgentPlugin } from "@dynamicagents/core";
 import { getWorkspace, shellQuote } from "@cloudflare/computer";
 import type { WorkspaceClient, WorkspaceStub } from "@cloudflare/computer";
 import { guardPath } from "./paths.js";
@@ -24,14 +24,14 @@ import { execGate, execLostNote, writeGate, type ExecGate } from "./gate.js";
 import type { WorkspaceAdvisory } from "./advisory.js";
 
 /**
- * `@loopingai/plugins/computer` — a Linux container whose filesystem outlives it.
+ * `@dynamicagents/plugins/computer` — a Linux container whose filesystem outlives it.
  *
  * The filesystem **is** a Durable Object's SQLite, mounted into the container
  * over FUSE by `computerd`. Commands see a normal `/workspace`; the Worker reads
  * the same tree over RPC; and when the container is replaced the tree is pushed
  * back into the new one.
  *
- * Not to be confused with `@loopingai/plugins/workspace`, which is a virtual
+ * Not to be confused with `@dynamicagents/plugins/workspace`, which is a virtual
  * filesystem with no processes and nothing to run. Install exactly one
  * filesystem plugin — an agent holding two gives the model no way to know which
  * one a path refers to.
@@ -293,7 +293,7 @@ function wrapped(command: string, shell: string): string {
  *
  * This is the variant for a caller that **reads the result in code**: `stdout` is
  * a data channel it compares or parses, and `stderr` is a separate diagnostic.
- * {@link computerExec} is that caller, on behalf of `@loopingai/plugins/repo`,
+ * {@link computerExec} is that caller, on behalf of `@dynamicagents/plugins/repo`,
  * which asks git questions like `symbolic-ref --short refs/remotes/origin/HEAD`
  * and `rev-list --count` and needs the answer alone.
  *
@@ -406,7 +406,7 @@ export interface ComputerConfig {
    * a `CI` flag, proxy settings. Host-supplied and never model input.
    *
    * "These tools" is exact: {@link computerExec} deliberately does not merge it,
-   * so a proxy set here does not reach the git that `@loopingai/plugins/repo`
+   * so a proxy set here does not reach the git that `@dynamicagents/plugins/repo`
    * runs through that export. The reasoning, and how a host opts in explicitly,
    * is written up there.
    *
@@ -427,7 +427,7 @@ export interface ComputerConfig {
    *
    * Do not hand the agent the credential; hand it the *action*. Keep the secret
    * on the Worker and expose one tool that makes the call it is for.
-   * `@loopingai/plugins/repo` is the worked example: it holds a forge token, calls
+   * `@dynamicagents/plugins/repo` is the worked example: it holds a forge token, calls
    * the API from the Worker, and runs clone, fetch and push on the host's side of
    * the boundary. **No command in its container is ever given that token.**
    */
@@ -1022,7 +1022,7 @@ export function buildComputerTools(
  * An `exec` bound to this workspace, for plugins that need a shell but should
  * not own a container.
  *
- * `@loopingai/plugins/repo` is the reason this exists: it needs `git` on a real
+ * `@dynamicagents/plugins/repo` is the reason this exists: it needs `git` on a real
  * shell, but depending on this module would weld the two together and stop a
  * host from pointing it at its own container. Structurally typed for the same
  * reason — the two plugins compose without either importing the other.

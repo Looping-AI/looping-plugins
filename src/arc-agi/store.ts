@@ -2,7 +2,7 @@ import { desc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
-import type { PluginStore } from "@loopingai/core";
+import type { PluginStore } from "@dynamicagents/core";
 import type { ScorecardStore } from "./scorecard.js";
 import type { CookieJar, Scorecard } from "./types.js";
 

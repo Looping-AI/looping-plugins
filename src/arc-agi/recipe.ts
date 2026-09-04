@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { ResolvedRecipe, SubtaskTypeSpec } from "@loopingai/core";
+import type { ResolvedRecipe, SubtaskTypeSpec } from "@dynamicagents/core";
 import { ARC_GAME_SOUL } from "./soul.js";
 import { ARC_CAPABILITY, arcDelegationGuidance } from "./main-agent.js";
 

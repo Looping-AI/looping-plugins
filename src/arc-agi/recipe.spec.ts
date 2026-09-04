@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { TEST_MODELS } from "@loopingai/core/testing";
+import { TEST_MODELS } from "@dynamicagents/core/testing";
 import {
   createAgentRuntime,
   validateRecipe,
   DEFAULT_CORE_CONFIG,
   MAX_CHUNKS_PER_BRANCH
-} from "@loopingai/core";
+} from "@dynamicagents/core";
 import { ARC_GAME_RECIPE, ARC_GAME_SPEC, ARC_GAME_TYPE } from "./recipe.js";
 import { arcAgi } from "./index.js";
 

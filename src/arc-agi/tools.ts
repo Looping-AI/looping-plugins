@@ -1,7 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
-import type { ToolFamilyContext, RecipeToolSet } from "@loopingai/core";
-import { runtimeAs } from "@loopingai/core/subtasks";
+import type { ToolFamilyContext, RecipeToolSet } from "@dynamicagents/core";
+import { runtimeAs } from "@dynamicagents/core/subtasks";
 import { makeArcClient } from "./client.js";
 import {
   colorHistogram,
@@ -350,7 +350,7 @@ export function buildArcGameTools(
             session.levelsReported.push(frame.levels_completed);
             emitProgress({
               // One play per execution, so the level alone identifies the note;
-              // the gateway dedupes on this key.
+              // the gatekeeper dedupes on this key.
               key: `arc:${session.gameId}:level:${frame.levels_completed}`,
               text:
                 `ARC ${session.gameId}: reached level ${frame.levels_completed}` +

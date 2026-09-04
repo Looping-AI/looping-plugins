@@ -70,8 +70,8 @@ export interface ClaudeCodeConfig {
    * Ceiling on the *outer* session's turns.
    *
    * Advisory. Claude Code's own subagent tree multiplies whatever this says, and
-   * the tree is invisible to Looping's scheduler. {@link timeoutMs} is the
-   * ceiling that actually holds, because the container runtime enforces it.
+   * the tree is invisible to Dynamic Agents' scheduler. {@link timeoutMs} is
+   * the ceiling that actually holds, because the container runtime enforces it.
    */
   maxTurns?: number;
 

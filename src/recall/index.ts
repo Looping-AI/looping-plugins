@@ -3,12 +3,12 @@ import type { ToolSet } from "ai";
 import { z } from "zod";
 import { createWorkersAI } from "workers-ai-provider";
 import type { SessionMessage } from "agents/experimental/memory/session";
-import { definePlugin } from "@loopingai/core";
-import type { AgentPlugin } from "@loopingai/core";
-import { parseTurn, sessionText } from "@loopingai/core/agent";
+import { definePlugin } from "@dynamicagents/core";
+import type { AgentPlugin } from "@dynamicagents/core";
+import { parseTurn, sessionText } from "@dynamicagents/core/agent";
 
 /**
- * `@loopingai/plugins/recall` — episodic memory over Cloudflare Vectorize.
+ * `@dynamicagents/plugins/recall` — episodic memory over Cloudflare Vectorize.
  *
  * When the Session compacts, the raw messages it folds into a summary would
  * otherwise be lost. Core announces that moment (`onMessagesDisplaced`) because

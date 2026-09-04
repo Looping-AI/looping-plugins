@@ -233,7 +233,7 @@ export function renderResult(
  * {@link computerExec} has no verdict line, only the four fields its caller
  * branches on. A *killed* process writes nothing, so without this a `git clone`
  * that hit the ten-minute ceiling reaches the model through
- * `@loopingai/plugins/repo` as `clone failed:` with an empty reason — which reads
+ * `@dynamicagents/plugins/repo` as `clone failed:` with an empty reason — which reads
  * like a bug in the plugin rather than a limit it can work within.
  *
  * Only `cancelled`. A `failed` status is an ordinary non-zero exit, where the

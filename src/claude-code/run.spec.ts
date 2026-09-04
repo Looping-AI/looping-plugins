@@ -325,7 +325,7 @@ describe("drainRun", () => {
 
   /**
    * Progress keys are positional, so the count has to survive the chunk boundary
-   * or the second chunk restarts at `claude:0` and the gateway drops every note
+   * or the second chunk restarts at `claude:0` and the gatekeeper drops every note
    * as a duplicate of one it already showed.
    */
   it("continues the progress numbering across chunks", async () => {
