@@ -59,11 +59,13 @@ export interface InstallProbe {
  * hand-written union it replaced. Every reader still spells `status.command` at
  * the top level and no call site moved.
  *
- * The `/job` subpath landed in `@dynamicagents/core` **0.8.1**, which is why the
- * peer range is `^0.8.1` rather than the `^0.8.0` the rest of this package would
- * otherwise be content with. A consumer resolving 0.8.0 does not get a subtly
- * wrong type here, it gets an unresolvable import — so the floor is stated in
- * `package.json` rather than left to chance.
+ * The `/job` subpath landed in core **0.8.1** — before the rename, so under the
+ * predecessor scope rather than this one — and once justified a peer floor of
+ * `^0.8.1` rather than the `^0.8.0` the rest of this package would otherwise
+ * have been content with: a consumer resolving 0.8.0 does not get a subtly
+ * wrong type here, it gets an unresolvable import. That floor is no longer
+ * this file's to argue for. `^0.9.0` is the range now, every core it admits
+ * carries `/job`, and the constraint is the release train's.
  */
 export type InstallState = JobState<{ command: string }>;
 
