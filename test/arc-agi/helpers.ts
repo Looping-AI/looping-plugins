@@ -1,7 +1,10 @@
-import type { ToolFamilyContext } from "@loopingai/core";
-import type { WorkspaceHandle } from "@loopingai/core";
-import type { ProgressEvent, SubtaskRuntime } from "@loopingai/core/subtasks";
-import type { SubtaskParams } from "@loopingai/core";
+import type { ToolFamilyContext } from "@dynamicagents/core";
+import type { WorkspaceHandle } from "@dynamicagents/core";
+import type {
+  ProgressEvent,
+  SubtaskRuntime
+} from "@dynamicagents/core/subtasks";
+import type { SubtaskParams } from "@dynamicagents/core";
 import type { ScorecardStore } from "../../src/arc-agi/scorecard.js";
 import type { Scorecard } from "../../src/arc-agi/types.js";
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Install the sibling `looping-core` checkout into this repo, for developing
- * across the two at once.
+ * Install the sibling `core` checkout into this repo, for developing across the
+ * two at once.
  *
  * `npm pack` + tarball install, deliberately — **not `npm link`**, and not a
  * `file:` dependency either:
@@ -22,7 +22,7 @@
  *
  * ## Why this repo needs it
  *
- * `@loopingai/core` is a **peer** dependency here, so a plain `npm install`
+ * `@dynamicagents/core` is a **peer** dependency here, so a plain `npm install`
  * resolves it from the registry — and will happily overwrite a local build of it
  * that you are in the middle of testing against. The failure is quiet and
  * misleading: the next `tsc` reports type errors in *this* repo's source, for a
@@ -44,21 +44,21 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 /** Checkouts this repo builds against. A missing one is an error. */
-const SIBLINGS = ["looping-core"];
+const SIBLINGS = ["core"];
 
 /**
  * Packed too when present, skipped when not.
  *
- * `looping-a2a-protocol` is core's own dependency rather than this repo's —
- * nothing here imports it — so it normally arrives transitively from the
- * registry. But a local core built against an unpublished protocol change needs
- * that change installed too, or the tarball resolves the published copy and the
- * two disagree.
+ * `g2a-protocol` is core's own dependency rather than this repo's — nothing
+ * here imports it — so it normally arrives transitively from the registry. But a
+ * local core built against an unpublished protocol change needs that change
+ * installed too, or the tarball resolves the published copy and the two
+ * disagree.
  */
-const OPTIONAL_SIBLINGS = ["looping-a2a-protocol"];
+const OPTIONAL_SIBLINGS = ["g2a-protocol"];
 
 const root = path.resolve(import.meta.dirname, "..");
-const out = mkdtempSync(path.join(tmpdir(), "looping-pack-"));
+const out = mkdtempSync(path.join(tmpdir(), "da-pack-"));
 const tarballs = [];
 
 for (const name of [...SIBLINGS, ...OPTIONAL_SIBLINGS]) {
@@ -116,7 +116,7 @@ execFileSync("npm", ["install", "--no-save", ...tarballs], {
  * Put the lockfile back exactly as it was.
  *
  * `--no-save` protects the *manifest*, not the lockfile: npm can still pin
- * `@loopingai/*` to `file:/var/folders/…/looping-pack-*.tgz`. Those paths do not
+ * `@dynamicagents/*` to `file:/var/folders/…/da-pack-*.tgz`. Those paths do not
  * exist on a CI runner — or on this machine once the temp dir is cleaned — so the
  * damage surfaces as a failed install belonging to whoever pulls next, with no
  * connection to the command that caused it.

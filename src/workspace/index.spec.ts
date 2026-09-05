@@ -1,12 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { TEST_MODELS } from "@loopingai/core/testing";
+import { TEST_MODELS } from "@dynamicagents/core/testing";
 import {
   createAgentRuntime,
   makeWorkspaceHandle,
   memoryWorkspaceBacking,
   WORKSPACE_MAX_FILE_BYTES
-} from "@loopingai/core";
-import type { ToolFamilyContext } from "@loopingai/core";
+} from "@dynamicagents/core";
+import type { ToolFamilyContext } from "@dynamicagents/core";
 import { buildWorkspaceTools, workspace, WORKSPACE_FAMILY } from "./index.js";
 import { callNamed as call } from "../../test/helpers.js";
 

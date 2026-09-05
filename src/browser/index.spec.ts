@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { TEST_MODELS } from "@loopingai/core/testing";
-import { createAgentRuntime, PLUGIN_CONTRACT_VERSION } from "@loopingai/core";
-import type { SessionLike } from "@loopingai/core/agent";
+import { TEST_MODELS } from "@dynamicagents/core/testing";
+import {
+  createAgentRuntime,
+  PLUGIN_CONTRACT_VERSION
+} from "@dynamicagents/core";
+import type { SessionLike } from "@dynamicagents/core/agent";
 import { browser, BROWSER_FAMILY } from "./index.js";
 import type { QuickActionBinding } from "agents/browser";
 

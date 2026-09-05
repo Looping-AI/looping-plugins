@@ -1,5 +1,5 @@
-import { definePlugin } from "@loopingai/core";
-import type { AgentPlugin } from "@loopingai/core";
+import { definePlugin } from "@dynamicagents/core";
+import type { AgentPlugin } from "@dynamicagents/core";
 import type { ToolSet } from "ai";
 import { createQuickActionTools } from "agents/browser/ai";
 import type { QuickActionToolName } from "agents/browser/ai";
@@ -9,7 +9,7 @@ import type {
 } from "agents/browser";
 
 /**
- * `@loopingai/plugins/browser` — read the web, via Cloudflare Browser Rendering
+ * `@dynamicagents/plugins/browser` — read the web, via Cloudflare Browser Rendering
  * Quick Actions.
  *
  * Four tools (`browser_markdown`, `browser_extract`, `browser_links`,

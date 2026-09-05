@@ -1,5 +1,5 @@
-import { definePlugin, PLUGIN_CONTRACT_VERSION } from "@loopingai/core";
-import type { AgentPlugin } from "@loopingai/core";
+import { definePlugin, PLUGIN_CONTRACT_VERSION } from "@dynamicagents/core";
+import type { AgentPlugin } from "@dynamicagents/core";
 import { claudeCodeEgress } from "./egress.js";
 import { credentialPool } from "./credentials.js";
 import type { CredentialStore, Lead } from "./credentials.js";
@@ -26,7 +26,7 @@ import {
 } from "./recipe.js";
 
 /**
- * `@loopingai/plugins/claude-code` — subtasks that run the Claude Code CLI.
+ * `@dynamicagents/plugins/claude-code` — subtasks that run the Claude Code CLI.
  *
  * ## Why this exists
  *

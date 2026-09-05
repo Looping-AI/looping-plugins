@@ -3,12 +3,12 @@ import type { LanguageModel } from "ai";
 import { z } from "zod";
 import { createWorkersAI } from "workers-ai-provider";
 import type { SessionMessage } from "agents/experimental/memory/session";
-import { definePlugin } from "@loopingai/core";
-import type { AgentPlugin } from "@loopingai/core";
-import { parseTurn, sessionText } from "@loopingai/core/agent";
+import { definePlugin } from "@dynamicagents/core";
+import type { AgentPlugin } from "@dynamicagents/core";
+import { parseTurn, sessionText } from "@dynamicagents/core/agent";
 
 /**
- * `@loopingai/plugins/triage` — decide whether an inbound message deserves a
+ * `@dynamicagents/plugins/triage` — decide whether an inbound message deserves a
  * reply at all, *before* the tool loop runs.
  *
  * An agent in a shared channel sees every message, and most are not for it. Left
@@ -127,7 +127,7 @@ function truncate(text: string, max: number): string {
 }
 
 /**
- * Render one stored message as a transcript line. User turns carry the gateway's
+ * Render one stored message as a transcript line. User turns carry the gatekeeper's
  * `<turn from="…">` provenance, so the speaker's name is surfaced rather than a
  * flat "user" — without it the classifier cannot tell one participant from
  * another, which is most of what it has to reason about. Assistant turns are

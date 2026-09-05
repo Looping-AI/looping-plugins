@@ -1,7 +1,7 @@
 {
-  "name": "@loopingai/plugins",
-  "version": "0.8.1",
-  "description": "Optional, composable capabilities for Looping agents: ARC-AGI-3, browser rendering, a Linux container, git and pull requests, workspace, episodic recall, and pre-turn triage. One subpath per plugin, so a bundle grows only with what it imports.",
+  "name": "@dynamicagents/plugins",
+  "version": "0.9.0",
+  "description": "Optional, composable capabilities for a Dynamic Agent: ARC-AGI-3, browser rendering, a Linux container, git and pull requests, workspace, episodic recall, and pre-turn triage. One subpath per plugin, so a bundle grows only with what it imports.",
   "keywords": [
     "ai-agents",
     "cloudflare-workers",
@@ -14,15 +14,15 @@
     "git",
     "plugins"
   ],
-  "license": "GPL-3.0-only",
-  "author": "Looping AI",
-  "homepage": "https://github.com/Looping-AI/looping-plugins#readme",
+  "license": "Apache-2.0",
+  "author": "Dynamic Agents",
+  "homepage": "https://github.com/dynamicagents/plugins#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Looping-AI/looping-plugins.git"
+    "url": "git+https://github.com/dynamicagents/plugins.git"
   },
   "bugs": {
-    "url": "https://github.com/Looping-AI/looping-plugins/issues"
+    "url": "https://github.com/dynamicagents/plugins/issues"
   },
   "type": "module",
   "sideEffects": false,
@@ -85,9 +85,9 @@
   "peerDependencies": {
     "@cloudflare/computer": "^0.2.1",
     "@cloudflare/shell": "^0.4.3",
-    "@loopingai/core": "^0.8.1",
-    "agents": "^0.20.0",
-    "ai": "^7.0.52",
+    "@dynamicagents/core": "^0.9.0",
+    "agents": "^0.21.0",
+    "ai": "^7.0.77",
     "drizzle-orm": "^0.45.2",
     "workers-ai-provider": "^4.0.0",
     "zod": "^4.4.3"
@@ -103,20 +103,20 @@
   "devDependencies": {
     "@cloudflare/computer": "^0.2.1",
     "@cloudflare/shell": "0.4.3",
-    "@cloudflare/vitest-pool-workers": "^0.21.3",
-    "@loopingai/core": "^0.8.1",
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@dynamicagents/core": "^0.9.0",
     "@types/node": "^26.2.0",
-    "agents": "^0.20.0",
-    "ai": "^7.0.52",
+    "agents": "^0.21.0",
+    "ai": "^7.0.77",
     "drizzle-orm": "^0.45.2",
-    "eslint": "^10.8.0",
+    "eslint": "^10.9.0",
     "husky": "^9.1.7",
     "prettier": "^3.9.6",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.66.0",
-    "vitest": "^4.1.10",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.11",
     "workers-ai-provider": "^4.0.0",
-    "wrangler": "^4.119.0",
+    "wrangler": "^4.125.0",
     "zod": "^4.4.3"
   },
   "engines": {

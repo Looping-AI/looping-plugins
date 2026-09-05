@@ -1,8 +1,8 @@
 import { tool } from "ai";
 import type { ToolSet } from "ai";
 import { z } from "zod";
-import { definePlugin } from "@loopingai/core";
-import type { AgentPlugin } from "@loopingai/core";
+import { definePlugin } from "@dynamicagents/core";
+import type { AgentPlugin } from "@dynamicagents/core";
 import {
   DEFAULT_ALLOWED_HOSTS,
   parseRepo,
@@ -22,10 +22,10 @@ import { refreshCheckout, resolveDefaultBranch } from "./checkout.js";
 export { parseRepo } from "./url.js";
 
 /**
- * `@loopingai/plugins/repo` — clone, commit, push, open a pull request.
+ * `@dynamicagents/plugins/repo` — clone, commit, push, open a pull request.
  *
  * Layered over a container rather than owning one: it needs a shell with `git`
- * on it, and `@loopingai/plugins/computer` provides exactly that through
+ * on it, and `@dynamicagents/plugins/computer` provides exactly that through
  * `computerExec`. Passing `exec` in rather than importing that plugin keeps the
  * two independent — a host with its own container can use this against that
  * instead, and the tests here need no container at all.
@@ -125,7 +125,7 @@ export type RepoExec = (
  * on `exec` where they are cheap and where the model can see them work.
  *
  * A host implements this against whatever git it has on its own side of the
- * boundary. The coder in `looping-starter` runs isomorphic-git inside the
+ * boundary. The coder in `starter` runs isomorphic-git inside the
  * Durable Object that owns the workspace filesystem, so a push reads the token
  * from that object's environment and the container never holds one.
  *
@@ -292,8 +292,8 @@ export interface RepoCheckout {
 const DEFAULT_WORKDIR = "/workspace";
 const DEFAULT_API_BASE = "https://api.github.com";
 const DEFAULT_AUTHOR = {
-  name: "looping-coder",
-  email: "coder@looping.invalid"
+  name: "da-coder",
+  email: "coder@dynamicagents.invalid"
 };
 const DEFAULT_MAX_OUTPUT_CHARS = 16_000;
 /**
@@ -702,7 +702,7 @@ export function buildRepoTools(
           authorization: `Bearer ${secret.token}`,
           accept: "application/vnd.github+json",
           "content-type": "application/json",
-          "user-agent": "looping-coder"
+          "user-agent": "da-coder"
         },
         ...(init ? { body: JSON.stringify(init.body) } : {}),
         signal: AbortSignal.timeout(FORGE_TIMEOUT_MS)

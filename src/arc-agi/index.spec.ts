@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { arcAgi } from "./index.js";
 import { memStore } from "../../test/arc-agi/helpers.js";
-import type { RecipeExecutionResult } from "@loopingai/core/subtasks";
+import type { RecipeExecutionResult } from "@dynamicagents/core/subtasks";
 
 /**
  * The plugin's own seams — leasing and enrichment — as the parent drives them.

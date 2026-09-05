@@ -1,18 +1,18 @@
-# @loopingai/plugins
+# @dynamicagents/plugins
 
-**Optional, composable capabilities for Looping agents.**
+**Optional, composable capabilities for a Dynamic Agent.**
 
 One subpath per plugin, one factory per subpath, config passed at instantiation. Your bundle
 grows only with what you import.
 
 ```bash
-npm install @loopingai/plugins
+npm install @dynamicagents/plugins
 ```
 
 > Part of a three-package split:
-> [`@loopingai/core`](https://github.com/Looping-AI/looping-core) (the mandatory foundation) ·
-> **`@loopingai/plugins`** (this) ·
-> [`looping-starter`](https://github.com/Looping-AI/looping-starter) (a working agent that composes them).
+> [`@dynamicagents/core`](https://github.com/dynamicagents/core) (the mandatory foundation) ·
+> **`@dynamicagents/plugins`** (this) ·
+> [`starter`](https://github.com/dynamicagents/starter) (a working agent that composes them).
 
 ---
 
@@ -20,9 +20,9 @@ npm install @loopingai/plugins
 
 ```ts
 // src/plugins.ts
-import { arcAgi } from "@loopingai/plugins/arc-agi";
-import { browser } from "@loopingai/plugins/browser";
-import { recall } from "@loopingai/plugins/recall";
+import { arcAgi } from "@dynamicagents/plugins/arc-agi";
+import { browser } from "@dynamicagents/plugins/browser";
+import { recall } from "@dynamicagents/plugins/recall";
 
 export interface PluginHost {
   env: Env;
@@ -39,7 +39,7 @@ export const plugins = ({ env, storage, callerKey }: PluginHost) => [
 ```
 
 Delete a line and that module leaves your bundle entirely. Nothing in core imports a plugin,
-and there is **no root barrel** — `@loopingai/plugins` on its own does not resolve — so the
+and there is **no root barrel** — `@dynamicagents/plugins` on its own does not resolve — so the
 guarantee is structural rather than a tree-shaker's opinion. `npm run verify:exports` asserts
 it on the built graph before every publish.
 
@@ -66,7 +66,7 @@ export class MyAgent extends Agent<Env> {
     });
   }
 
-  async onTurn(turn: AgentTurn, identity: GatewayIdentity) {
+  async onTurn(turn: AgentTurn, identity: GatekeeperIdentity) {
     this.identity ??= identity.key!;
     // …
   }
@@ -99,7 +99,7 @@ snippet — a plugin cannot add its own binding, which is why it declares what i
 ## Writing one
 
 ```ts
-import { definePlugin, type AgentPlugin } from "@loopingai/core";
+import { definePlugin, type AgentPlugin } from "@dynamicagents/core";
 
 export function scraper(config: { apiKey: string }): AgentPlugin {
   return definePlugin({
@@ -125,7 +125,7 @@ Three rules the whole design rests on:
 ## Testing
 
 Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the harness from
-`@loopingai/core/testing`.
+`@dynamicagents/core/testing`.
 
 ```bash
 npm test          # the whole suite, no credentials and no network
@@ -135,11 +135,11 @@ npm run verify:exports
 
 ### Working against an unpublished core
 
-`@loopingai/core` is a **peer** dependency, so a plain `npm install` always resolves
+`@dynamicagents/core` is a **peer** dependency, so a plain `npm install` always resolves
 it from the registry — including over a local build you are testing against.
 
 ```bash
-npm run link:local   # npm pack + tarball install from ../looping-core
+npm run link:local   # npm pack + tarball install from ../core
 ```
 
 Run it after changing core, **and after any `npm install` here**, which silently

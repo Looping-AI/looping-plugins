@@ -5,7 +5,7 @@ import type {
   WorkspaceRuntimeGetOptions,
   WorkspaceRuntimeKillOptions
 } from "@cloudflare/computer";
-import type { ProgressEvent } from "@loopingai/core/subtasks";
+import type { ProgressEvent } from "@dynamicagents/core/subtasks";
 import {
   parseStream,
   toProgress,
@@ -17,7 +17,7 @@ import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./config.js";
 /**
  * Launching Claude Code in the workspace container, and draining it in windows.
  *
- * ## One Looping subtask is one `claude -p` session
+ * ## One Dynamic Agents subtask is one `claude -p` session
  *
  * Not one turn, and not one tool call. The unit has to be substantial because of
  * what an invocation costs before it does anything: the harness carries an
@@ -126,10 +126,11 @@ export interface LaunchOptions {
   /**
    * Caps on Claude Code's own subagent tree.
    *
-   * These steer rather than enforce, and the distinction matters: the inner tree
-   * is invisible to Looping's scheduler and unreachable by its cancellation
-   * sweep, so a cap it chooses to ignore has no backstop. What actually bounds
-   * the spend is the egress gateway, which every inner call also crosses.
+   * These steer rather than enforce, and the distinction matters: the inner
+   * tree is invisible to Dynamic Agents' scheduler and unreachable by its
+   * cancellation sweep, so a cap it chooses to ignore has no backstop. What
+   * actually bounds the spend is the egress gateway, which every inner call
+   * also crosses.
    */
   maxSubagentDepth?: number;
   maxConcurrentSubagents?: number;

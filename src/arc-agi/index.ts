@@ -1,6 +1,6 @@
-import { definePlugin } from "@loopingai/core";
-import type { AgentPlugin } from "@loopingai/core";
-import type { RecipeExecutionResult } from "@loopingai/core/subtasks";
+import { definePlugin } from "@dynamicagents/core";
+import type { AgentPlugin } from "@dynamicagents/core";
+import type { RecipeExecutionResult } from "@dynamicagents/core/subtasks";
 import { makeArcClient } from "./client.js";
 import { buildArcGamesTools } from "./game-tools.js";
 import { ARC_GAME_SPEC, ARC_GAME_TYPE } from "./recipe.js";
@@ -18,7 +18,7 @@ import { ARC_GAME_FAMILY, buildArcGameTools } from "./tools.js";
 import type { ArcRuntime } from "./types.js";
 
 /**
- * `@loopingai/plugins/arc-agi` — play ARC-AGI-3 games.
+ * `@dynamicagents/plugins/arc-agi` — play ARC-AGI-3 games.
  *
  * The stress test for the whole plugin contract, and the reason three of its
  * hooks exist. In the predecessor these were four leaks in the agent's Durable

@@ -1,13 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
 
-  // Dev-only. `@loopingai/plugins` is a library and never deploys — this config
+  // Dev-only. `@dynamicagents/plugins` is a library and never deploys — this config
   // exists so `@cloudflare/vitest-pool-workers` has a Worker to bind, and so the
   // recorded ARC spec has an `ARC_API_KEY` binding for vitest.config.ts to fill
   // from `.env.test`. It is excluded from the published tarball by
   // `package.json`'s `files` allowlist; a consumer brings their own, and each
   // plugin's README ships the snippet.
-  "name": "looping-plugins-test",
+  "name": "da-plugins-test",
   "main": "test/worker.ts",
   // 2026-08-04 is not an arbitrary "recent enough" date: it is the day
   // `nodejs_compat` became a default rather than a flag. The Agents SDK reaches

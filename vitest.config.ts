@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { createVcr, recordFromEnv } from "@loopingai/core/testing/node";
+import { createVcr, recordFromEnv } from "@dynamicagents/core/testing/node";
 
 /**
  * Specs run **inside workerd**, not Node.
@@ -58,8 +58,8 @@ export default defineConfig({
     /**
      * Force one copy of every shared peer.
      *
-     * `@loopingai/core` is installed as `file:../looping-core` for the inner
-     * loop, which npm satisfies with a symlink — and Vite resolves through
+     * `@dynamicagents/core` is installed as `file:../core` for the inner loop,
+     * which npm satisfies with a symlink — and Vite resolves through
      * realpath, so core's imports land in *its* `node_modules` while this
      * package's land in ours. Two copies of `agents` in one Worker breaks
      * `instanceof` and makes `Session`/`SessionMessage` two unrelated types,
@@ -104,7 +104,7 @@ export default defineConfig({
   test: {
     // Node realm. Flushes cassettes and stops the recorder after the run;
     // without it a `RECORD=1` run hangs on open sockets.
-    globalSetup: ["@loopingai/core/testing/vcr-global-setup"],
+    globalSetup: ["@dynamicagents/core/testing/vcr-global-setup"],
     include: ["src/**/*.spec.ts", "test/**/*.spec.ts"]
   }
 });

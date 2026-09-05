@@ -1,5 +1,5 @@
 /**
- * `@loopingai/plugins/claude-code` — the credential pool, and how exhaustion is
+ * `@dynamicagents/plugins/claude-code` — the credential pool, and how exhaustion is
  * detected.
  *
  * ## Why a pool rather than a budget

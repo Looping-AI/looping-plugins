@@ -28,9 +28,9 @@ jobs:
           # One source of truth with local dev; `engines` requires >=24.
           node-version-file: .nvmrc
 
-      # `@loopingai/core` always from the registry, never from a sibling
-      # checkout. A `file:../looping-core` install is an inner-loop convenience,
-      # and a package that only builds against one must never be able to ship.
+      # `@dynamicagents/core` always from the registry, never from a sibling
+      # checkout. A `file:../core` install is an inner-loop convenience, and a
+      # package that only builds against one must never be able to ship.
       - run: npm ci
 
       # `npm test` alone would pass on code that neither typechecks nor formats:

@@ -1,4 +1,4 @@
-# `@loopingai/plugins/claude-code`
+# `@dynamicagents/plugins/claude-code`
 
 Subtasks that run the **Claude Code CLI** inside the agent's workspace container,
 against the durable checkout.
@@ -23,18 +23,18 @@ tools, its own loop and its own context management, so there is nothing for
 core's resumable runner to drive. The plugin declares a subtask type; the host's
 subagent overrides `executeChunk` and drives a session instead.
 
-**One Looping subtask is one `claude -p` session.** Not one turn, and not one
-tool call — the unit has to be substantial, because of what an invocation costs
-before it does anything (see [Costs](#costs)).
+**One Dynamic Agents subtask is one `claude -p` session.** Not one turn, and not
+one tool call — the unit has to be substantial, because of what an invocation
+costs before it does anything (see [Costs](#costs)).
 
 Two nested notions of "subagent" that must never be conflated:
 
-|                                | Looping subtask                                | Claude Code subagent          |
-| ------------------------------ | ---------------------------------------------- | ----------------------------- |
-| Durable                        | yes                                            | no                            |
-| Visible to Looping's scheduler | yes                                            | **no**                        |
-| Cancellable by Looping         | yes                                            | **no**                        |
-| Bounded by                     | `timeoutMs`, enforced by the container runtime | `CLAUDE_CODE_MAX_*`, advisory |
+|                                      | Dynamic Agents subtask                         | Claude Code subagent          |
+| ------------------------------------ | ---------------------------------------------- | ----------------------------- |
+| Durable                              | yes                                            | no                            |
+| Visible to Dynamic Agents' scheduler | yes                                            | **no**                        |
+| Cancellable by Dynamic Agents        | yes                                            | **no**                        |
+| Bounded by                           | `timeoutMs`, enforced by the container runtime | `CLAUDE_CODE_MAX_*`, advisory |
 
 ## The credential never enters the container
 

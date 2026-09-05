@@ -1,9 +1,9 @@
-# `@loopingai/plugins/workspace`
+# `@dynamicagents/plugins/workspace`
 
 A durable file store for long subagent runs, and the model-facing tools over it.
 
 ```ts
-import { workspace } from "@loopingai/plugins/workspace";
+import { workspace } from "@dynamicagents/plugins/workspace";
 
 workspace();
 ```

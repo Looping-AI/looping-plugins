@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
-import { TEST_MODELS } from "@loopingai/core/testing";
-import { createAgentRuntime } from "@loopingai/core";
-import type { SessionLike } from "@loopingai/core/agent";
+import { TEST_MODELS } from "@dynamicagents/core/testing";
+import { createAgentRuntime } from "@dynamicagents/core";
+import type { SessionLike } from "@dynamicagents/core/agent";
 import type { SessionMessage } from "agents/experimental/memory/session";
 import {
   archiveMessages,
@@ -24,7 +24,7 @@ function msg(id: string, role: "user" | "assistant", text: string) {
   } as SessionMessage;
 }
 
-/** A user turn wrapped in the gateway's provenance tag, as production stores it. */
+/** A user turn wrapped in the gatekeeper's provenance tag, as production stores it. */
 function turn(id: string, from: string, body: string): SessionMessage {
   return msg(
     id,

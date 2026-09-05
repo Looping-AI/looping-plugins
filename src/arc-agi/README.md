@@ -1,9 +1,9 @@
-# `@loopingai/plugins/arc-agi`
+# `@dynamicagents/plugins/arc-agi`
 
 Play [ARC-AGI-3](https://arcprize.org) games.
 
 ```ts
-import { arcAgi } from "@loopingai/plugins/arc-agi";
+import { arcAgi } from "@dynamicagents/plugins/arc-agi";
 
 arcAgi({ apiKey: env.ARC_API_KEY, storage: this.ctx.storage });
 ```

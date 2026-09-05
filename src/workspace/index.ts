@@ -1,16 +1,16 @@
 import { tool } from "ai";
 import type { ToolSet } from "ai";
 import { z } from "zod";
-import { definePlugin } from "@loopingai/core";
+import { definePlugin } from "@dynamicagents/core";
 import type {
   AgentPlugin,
   WorkspaceBacking,
   WorkspaceHandle
-} from "@loopingai/core";
+} from "@dynamicagents/core";
 import { Workspace } from "@cloudflare/shell";
 
 /**
- * `@loopingai/plugins/workspace` — a durable file store for long subagent runs,
+ * `@dynamicagents/plugins/workspace` — a durable file store for long subagent runs,
  * and the model-facing tools over it.
  *
  * Core already owns the *interface*: `WorkspaceHandle`, `WorkspaceBacking`, the

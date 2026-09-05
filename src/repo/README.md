@@ -1,10 +1,10 @@
-# `@loopingai/plugins/repo`
+# `@dynamicagents/plugins/repo`
 
 Clone, commit, push a work branch, open a pull request.
 
 ```ts
-import { repo } from "@loopingai/plugins/repo";
-import { computerExec } from "@loopingai/plugins/computer";
+import { repo } from "@dynamicagents/plugins/repo";
+import { computerExec } from "@dynamicagents/plugins/computer";
 
 repo({
   // Runs in the container. Never given a credential.
@@ -12,7 +12,7 @@ repo({
   // Yours to implement — this package exports the `RepoGit` type, not a
   // backing for it, because the token has to live on your side of the
   // boundary. Clone, fetch and push only; see "Where the token lives" below.
-  // `looping-starter`'s coder does it with isomorphic-git inside the Durable
+  // `starter`'s coder does it with isomorphic-git inside the Durable
   // Object that owns the workspace filesystem.
   git: workspaceGit({ binding: env.WORKSPACE }),
   token: () => env.GITHUB_TOKEN
@@ -44,7 +44,7 @@ environment.
 
 `clone`, `fetch` and `push` — the three operations that authenticate — do not run
 there. They go to the injected `git`, which the host implements on its own side of
-the boundary. The coder in `looping-starter` runs isomorphic-git inside the Durable
+the boundary. The coder in `starter` runs isomorphic-git inside the Durable
 Object that owns the workspace filesystem: the same files the container mounts,
 reached without a shell. No hooks, no `ext::` transport, no template directory, no
 credential helpers.

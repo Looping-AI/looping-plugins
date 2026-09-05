@@ -1,9 +1,9 @@
-# `@loopingai/plugins/triage`
+# `@dynamicagents/plugins/triage`
 
 Decide whether an inbound message deserves a reply **before** the tool loop runs.
 
 ```ts
-import { triage } from "@loopingai/plugins/triage";
+import { triage } from "@dynamicagents/plugins/triage";
 
 triage({ ai: env.AI, aiGatewayId: "my-gateway" });
 ```
@@ -40,7 +40,7 @@ import {
   noReplyTool,
   isNoReplyTurn,
   NO_REPLY_TOOL_NAME
-} from "@loopingai/plugins/triage";
+} from "@dynamicagents/plugins/triage";
 ```
 
 Wiring is your loop's: offer the tool until the agent has spoken, withdraw it after, and stop

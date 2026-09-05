@@ -1,4 +1,4 @@
-import type { ProgressEvent } from "@loopingai/core/subtasks";
+import type { ProgressEvent } from "@dynamicagents/core/subtasks";
 
 /**
  * `claude -p --output-format stream-json` on the wire, turned into things this
@@ -206,10 +206,11 @@ function readDenial(event: Record<string, unknown>): ClaudeCodeEvent {
  * **Messages carrying `parent_tool_use_id` are dropped**, and this is the single
  * most important line in the module. Claude Code runs its *own* subagents, and
  * every message one of them produces arrives on this same stream tagged with the
- * parent tool-use that spawned it. Forwarding those fills the Looping parent's
- * context with the inner tree's chatter — which it can neither act on nor
- * cancel, because those subagents are invisible to Looping's scheduler. The tag
- * is the only reliable way to tell the two apart, so it is the filter.
+ * parent tool-use that spawned it. Forwarding those fills the Dynamic Agents
+ * parent's context with the inner tree's chatter — which it can neither act on
+ * nor cancel, because those subagents are invisible to Dynamic Agents'
+ * scheduler. The tag is the only reliable way to tell the two apart, so it is
+ * the filter.
  *
  * `result` and `init` are never nested and are read unconditionally.
  */
@@ -413,7 +414,7 @@ function describe(event: ClaudeCodeEvent): string | undefined {
     // nine of them for a one-line README edit. The tool names added nothing to
     // the turns that *did* have text either, so the prefix goes with them.
     //
-    // Same policy the in-process agents already apply in the gateway
+    // Same policy the in-process agents already apply in the gatekeeper
     // (src/agents/shared/loop.ts: "Tool-only steps stay silent in Slack").
     // Deliberately narrower than silencing the whole channel: `denied` and
     // `retry` below stay, because they are the only evidence of a session that

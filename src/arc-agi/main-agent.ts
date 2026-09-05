@@ -1,4 +1,4 @@
-import type { DelegationNames } from "@loopingai/core";
+import type { DelegationNames } from "@dynamicagents/core";
 
 /**
  * Everything the **main agent** is told about ARC-AGI-3 — the counterpart to

@@ -16,7 +16,7 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { buildArcGameTools } from "./tools.js";
-import type { ToolFamilyContext } from "@loopingai/core";
+import type { ToolFamilyContext } from "@dynamicagents/core";
 import { parseGrid } from "./analysis.js";
 import type { ArcSession, FrameResponse } from "./types.js";
 import { ctx, callTool } from "../../test/arc-agi/helpers.js";

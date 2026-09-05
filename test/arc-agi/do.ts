@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { doStorage, makeDoHelpers } from "@loopingai/core/testing";
+import { doStorage, makeDoHelpers } from "@dynamicagents/core/testing";
 import {
   arcScorecardStore,
   makeScorecardStore,
