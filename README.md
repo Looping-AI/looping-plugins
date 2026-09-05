@@ -1,6 +1,6 @@
 # @dynamicagents/plugins
 
-**Optional, composable capabilities for a Dynamic Agents agent.**
+**Optional, composable capabilities for a Dynamic Agent.**
 
 One subpath per plugin, one factory per subpath, config passed at instantiation. Your bundle
 grows only with what you import.
