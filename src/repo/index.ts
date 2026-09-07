@@ -230,6 +230,16 @@ export interface RepoConfig {
    * what stops a git plugin growing an opinion about npm — the host wires this
    * to whatever its runtime does, or leaves it unset and nothing changes.
    *
+   * **Record {@link RepoCheckout.dir} here, and record it on its own.** Installing
+   * is the use this hook was written for, and it is not the only obligation:
+   * `dir` is reported nowhere else, so a host that does not persist it has no
+   * way to answer "where is the checkout" afterwards. Persisting it *as part of*
+   * an install is the trap, because an install is conditional and the checkout is
+   * not — a host that stored the path alongside its install state found that a
+   * repository the resolver had nothing to install in (no `package.json`) cloned
+   * perfectly, reported itself correctly, and could never be worked in, because
+   * the one path its subagents needed was written on a branch that never ran.
+   *
    * Awaited, so it can record intent durably, but it must **return quickly**:
    * it runs inside `repo_clone`, which runs inside a model turn. A host that
    * wants to install here should start a job and return, not wait for it.
@@ -269,7 +279,14 @@ export interface RepoConfig {
 
 /** What {@link RepoConfig.afterCheckout} is told about a checkout. */
 export interface RepoCheckout {
-  /** Absolute path of the working tree. */
+  /**
+   * Absolute path of the working tree.
+   *
+   * The only report of it there is. Nothing in this plugin holds state, so a
+   * host that does not persist this cannot find the checkout again — and must
+   * persist it unconditionally rather than as a side effect of whatever else the
+   * hook does. See {@link RepoConfig.afterCheckout}.
+   */
   dir: string;
   /** The clone URL, already allowlist-checked. */
   url: string;
