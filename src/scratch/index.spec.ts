@@ -12,16 +12,23 @@ import {
  * The scratchpad's mechanics, with no container.
  *
  * `exec` is injected precisely so this is testable without one, which lets the
- * assertions be made on the exact command strings — and the command strings are
- * where the two properties worth protecting live: a fresh scratchpad is a
- * repository that can be **reset**, and a container that did not answer never
- * looks like a repository that is not there.
+ * assertions be made on the exact command strings, working directory and
+ * environment — which is where the properties worth protecting live. A
+ * scratchpad has to be a repository that can be **reset**, a reset has to empty
+ * it, and a container that did not answer must never look like a repository that
+ * is not there.
  *
  * What is deliberately *not* here is anything about how a host addresses a
  * scratchpad — which workspace it selects, how it is recorded, when it is
  * reclaimed. That is the host's, exercised in the host's own suite through the
  * two hooks.
  */
+
+interface Ran {
+  command: string;
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+}
 
 /** A shell that records what it was asked and answers from a script. */
 function fakeExec(
@@ -31,7 +38,7 @@ function fakeExec(
     success: true
   })
 ) {
-  const commands: { command: string; cwd?: string; env?: unknown }[] = [];
+  const commands: Ran[] = [];
   const exec: ScratchConfig["exec"] = async (command, options) => {
     commands.push({
       command,
@@ -50,9 +57,15 @@ function fakeExec(
   return { exec, commands };
 }
 
-/** "Nothing is checked out here" — what `rev-parse` says on a bare directory. */
-const noRepository = (command: string) =>
-  command.startsWith("git rev-parse") ? { success: false } : { success: true };
+/** The probe is the only command that starts with `test`. */
+const isProbe = (command: string) => command.startsWith("test -e");
+const isInit = (command: string) => command.includes("git init");
+const isReset = (command: string) => command.includes("git clean");
+const isStatus = (command: string) => command.startsWith("git status");
+
+/** "There is no usable scratchpad here" — what the probe says on a bare path. */
+const nothingThere = (command: string) =>
+  isProbe(command) ? { success: false } : { success: true };
 
 const open = async (
   config: ScratchConfig,
@@ -68,31 +81,101 @@ const open = async (
   return await execute(input, {});
 };
 
+describe("finding out whether there is one", () => {
+  /**
+   * A command's working directory has to exist before the command starts. Asking
+   * this from inside the scratchpad makes the very **first** open — the one where
+   * the directory is not there yet — fail before git runs, which this plugin
+   * cannot tell apart from a container that did not answer. The result is a
+   * scratchpad that can never be created, reported as infrastructure.
+   */
+  it("asks from a directory that exists", async () => {
+    const { exec, commands } = fakeExec(nothingThere);
+
+    await open({ exec });
+
+    expect(commands[0]!.command).toSatisfy(isProbe);
+    expect(commands[0]!.cwd).toBe("/");
+  });
+
+  /**
+   * `git rev-parse` from inside the scratchpad walks *upwards*, so a scratchpad
+   * sitting anywhere within another repository answers yes — and a later
+   * `reset: true` would then discard that repository's tree instead. The question
+   * is whether the scratchpad is itself a repository root.
+   */
+  it("does not accept a repository above the scratchpad", async () => {
+    const { exec, commands } = fakeExec(nothingThere);
+
+    await open({ exec });
+
+    expect(commands[0]!.command).toContain('test -e "$SCRATCH_DIR/.git"');
+  });
+
+  /**
+   * `git init` and the commit after it are two commands, and only the pair is
+   * meaningful — an open interrupted between them leaves a repository with no
+   * `HEAD`, which is exactly the state a host's cancellation cleanup cannot
+   * recover from. So the probe asks for the commit, not just the repository, and
+   * an incomplete scratchpad is repaired rather than accepted.
+   */
+  it("repairs a repository that has no commit", async () => {
+    const { exec, commands } = fakeExec((command) =>
+      // `.git` is there; `rev-parse HEAD` is what fails.
+      isProbe(command) ? { success: false } : { success: true }
+    );
+
+    await open({ exec });
+
+    expect(commands[0]!.command).toContain("rev-parse --verify -q HEAD");
+    expect(commands.some((c) => isInit(c.command))).toBe(true);
+  });
+});
+
 describe("opening a scratchpad", () => {
   /**
    * **The empty commit is the assertion.** Without a `HEAD`, `git reset --hard`
    * fails outright — and that is what a host runs to discard a cancelled task's
    * edits. Since such cleanup is best-effort in every host that has one, the
-   * failure would be a logged warning plus a cancelled run's files surviving
-   * into the next task as its starting point.
+   * failure would be a logged warning plus a cancelled run's files surviving into
+   * the next task as its starting point.
    */
   it("creates a repository that can be reset", async () => {
-    const { exec, commands } = fakeExec(noRepository);
+    const { exec, commands } = fakeExec(nothingThere);
 
     const said = await open({ exec });
 
-    const init = commands.find((c) => c.command.includes("git init"));
+    const init = commands.find((c) => isInit(c.command));
     expect(init).toBeDefined();
     expect(init!.command).toContain("git commit -q --allow-empty");
     // From outside the scratchpad, since the command's first act is to create it.
     expect(init!.cwd).toBe("/");
-    // Through the environment, so a name with a quote in it stays a value.
-    expect(init!.env).toEqual({
-      GIT_NAME: "da-coder",
-      GIT_EMAIL: "coder@dynamicagents.invalid"
-    });
-    expect(said).toContain(`Opened a new scratchpad at ${DEFAULT_SCRATCH_DIR}`);
+    expect(said).toContain(`Opened a scratchpad at ${DEFAULT_SCRATCH_DIR}`);
     expect(said).toContain("nothing in it is pushed anywhere");
+  });
+
+  /**
+   * Every value reaches the shell as data. Double quotes still expand `$(…)`,
+   * backticks and variables, so a host directory or a committer name containing
+   * one would otherwise be shell rather than a value — a different path, or a
+   * command nobody asked for.
+   */
+  it("never spells a configured value in shell text", async () => {
+    const { exec, commands } = fakeExec(nothingThere);
+
+    await open({
+      exec,
+      dir: "/srv/pad",
+      author: { name: 'A "quoted" name', email: "a@b.test" }
+    });
+
+    for (const ran of commands) {
+      expect(ran.command).not.toContain("/srv/pad");
+      expect(ran.command).not.toContain("quoted");
+      expect(ran.env?.SCRATCH_DIR).toBe("/srv/pad");
+    }
+    const init = commands.find((c) => isInit(c.command))!;
+    expect(init.env?.GIT_NAME).toBe('A "quoted" name');
   });
 
   /**
@@ -108,7 +191,7 @@ describe("opening a scratchpad", () => {
 
     expect(said).toContain("could not reach the container");
     expect(said).toContain("Nothing was created or changed");
-    expect(commands.some((c) => c.command.includes("git init"))).toBe(false);
+    expect(commands.some((c) => isInit(c.command))).toBe(false);
   });
 
   /**
@@ -119,36 +202,61 @@ describe("opening a scratchpad", () => {
    */
   it("reuses what an earlier task left, unless asked to reset", async () => {
     const { exec, commands } = fakeExec((command) =>
-      command.startsWith("git status")
+      isStatus(command)
         ? { success: true, stdout: "?? primes.mjs\n" }
         : { success: true }
     );
 
     const said = await open({ exec });
 
-    expect(commands.some((c) => c.command.includes("git clean"))).toBe(false);
+    expect(commands.some((c) => isReset(c.command))).toBe(false);
     expect(said).toContain("Reopened the scratchpad");
     expect(said).toContain("primes.mjs");
   });
 
+  /**
+   * **`-ff`, not `-f`.** One force leaves untracked nested repositories in place,
+   * and a scratchpad is where those turn up — cloning something to look at it is
+   * one of the things it is for. Anything short of the second force reports an
+   * emptiness it did not deliver.
+   */
   it("empties it when asked", async () => {
     const { exec, commands } = fakeExec();
 
     const said = await open({ exec }, { reset: true });
 
-    expect(commands.some((c) => c.command.includes("git clean -fdxq"))).toBe(
-      true
-    );
+    const cleaned = commands.find((c) => isReset(c.command));
+    expect(cleaned!.command).toContain("git clean -ffdxq");
     expect(said).toContain("emptied it");
     // Nothing is asked about the tree — this call is what made it empty.
-    expect(commands.some((c) => c.command.startsWith("git status"))).toBe(
-      false
+    expect(commands.some((c) => isStatus(c.command))).toBe(false);
+  });
+
+  /**
+   * Establishing the repository is not the same as establishing an empty tree.
+   * `git init` over a directory that already holds files leaves every one of
+   * them, so the tree still has to be read — the alternative is telling the model
+   * a scratchpad is empty and letting it write a brief for one.
+   */
+  it("does not claim an initialised scratchpad is empty", async () => {
+    const { exec, commands } = fakeExec((command) =>
+      isProbe(command)
+        ? { success: false }
+        : isStatus(command)
+          ? { success: true, stdout: "?? left-behind.txt\n" }
+          : { success: true }
     );
+
+    const said = await open({ exec });
+
+    expect(commands.some((c) => isStatus(c.command))).toBe(true);
+    expect(said).not.toContain("It is empty");
+    expect(said).toContain("left-behind.txt");
   });
 
   it("says what went wrong when the repository cannot be created", async () => {
     const { exec } = fakeExec((command) =>
-      command.startsWith("git rev-parse") || command.includes("git init")
+      isProbe(command) || isInit(command)
         ? { success: false }
         : { success: true }
     );
@@ -170,13 +278,10 @@ describe("the host's half", () => {
     const order: string[] = [];
     const { exec } = fakeExec((command) => {
       order.push(command);
-      return noRepository(command);
+      return nothingThere(command);
     });
 
-    await open({
-      exec,
-      beforeOpen: () => order.push("selected")
-    });
+    await open({ exec, beforeOpen: () => order.push("selected") });
 
     expect(order[0]).toBe("selected");
   });
@@ -198,7 +303,7 @@ describe("the host's half", () => {
 
   it("hands the host the scratchpad it opened", async () => {
     const seen: unknown[] = [];
-    const { exec } = fakeExec(noRepository);
+    const { exec } = fakeExec(nothingThere);
 
     await open({
       exec,
@@ -217,7 +322,7 @@ describe("the host's half", () => {
    * durable record agrees.
    */
   it("reports a scratchpad the host cannot see, rather than claiming it is open", async () => {
-    const { exec } = fakeExec(noRepository);
+    const { exec } = fakeExec(nothingThere);
 
     const said = await open({
       exec,
@@ -239,7 +344,7 @@ describe("the host's half", () => {
    * that is not there.
    */
   it("does not swallow a host that failed to record it", async () => {
-    const { exec } = fakeExec(noRepository);
+    const { exec } = fakeExec(nothingThere);
 
     await expect(
       open({
@@ -252,11 +357,10 @@ describe("the host's half", () => {
   });
 
   it("takes a host's own directory", async () => {
-    const { exec, commands } = fakeExec(noRepository);
+    const { exec } = fakeExec(nothingThere);
 
     const said = await open({ exec, dir: "/srv/pad" });
 
-    expect(commands[0]!.cwd).toBe("/srv/pad");
     expect(said).toContain("/srv/pad");
   });
 });

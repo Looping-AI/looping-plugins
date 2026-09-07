@@ -47,11 +47,35 @@ protect and no pull request to open.
 
 ### The empty initial commit
 
-`scratch_open` makes one on creation, and it is load-bearing rather than tidy.
-Without it the repository has no `HEAD`, and `git reset --hard` fails outright —
-which is what a host runs to discard a cancelled task's edits. That cleanup is
-best-effort in every host that has one, so the failure is a logged warning plus a
-cancelled run's files surviving into the next task as its starting point.
+`scratch_open` makes one, and it is load-bearing rather than tidy. Without it the
+repository has no `HEAD`, and `git reset --hard` fails outright — which is what a
+host runs to discard a cancelled task's edits. That cleanup is best-effort in
+every host that has one, so the failure is a logged warning plus a cancelled
+run's files surviving into the next task as its starting point.
+
+Because `git init` and that commit are two commands, a scratchpad can exist with
+only the first. So "is there a scratchpad here" asks for the commit rather than
+the repository, and a scratchpad missing it is repaired on the next open — `git
+init` re-initialises without touching the tree, and an empty commit adds a `HEAD`
+without touching it either.
+
+The same question is asked from outside the scratchpad, and about the scratchpad
+directory itself. From inside, it cannot be asked at all before the directory
+exists; and `git rev-parse` walks upwards, so a scratchpad sitting anywhere within
+another repository would answer yes and hand `reset: true` that repository's tree.
+
+### `reset: true` empties it, including nested repositories
+
+The clean is `-ff`. A single force leaves untracked nested repositories where
+they are, and a scratchpad is where those turn up — cloning something to look at
+it is one of the things it is for. The second force is safe here in a way it is
+not in a checkout: nothing in a scratchpad is tracked by anything else, and
+nothing in it is ever pushed.
+
+Note that establishing the repository is _not_ the same as establishing an empty
+tree: `git init` over a directory that already holds files leaves every one of
+them. Only a reset makes a scratchpad empty, so that is the only case where
+`scratch_open` reports emptiness without reading the tree first.
 
 ## What the host owns
 

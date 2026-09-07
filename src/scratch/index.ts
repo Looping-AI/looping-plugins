@@ -91,7 +91,15 @@ export type ScratchExec = (
 export interface Scratchpad {
   /** Absolute path of the scratchpad's working tree. */
   dir: string;
-  /** True when this call created it, false when it was already there. */
+  /**
+   * True when this call initialised the repository — either because there was
+   * none, or because the one there was incomplete.
+   *
+   * **Not a claim that the tree is empty.** `git init` leaves whatever is in the
+   * directory exactly where it is, so a scratchpad whose repository had to be
+   * established over existing files is `fresh` and full. Only a reset makes it
+   * empty, which is why nothing here reads this to decide what is in the tree.
+   */
   fresh: boolean;
 }
 
@@ -235,29 +243,73 @@ function capabilityFor(dir: string): string {
 }
 
 /**
- * Create a scratchpad that is not there yet.
+ * Whether there is a usable scratchpad at `$SCRATCH_DIR`, asked from a directory
+ * that certainly exists.
+ *
+ * Three properties, and each rules out a state that reads as "ready" and is not:
+ *
+ * - **Run from `/`.** A command's own working directory has to exist before the
+ *   command starts, so asking this from inside the scratchpad makes the very
+ *   first open — the one where the directory is not there yet — fail before git
+ *   runs, and be indistinguishable from a container that did not answer.
+ * - **`.git` in the scratchpad itself**, not `rev-parse` from within it: that
+ *   walks upwards and answers yes for a scratchpad sitting anywhere inside
+ *   another repository, whose tree a later reset would then discard.
+ * - **`HEAD` resolves.** A repository with no commit is not usable here — see
+ *   {@link INIT_COMMAND} — and it is a reachable state, because `git init` and
+ *   the commit after it are two commands and only the pair is meaningful.
+ *
+ * Anything less than all three sends the caller to {@link INIT_COMMAND}, which
+ * repairs each of them and leaves an existing tree alone.
+ */
+const PROBE_COMMAND =
+  'test -e "$SCRATCH_DIR/.git" && ' +
+  'git -C "$SCRATCH_DIR" rev-parse --verify -q HEAD >/dev/null';
+
+/**
+ * Establish a scratchpad: a git repository with a commit in it.
  *
  * **The empty commit is load-bearing.** Without it the repository has no `HEAD`,
  * and `git reset --hard` fails outright — which is what a host runs to discard a
  * cancelled task's edits. That cleanup is best-effort in every host that has one,
- * so the failure would be a logged warning plus a cancelled run's files surviving
- * into the next task as its starting point. One commit at creation closes it.
+ * so the failure is a logged warning plus a cancelled run's files surviving into
+ * the next task as its starting point.
  *
- * The identity arrives through the environment rather than the command text, so
- * a configured name containing a quote is a value rather than shell syntax. It is
- * set repo-locally for the reason `/repo` sets it there: a global identity in the
- * container would attach itself to any other repository sharing it.
+ * **Safe to run against a directory that already holds something**, which is what
+ * makes it a repair as well as a creation: `git init` on an existing repository
+ * re-initialises without touching the tree, and `--allow-empty` commits nothing,
+ * so a scratchpad left half-built by an interrupted open gains the `HEAD` it was
+ * missing and keeps its files.
+ *
+ * Every value arrives through the environment rather than the command text —
+ * the identity so a configured name containing a quote stays a value, and the
+ * directory because double quotes still expand `$(…)`, backticks and variables,
+ * so a host path containing any of them would otherwise be shell rather than a
+ * path. The identity is set repo-locally for the reason `/repo` sets it there: a
+ * global identity in the container would attach itself to any other repository
+ * sharing it.
  */
-function initCommand(dir: string): string {
-  return [
-    `mkdir -p "${dir}"`,
-    `cd "${dir}"`,
-    "git init -q",
-    'git config user.name "$GIT_NAME"',
-    'git config user.email "$GIT_EMAIL"',
-    'git commit -q --allow-empty -m "scratchpad"'
-  ].join(" && ");
-}
+const INIT_COMMAND = [
+  'mkdir -p "$SCRATCH_DIR"',
+  'cd "$SCRATCH_DIR"',
+  "git init -q",
+  'git config user.name "$GIT_NAME"',
+  'git config user.email "$GIT_EMAIL"',
+  'git commit -q --allow-empty -m "scratchpad"'
+].join(" && ");
+
+/**
+ * Empty the scratchpad.
+ *
+ * **`-ff`, not `-f`.** A single force leaves untracked *nested repositories*
+ * where they are, so a task that cloned or initialised something inside the
+ * scratchpad would survive a reset this tool reports as having emptied it — and
+ * a scratchpad is exactly where that happens, since cloning something to look at
+ * it is one of the things it is for. The second force is what makes the promise
+ * true. It is safe to make here in a way it would not be in a checkout: nothing
+ * in a scratchpad is tracked by anything else, and nothing in it is ever pushed.
+ */
+const RESET_COMMAND = "git reset --hard -q && git clean -ffdxq";
 
 export function scratch(config: ScratchConfig): AgentPlugin {
   const dir = config.dir ?? DEFAULT_SCRATCH_DIR;
@@ -277,7 +329,13 @@ export function scratch(config: ScratchConfig): AgentPlugin {
     options?: { cwd?: string; env?: Record<string, string>; runtime?: unknown }
   ): Promise<Ran> => {
     try {
-      return await config.exec(command, { cwd: dir, ...options });
+      return await config.exec(command, {
+        cwd: dir,
+        ...options,
+        // Always, and merged over whatever the caller passed: every command here
+        // names the scratchpad, and none of them may spell it in shell text.
+        env: { ...options?.env, SCRATCH_DIR: dir }
+      });
     } catch (err) {
       console.warn("[scratch] the container could not be reached", {
         command,
@@ -297,8 +355,12 @@ export function scratch(config: ScratchConfig): AgentPlugin {
    *
    * Worth a command because the alternative is a model assuming an empty
    * scratchpad and writing a brief for one — a durable workspace carries the
-   * same warning wherever it is described. Skipped when this call is what made it
-   * empty: there is nothing to report and no reason to pay for the round trip.
+   * same warning wherever it is described.
+   *
+   * **Only a reset is allowed to skip it.** Establishing the repository is not
+   * the same as establishing an empty tree: `git init` over a directory that
+   * already holds files leaves every one of them, so the one call that can
+   * answer this without asking is the one that just deleted everything.
    */
   const describeTree = async (
     knownEmpty: boolean,
@@ -332,7 +394,7 @@ export function scratch(config: ScratchConfig): AgentPlugin {
      */
     config.beforeOpen?.();
 
-    const existing = await run("git rev-parse --git-dir", { runtime });
+    const existing = await run(PROBE_COMMAND, { cwd: "/", runtime });
     if (existing.unreachable) {
       return truncateOutput(
         "could not reach the container to open the scratchpad: " +
@@ -344,9 +406,9 @@ export function scratch(config: ScratchConfig): AgentPlugin {
 
     let fresh = false;
     if (!existing.success) {
-      // From the parent of the scratchpad, not from inside it: the first thing
-      // this command does is create the directory the rest run in.
-      const init = await run(initCommand(dir), {
+      // From a directory that exists, since the first thing this command does is
+      // create the one the rest of it runs in.
+      const init = await run(INIT_COMMAND, {
         cwd: "/",
         env: { GIT_NAME: author.name, GIT_EMAIL: author.email },
         runtime
@@ -360,9 +422,7 @@ export function scratch(config: ScratchConfig): AgentPlugin {
       }
       fresh = true;
     } else if (reset) {
-      const cleaned = await run("git reset --hard -q && git clean -fdxq", {
-        runtime
-      });
+      const cleaned = await run(RESET_COMMAND, { runtime });
       if (!cleaned.success) {
         return truncateOutput(
           `the scratchpad at ${dir} could not be reset: ` +
@@ -386,17 +446,17 @@ export function scratch(config: ScratchConfig): AgentPlugin {
       );
     }
 
-    const opened = fresh
-      ? `Opened a new scratchpad at ${dir}.`
-      : reset
-        ? `Opened the scratchpad at ${dir} and emptied it.`
+    const opened = reset
+      ? `Opened the scratchpad at ${dir} and emptied it.`
+      : fresh
+        ? `Opened a scratchpad at ${dir}.`
         : `Reopened the scratchpad at ${dir}, which an earlier task may have left files in.`;
 
     return truncateOutput(
       [
         opened,
         "It is a git repository with no remote, so nothing in it is pushed anywhere.",
-        await describeTree(fresh || reset === true, runtime)
+        await describeTree(reset === true, runtime)
       ]
         .filter(Boolean)
         .join(" "),
