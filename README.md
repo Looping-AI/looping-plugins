@@ -88,6 +88,7 @@ needing per-caller state takes it the same way.
 | [`/computer`](src/computer/)       | A Linux container whose filesystem outlives it: shell, package manager, unrestricted network | `@cloudflare/computer` (paid)                |
 | [`/recall`](src/recall/)           | Episodic memory over Vectorize — search history that compaction folded away                  | `VECTORIZE` (1024-dim/cosine)                |
 | [`/repo`](src/repo/)               | Clone, commit, push a branch, open a pull request — over any container                       | `GITHUB_TOKEN`                               |
+| [`/scratch`](src/scratch/)         | A throwaway git repository with no remote, for work that needs a container but no checkout   | —                                            |
 | [`/triage`](src/triage/)           | A pre-turn gate: is this message even for me?                                                | —                                            |
 | [`/workspace`](src/workspace/)     | A durable file store for long subagent runs, plus tools over it                              | `@cloudflare/shell`                          |
 
