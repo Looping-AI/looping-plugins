@@ -523,6 +523,11 @@ export function buildRepoTools(
    * the GitHub API. One line naming the tool and carrying the stderr answers it
    * directly.
    *
+   * At `error`, because `--level error` is what an operator narrows to once a
+   * task has gone wrong and this is a thing that went wrong. As a `warn` it was
+   * outside that filter: a clone that failed on 2026-09-05 was invisible to the
+   * first pass of the investigation and had to be found by timestamp.
+   *
    * The token is scrubbed rather than trusted. It has no route into a container
    * command, and the one channel that could carry it is the forge API's error
    * body, which {@link forge} logs through this same function. So stderr *should*
@@ -540,7 +545,7 @@ export function buildRepoTools(
     const token = "token" in secret ? secret.token : "";
     const scrub = (text: string | undefined) =>
       token && text ? text.split(token).join("«token»") : text;
-    console.warn(`[repo] ${tool} failed`, {
+    console.error(`[repo] ${tool} failed`, {
       exitCode: detail.exitCode,
       stderr: truncateOutput(scrub(detail.stderr) ?? "", 2_000),
       stdout: truncateOutput(scrub(detail.stdout) ?? "", 2_000)
