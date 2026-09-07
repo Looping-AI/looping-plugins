@@ -49,7 +49,7 @@ export const CLAUDE_CODE_RECIPE: ResolvedRecipe = {
     "This recipe does not drive a model loop.",
     "",
     "A subtask of this type runs the Claude Code CLI inside the agent's",
-    "workspace container, against the durable checkout. The system prompt, the",
+    "workspace container, against the durable working tree. The system prompt, the",
     "tool loop and the context management all belong to that process. Nothing",
     "reads this text — it exists because a recipe must declare a soul, and a",
     "placeholder that looked like a prompt would invite someone to tune it."
@@ -74,9 +74,9 @@ export const CLAUDE_CODE_CAPABILITY = [
   "## Writing code",
   "",
   "You can hand a coding task to a Claude Code session running in your",
-  "workspace container, against the repository you have checked out. It has its",
-  "own tools — it reads, edits, runs the test suite and iterates — and it",
-  "reports back what it did.",
+  "workspace container, in whatever you have open there — a repository you",
+  "checked out, or a scratchpad. It has its own tools — it reads, edits, runs the",
+  "test suite and iterates — and it reports back what it did.",
   "",
   "Give it **one coherent change**, described the way you would describe it to",
   "an engineer: what should be true when it is done, and how to tell. It is",
@@ -91,7 +91,7 @@ export const CLAUDE_CODE_CAPABILITY = [
 export const CLAUDE_CODE_SPEC: SubtaskTypeSpec = {
   key: CLAUDE_CODE_TYPE,
   description:
-    "Make a code change in the checked-out repository with a Claude Code session.",
+    "Run a coding task in the workspace with a Claude Code session — a checked-out repository, or a scratchpad.",
   /**
    * No params, and that is a decision rather than an omission.
    *
