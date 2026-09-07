@@ -1378,7 +1378,7 @@ describe("failure logging", () => {
    * first pass of the 2026-09-05 investigation.
    */
   it("logs the tool and git's stderr when a push fails", async () => {
-    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { exec } = recorder({
         "rev-parse --verify --quiet": { success: true },
@@ -1393,12 +1393,12 @@ describe("failure logging", () => {
       });
 
       expect(result).toMatch(/push failed/i);
-      expect(warn).toHaveBeenCalledWith(
+      expect(error).toHaveBeenCalledWith(
         "[repo] repo_push failed",
         expect.objectContaining({ exitCode: 1 })
       );
     } finally {
-      warn.mockRestore();
+      error.mockRestore();
     }
   });
 
@@ -1408,7 +1408,7 @@ describe("failure logging", () => {
    * "should be" is not the standard for writing a credential into one.
    */
   it("scrubs the token out of anything it logs", async () => {
-    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { exec } = recorder();
       const { git } = gitRecorder({
@@ -1421,11 +1421,11 @@ describe("failure logging", () => {
         url: "https://github.com/o/r"
       });
 
-      const logged = JSON.stringify(warn.mock.calls);
+      const logged = JSON.stringify(error.mock.calls);
       expect(logged).not.toContain(TOKEN);
       expect(logged).toContain("«token»");
     } finally {
-      warn.mockRestore();
+      error.mockRestore();
     }
   });
 });
