@@ -1,6 +1,6 @@
 {
   "name": "@dynamicagents/plugins",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Optional, composable capabilities for a Dynamic Agent: ARC-AGI-3, browser rendering, a Linux container, git and pull requests, workspace, episodic recall, and pre-turn triage. One subpath per plugin, so a bundle grows only with what it imports.",
   "keywords": [
     "ai-agents",
@@ -90,7 +90,7 @@
   "peerDependencies": {
     "@cloudflare/computer": "^0.2.1",
     "@cloudflare/shell": "^0.4.3",
-    "@dynamicagents/core": "^0.9.0",
+    "@dynamicagents/core": ">=0.9.0 <0.11.0",
     "agents": ">=0.21.0 <0.23.0",
     "ai": "^7.0.77",
     "drizzle-orm": ">=0.45.2",
