@@ -1371,9 +1371,14 @@ describe("failure logging", () => {
    * Diagnosing a push failure without one means correlating `exec` exit
    * codes against the GitHub API to prove the branch never landed, because the
    * plugin told the model what went wrong and told the operator nothing.
+   *
+   * At `error`, and the level is part of the assertion. `--level error` is where
+   * an operator looks once a task has gone wrong, and as a `warn` this line sat
+   * outside that filter — which is how a clone failure stayed hidden through the
+   * first pass of the 2026-09-05 investigation.
    */
   it("logs the tool and git's stderr when a push fails", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { exec } = recorder({
         "rev-parse --verify --quiet": { success: true },
@@ -1388,12 +1393,12 @@ describe("failure logging", () => {
       });
 
       expect(result).toMatch(/push failed/i);
-      expect(warn).toHaveBeenCalledWith(
+      expect(error).toHaveBeenCalledWith(
         "[repo] repo_push failed",
         expect.objectContaining({ exitCode: 1 })
       );
     } finally {
-      warn.mockRestore();
+      error.mockRestore();
     }
   });
 
@@ -1403,7 +1408,7 @@ describe("failure logging", () => {
    * "should be" is not the standard for writing a credential into one.
    */
   it("scrubs the token out of anything it logs", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { exec } = recorder();
       const { git } = gitRecorder({
@@ -1416,11 +1421,11 @@ describe("failure logging", () => {
         url: "https://github.com/o/r"
       });
 
-      const logged = JSON.stringify(warn.mock.calls);
+      const logged = JSON.stringify(error.mock.calls);
       expect(logged).not.toContain(TOKEN);
       expect(logged).toContain("«token»");
     } finally {
-      warn.mockRestore();
+      error.mockRestore();
     }
   });
 });
