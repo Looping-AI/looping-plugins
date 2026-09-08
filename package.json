@@ -90,7 +90,7 @@
   "peerDependencies": {
     "@cloudflare/computer": "^0.2.1",
     "@cloudflare/shell": "^0.4.3",
-    "@dynamicagents/core": "^0.9.0",
+    "@dynamicagents/core": ">=0.9.0 <0.11.0",
     "agents": ">=0.21.0 <0.23.0",
     "ai": "^7.0.77",
     "drizzle-orm": ">=0.45.2",
