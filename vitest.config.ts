@@ -1,5 +1,5 @@
 import { defineConfig } from "vitest/config";
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { createVcr, recordFromEnv } from "@dynamicagents/core/testing/node";

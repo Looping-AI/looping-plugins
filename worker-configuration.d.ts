@@ -1,5 +1,5 @@
 /* eslint-disable */
-// Runtime types generated with workerd@1.20260903.1 2026-08-04 
+// Runtime types generated with workerd@1.20260907.1 2026-08-04 
 // Begin runtime types
 /*! *****************************************************************************
 Copyright (c) Cloudflare. All rights reserved.
@@ -3405,6 +3405,7 @@ interface ExecProcess {
 }
 interface Container {
     get running(): boolean;
+    get images(): Record<string, string>;
     start(options?: ContainerStartupOptions): void;
     monitor(): Promise<void>;
     destroy(error?: any): Promise<void>;
@@ -3606,6 +3607,7 @@ interface Tracing {
     enterSpan<T, A extends unknown[]>(name: string, callback: (span: Span, ...args: A) => T, ...args: A): T;
     startActiveSpan<T, A extends unknown[]>(name: string, callback: (span: Span, ...args: A) => T, ...args: A): T;
     startSpan(name: string): Span;
+    getActiveSpan(): Span | undefined;
     Span: typeof Span;
 }
 declare abstract class Span {

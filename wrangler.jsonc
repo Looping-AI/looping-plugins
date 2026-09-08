@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
 
   // Dev-only. `@dynamicagents/plugins` is a library and never deploys — this config
-  // exists so `@cloudflare/vitest-pool-workers` has a Worker to bind, and so the
+  // exists so `@cloudflare/vitest-plugin` has a Worker to bind, and so the
   // recorded ARC spec has an `ARC_API_KEY` binding for vitest.config.ts to fill
   // from `.env.test`. It is excluded from the published tarball by
   // `package.json`'s `files` allowlist; a consumer brings their own, and each

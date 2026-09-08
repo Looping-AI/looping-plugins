@@ -35,11 +35,11 @@
     // `wrangler.jsonc` and the installed workerd, which are its only two inputs.
     // Regenerate with `npm run types` and commit the result.
     //
-    // `@cloudflare/vitest-pool-workers/types` is here for the specs, which run
+    // `@cloudflare/vitest-plugin/types` is here for the specs, which run
     // inside workerd and import `cloudflare:test`.
     "types": [
       "./worker-configuration.d.ts",
-      "@cloudflare/vitest-pool-workers/types",
+      "@cloudflare/vitest-plugin/types",
       "node"
     ],
     "strict": true,
