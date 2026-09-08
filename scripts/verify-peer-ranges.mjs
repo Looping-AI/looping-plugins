@@ -71,11 +71,27 @@ const optional = (name) => meta[name]?.optional === true;
  * this package resolves. A nested one belongs to whoever nested it.
  */
 function installedVersion(name) {
+  const manifest = path.join(root, "node_modules", name, "package.json");
+  let source;
   try {
-    const manifest = path.join(root, "node_modules", name, "package.json");
-    return JSON.parse(readFileSync(manifest, "utf8")).version;
-  } catch {
-    return undefined;
+    source = readFileSync(manifest, "utf8");
+  } catch (error) {
+    // Absent is the only error that means absent. A manifest that exists and
+    // cannot be read — a permission problem, a half-written tree — is not the
+    // same as a peer nobody installed, and swallowing it here would let an
+    // *optional* peer pass this gate while unreadable, which is the one case
+    // where nothing downstream would notice either.
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
+    throw new Error(`cannot read ${manifest}: ${error.message}`, {
+      cause: error
+    });
+  }
+  try {
+    return JSON.parse(source).version;
+  } catch (error) {
+    throw new Error(`${manifest} is not valid JSON: ${error.message}`, {
+      cause: error
+    });
   }
 }
 
@@ -115,7 +131,9 @@ for (const [name, range] of peers) {
 // --- 3. no meta entry without a peer -----------------------------------------
 
 for (const name of Object.keys(meta)) {
-  if (!(name in (pkg.peerDependencies ?? {}))) {
+  // `Object.hasOwn`, not `in`: `in` walks the prototype chain, so a stale key
+  // named `constructor` or `toString` would name a "peer" that does not exist.
+  if (!Object.hasOwn(pkg.peerDependencies ?? {}, name)) {
     fail(
       `peerDependenciesMeta has "${name}", which is not a peer — npm ignores ` +
         `it silently, so if the peer was renamed its replacement is now required`
