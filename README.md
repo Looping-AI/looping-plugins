@@ -125,7 +125,7 @@ Three rules the whole design rests on:
 
 ## Testing
 
-Specs run inside real workerd via `@cloudflare/vitest-pool-workers`, with the harness from
+Specs run inside real workerd via `@cloudflare/vitest-plugin`, with the harness from
 `@dynamicagents/core/testing`.
 
 ```bash
