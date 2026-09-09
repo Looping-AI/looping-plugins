@@ -38,3 +38,16 @@ changes a decision. Not what changed, not when, not what a previous version said
 
 If a comment is longer than the code it explains, ask what decision it is
 protecting. Usually one paragraph of that is doing the work.
+
+---
+
+## Publishing
+
+Merging a version bump to `main` is the release: once Test is green,
+`.github/workflows/release.yml` publishes that version to npm over OIDC and only
+then cuts the tag. The bump is the decision to ship. The workflow comments hold
+the rest.
+
+Core ships first. A version here whose peer range admits a core that is not yet
+on the registry is one nobody can install, which is why `npm ci` resolves core
+from the registry in both workflows rather than from a sibling checkout.

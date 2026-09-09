@@ -1,22 +1,59 @@
 name: Release
 
 # Only once Test has gone green on main. A release is a tag that consumers and
-# `git compare` links resolve forever, so it must never name a commit whose
-# suite was red.
+# `git compare` links resolve forever — and now also a version on npm, which is
+# immutable — so it must never name a commit whose suite was red.
 on:
   workflow_run:
     workflows: [Test]
     types: [completed]
     branches: [main]
 
-permissions:
-  contents: write
+# Nothing by default; each job takes only what it needs. The job that mints a
+# publish credential cannot write to the repository, and the job that writes
+# tags cannot mint one.
+permissions: {}
 
 jobs:
-  release:
-    if: github.event.workflow_run.conclusion == 'success'
-    timeout-minutes: 5
+  publish:
+    # `branches: [main]` above filters `workflow_run.head_branch`, which for a
+    # `pull_request` run is the *source* branch — and Test runs fork PRs. A fork
+    # whose branch is named `main` therefore produces a green run that matches,
+    # and `workflow_run` hands it this repository's context and this job's
+    # credentials. The three clauses after the first are what close that: only a
+    # push, to this repository, on its own `main`.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'main'
+    # Two green mains in quick succession must not race each other into the
+    # registry. On the job rather than the workflow so the group holds actual
+    # publishes: a run the guard above rejects has no business queueing ahead of
+    # one it accepts. `queue: max` is what makes the queue a queue — the default
+    # keeps a single pending run and lets each new arrival cancel the last, so a
+    # version bump waiting its turn would be dropped without ever publishing.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+      queue: max
+    # `prepublishOnly` re-runs `check` and the whole suite before the tarball is
+    # cut, so this needs Test's budget over again, not the five minutes a tag
+    # used to take.
+    timeout-minutes: 25
+    # Trusted publishing trusts GitHub-hosted runners only.
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # The OIDC token npm trades for a short-lived publish credential. This one
+      # line is what replaces NPM_TOKEN.
+      id-token: write
+    outputs:
+      name: ${{ steps.gate.outputs.name }}
+      version: ${{ steps.gate.outputs.version }}
+      # Whether *this* run is the one that published, which is what decides
+      # below whether `head_sha` may be tagged.
+      published: ${{ steps.gate.outputs.publish }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -24,23 +61,91 @@ jobs:
           # tested; pin the checkout to the exact sha Test passed on.
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 1
+          # Nothing here talks to git again, and a checkout credential left in
+          # `.git/config` outlives the step that needed it.
+          persist-credentials: false
 
-      - id: version
-        run: echo "version=$(node -p "require('./package.json').version")" >>"$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v6
+        with:
+          # One source of truth with local dev; `engines` requires >=24.
+          node-version-file: .nvmrc
+          registry-url: https://registry.npmjs.org
 
-      # The version in package.json is the whole trigger. Every green main is
-      # checked and only one carrying a version with no release yet creates
-      # anything, so ordinary merges and re-runs are no-ops.
+      # Trusted publishing is an npm-CLI feature, not an Actions one: an npm
+      # without the OIDC exchange falls through to asking for a token this job
+      # does not have, and fails with an auth error that names nothing useful.
+      # Asserted rather than `npm i -g npm@latest`, because the job holding a
+      # live publish credential should pull nothing extra.
+      - name: npm is new enough to exchange an OIDC token
+        run: |
+          set -euo pipefail
+          need=11.5.1
+          have="$(npm --version)"
+          if [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -1)" != "$need" ]; then
+            echo "npm $have cannot do trusted publishing; need >= $need" >&2
+            exit 1
+          fi
+
+      # The version in package.json is the whole trigger, and the registry is
+      # the only honest answer to whether it shipped. Not the GitHub release:
+      # the two can come apart — a publish that fails after the tag is written,
+      # a release cut by hand — and keying off the tag would wedge the package
+      # out of ever publishing that version.
+      - id: gate
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          echo "name=$name" >>"$GITHUB_OUTPUT"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          if [ "$(npm view "$name@$version" version 2>/dev/null || true)" = "$version" ]; then
+            echo "$name@$version is already on npm — nothing to publish."
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "Publishing $name@$version."
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      # `@dynamicagents/core` always from the registry, never from a sibling
+      # checkout. A `file:../core` install is an inner-loop convenience, and a
+      # package that only builds against one must never be able to ship.
+      - if: steps.gate.outputs.publish == 'true'
+        run: npm ci
+
+      # No NODE_AUTH_TOKEN, no NPM_TOKEN, no secret of any kind: npm trades this
+      # job's OIDC token for a credential scoped to this package, this
+      # repository and this workflow file, good for minutes. Provenance is
+      # attached automatically — public repo, public package — so `--provenance`
+      # would only restate it.
+      #
+      # `prepack` builds dist and runs verify:exports; `prepublishOnly` re-runs
+      # check and the suite. Both stay: they are the last gate a tarball passes.
+      - if: steps.gate.outputs.publish == 'true'
+        run: npm publish
+
+  # Only once the version is on npm, so a tag never names a release that failed
+  # to ship. Still runs on every green main and still no-ops when the release
+  # already exists, so ordinary merges and re-runs cost nothing.
+  release:
+    needs: publish
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # No checkout: `gh` needs the repository's name, not its contents, and the
+      # one job that can write tags is better off never holding the tree.
       #
       # Tag and title are `v`-prefixed, the common convention. 0.1.0 and 0.1.1
       # were released bare and stay that way — the unprefixed lookup below is
       # only so a version released under the old scheme is not released twice.
-      #
-      # This publishes nothing to npm — `npm publish` stays manual.
       - name: Release this version, if it has none
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ needs.publish.outputs.name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          PUBLISHED: ${{ needs.publish.outputs.published }}
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
@@ -50,6 +155,21 @@ jobs:
               exit 0
             fi
           done
+          # When this run published, SHA is by construction the commit the
+          # tarball was built from. When it did not, the version reached npm in
+          # some earlier run and SHA is only whatever is on main now — a later
+          # commit that changed no version would be tagged as the source of an
+          # artifact it never produced. npm records the publishing commit as
+          # `gitHead`; make it agree, or stop and let a human cut the tag.
+          if [ "$PUBLISHED" != "true" ]; then
+            head="$(npm view "$NAME@$VERSION" gitHead 2>/dev/null || true)"
+            if [ "$head" != "$SHA" ]; then
+              echo "npm built $NAME@$VERSION from ${head:-an unrecorded commit}, not $SHA." >&2
+              echo "Refusing to tag a commit the registry does not name." >&2
+              exit 1
+            fi
+          fi
+
           gh release create "v$VERSION" \
             --target "$SHA" \
             --title "v$VERSION" \
