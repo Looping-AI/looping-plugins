@@ -43,9 +43,9 @@ protecting. Usually one paragraph of that is doing the work.
 
 ## Publishing
 
-Merging a version bump to `main` is the release: once Test is green,
-`.github/workflows/release.yml` publishes that version to npm over OIDC and only
-then cuts the tag. The bump is the decision to ship. The workflow comments hold
+A version bump reaching `main` is what ships it: on the first green Test run for
+a commit carrying that version, `.github/workflows/release.yml` publishes it to
+npm over OIDC and only then cuts the tag. The bump is the decision to ship. The workflow comments hold
 the rest.
 
 Core ships first. A version here whose peer range admits a core that is not yet

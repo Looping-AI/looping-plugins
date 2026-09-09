@@ -1,8 +1,8 @@
 name: Release
 
 # Only once Test has gone green on main. A release is a tag that consumers and
-# `git compare` links resolve forever — and now also a version on npm, which is
-# immutable — so it must never name a commit whose suite was red.
+# `git compare` links resolve forever, and a version on npm that can never be
+# replaced, so it must never name a commit whose suite was red.
 on:
   workflow_run:
     workflows: [Test]
@@ -20,8 +20,8 @@ jobs:
     # `pull_request` run is the *source* branch — and Test runs fork PRs. A fork
     # whose branch is named `main` therefore produces a green run that matches,
     # and `workflow_run` hands it this repository's context and this job's
-    # credentials. The three clauses after the first are what close that: only a
-    # push, to this repository, on its own `main`.
+    # credentials. The rest of the condition is what closes that: only a push,
+    # to this repository, on its own `main`.
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
@@ -166,6 +166,24 @@ jobs:
             if [ "$head" != "$SHA" ]; then
               echo "npm built $NAME@$VERSION from ${head:-an unrecorded commit}, not $SHA." >&2
               echo "Refusing to tag a commit the registry does not name." >&2
+              exit 1
+            fi
+          fi
+
+          # `gh release view` above sees releases, not tags, and the two come
+          # apart: deleting a release leaves its tag behind. The create API
+          # documents `target_commitish` as "unused if the Git tag already
+          # exists", so a leftover tag silently attaches this release to the
+          # commit it already points at and `--target` below is ignored.
+          #
+          # Gated on gh's exit status, not on the captured text: `gh api --jq`
+          # prints the error body to stdout on a 422, so a missing tag read
+          # through `|| true` would look like a mismatching sha and refuse
+          # every ordinary release.
+          if tagged="$(gh api "repos/$GH_REPO/commits/v$VERSION" --jq .sha 2>/dev/null)"; then
+            if [ "$tagged" != "$SHA" ]; then
+              echo "Tag v$VERSION already exists at $tagged, not $SHA." >&2
+              echo "Refusing to cut a release the tag would misname." >&2
               exit 1
             fi
           fi
