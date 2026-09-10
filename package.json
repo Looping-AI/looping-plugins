@@ -85,7 +85,7 @@
     "verify:peer-ranges": "node scripts/verify-peer-ranges.mjs",
     "prepack": "npm run build && npm run verify:exports",
     "prepublishOnly": "npm run check && npm test && npm run verify:exports",
-    "prepare": "husky"
+    "prepare": "husky || true && npm run build"
   },
   "peerDependencies": {
     "@cloudflare/computer": "^0.2.1",
@@ -132,6 +132,7 @@
     "access": "public"
   },
   "allowScripts": {
+    "@dynamicagents/core": true,
     "esbuild": false,
     "fsevents": false,
     "sharp": false,

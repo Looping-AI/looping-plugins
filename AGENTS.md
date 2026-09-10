@@ -43,11 +43,29 @@ protecting. Usually one paragraph of that is doing the work.
 
 ## Publishing
 
+**Development lands on `next`; `main` is the released line.** A release is a merge
+from `next` into `main` carrying a version bump, so a bump is a deliberate act at
+release time rather than something that rides every merge.
+
 A version bump reaching `main` is what ships it: on the first green Test run for
 a commit carrying that version, `.github/workflows/release.yml` publishes it to
 npm over OIDC and only then cuts the tag. The bump is the decision to ship. The workflow comments hold
 the rest.
 
 Core ships first. A version here whose peer range admits a core that is not yet
-on the registry is one nobody can install, which is why `npm ci` resolves core
-from the registry in both workflows rather than from a sibling checkout.
+on the registry is one nobody can install.
+
+**The core references say different things, and both are load-bearing.** The
+`peerDependency` stays a semver range, because that is the only one a published
+consumer installs against — a git ref there would name a moving branch in somebody
+else's `node_modules`. The `devDependency` is what this repo builds and tests
+against, so it becomes a git ref onto core's `next`, which is how a core change is
+exercised here before it is released. That switch is pending: it needs a `prepare`
+that builds on core's `next` first, or there is nothing on that branch to install.
+
+`verify:peer-ranges` still holds that range honest: it reads the **installed** copy,
+and a git-installed core reports its real version. What it cannot see is that an
+unreleased `next` still carries the last released version number, so during
+development the installed core is that version plus whatever has landed since. That
+is the cost of batching releases, and it is why the range is checked against the tree
+rather than against the manifest.

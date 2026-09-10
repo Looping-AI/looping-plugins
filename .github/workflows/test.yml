@@ -1,12 +1,18 @@
 name: Test
 
+# `next` is where development lands; `main` is the released line, and a merge
+# from `next` into it is what a release is. Both need the suite: without `next`
+# here a PR into it would be unchecked, and Release keys off the run Test
+# completes on `main`.
 on:
   push:
     branches:
       - main
+      - next
   pull_request:
     branches:
       - main
+      - next
 
 # Superseded PR runs are cancelled; main is not, because Release keys off the
 # run that Test completes there.
