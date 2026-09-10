@@ -332,3 +332,63 @@ describe("recall()", () => {
     ).toThrow(/VECTORIZE/);
   });
 });
+
+/**
+ * Cancellation. A recall is the model waiting on two network hops — an embedding
+ * and a Vectorize query — and a round that was cancelled or ran out of time
+ * should sit behind neither.
+ */
+describe("a cancelled recall", () => {
+  it("hands the tool call's signal to the embedder", async () => {
+    const { index } = fakeIndex();
+    let seen: AbortSignal | undefined;
+    const spying: Embed = async (texts, signal) => {
+      seen = signal;
+      return texts.map(() => [0, 0, 0]);
+    };
+    const plugin = recall({
+      ai: {} as Ai,
+      index,
+      namespace: () => "caller:abc",
+      embed: spying
+    });
+    const tools = await plugin.mainAgentTools!({ session: sessionWith(1) });
+    const controller = new AbortController();
+
+    await callTool(
+      tools.recall,
+      { query: "the deploy" },
+      { abortSignal: controller.signal }
+    );
+
+    // The embedder is the half that can actually pass it on — `embedMany` takes
+    // one — so it is handed the call's signal rather than left to wait unbounded.
+    expect(seen).toBe(controller.signal);
+  });
+
+  it("stops waiting on a query the index never answers", async () => {
+    const index: RecallIndex = {
+      upsert: async () => ({}),
+      // Vectorize takes no signal, so a hung query can only be abandoned.
+      query: () => new Promise<VectorizeMatches>(() => {})
+    };
+    const plugin = recall({
+      ai: {} as Ai,
+      index,
+      namespace: () => "caller:abc",
+      embed
+    });
+    const tools = await plugin.mainAgentTools!({ session: sessionWith(1) });
+    const controller = new AbortController();
+    const reason = new Error("round cancelled");
+
+    const pending = callTool(
+      tools.recall,
+      { query: "the deploy" },
+      { abortSignal: controller.signal }
+    );
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+  });
+});

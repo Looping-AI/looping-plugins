@@ -79,6 +79,12 @@ export type ScratchExec = (
      * inside it.
      */
     runtime?: unknown;
+    /**
+     * The calling tool's cancellation. An implementation that reaches a container
+     * is expected to honour it, since a hung command is the one thing this plugin
+     * cannot bound for itself; `computerExec` kills the command on abort.
+     */
+    signal?: AbortSignal;
   }
 ) => Promise<{
   success: boolean;
@@ -326,7 +332,12 @@ export function scratch(config: ScratchConfig): AgentPlugin {
    */
   const run = async (
     command: string,
-    options?: { cwd?: string; env?: Record<string, string>; runtime?: unknown }
+    options?: {
+      cwd?: string;
+      env?: Record<string, string>;
+      runtime?: unknown;
+      signal?: AbortSignal;
+    }
   ): Promise<Ran> => {
     try {
       return await config.exec(command, {
@@ -337,6 +348,9 @@ export function scratch(config: ScratchConfig): AgentPlugin {
         env: { ...options?.env, SCRATCH_DIR: dir }
       });
     } catch (err) {
+      // A cancel is not an unreachable container. Reported as one, it would tell
+      // the model to try again in a moment; rethrown, the call ends as what it was.
+      if (options?.signal?.aborted) throw err;
       console.warn("[scratch] the container could not be reached", {
         command,
         err: String(err)
@@ -364,10 +378,11 @@ export function scratch(config: ScratchConfig): AgentPlugin {
    */
   const describeTree = async (
     knownEmpty: boolean,
-    runtime: unknown
+    runtime: unknown,
+    signal?: AbortSignal
   ): Promise<string> => {
     if (knownEmpty) return "It is empty.";
-    const listed = await run("git status --porcelain", { runtime });
+    const listed = await run("git status --porcelain", { runtime, signal });
     // Silence rather than a guess: the scratchpad is open either way, and "it is
     // empty" would be a claim this command did not support.
     if (!listed.success) return "";
@@ -383,7 +398,8 @@ export function scratch(config: ScratchConfig): AgentPlugin {
 
   const open = async (
     reset: boolean | undefined,
-    runtime: unknown
+    runtime: unknown,
+    signal?: AbortSignal
   ): Promise<string> => {
     /**
      * First, and before anything that resolves a workspace.
@@ -394,7 +410,7 @@ export function scratch(config: ScratchConfig): AgentPlugin {
      */
     config.beforeOpen?.();
 
-    const existing = await run(PROBE_COMMAND, { cwd: "/", runtime });
+    const existing = await run(PROBE_COMMAND, { cwd: "/", runtime, signal });
     if (existing.unreachable) {
       return truncateOutput(
         "could not reach the container to open the scratchpad: " +
@@ -411,7 +427,8 @@ export function scratch(config: ScratchConfig): AgentPlugin {
       const init = await run(INIT_COMMAND, {
         cwd: "/",
         env: { GIT_NAME: author.name, GIT_EMAIL: author.email },
-        runtime
+        runtime,
+        signal
       });
       if (!init.success) {
         return truncateOutput(
@@ -422,7 +439,7 @@ export function scratch(config: ScratchConfig): AgentPlugin {
       }
       fresh = true;
     } else if (reset) {
-      const cleaned = await run(RESET_COMMAND, { runtime });
+      const cleaned = await run(RESET_COMMAND, { runtime, signal });
       if (!cleaned.success) {
         return truncateOutput(
           `the scratchpad at ${dir} could not be reset: ` +
@@ -456,7 +473,7 @@ export function scratch(config: ScratchConfig): AgentPlugin {
       [
         opened,
         "It is a git repository with no remote, so nothing in it is pushed anywhere.",
-        await describeTree(reset === true, runtime)
+        await describeTree(reset === true, runtime, signal)
       ]
         .filter(Boolean)
         .join(" "),
@@ -492,7 +509,8 @@ export function scratch(config: ScratchConfig): AgentPlugin {
               "Discard everything in the scratchpad first, including files an earlier task left"
             )
         }),
-        execute: ({ reset }) => open(reset, undefined)
+        execute: ({ reset }, { abortSignal }) =>
+          open(reset, undefined, abortSignal)
       })
     }),
 

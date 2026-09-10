@@ -229,7 +229,7 @@ export function buildArcGameTools(
           .optional()
           .describe("brief reasoning for this move or sequence")
       }),
-      execute: async ({ steps, note }) => {
+      execute: async ({ steps, note }, { abortSignal }) => {
         // Acting immediately is right — the results below carry the board — but
         // this chunk's orientation goes out first, so the model is never acting
         // on a board it can no longer see.
@@ -296,6 +296,14 @@ export function buildArcGameTools(
           } else if (action === 6 && (x === undefined || y === undefined)) {
             stopped = "click (action 6) requires x and y (0–63)";
           }
+          // Ahead of the write-ahead below rather than left to the `fetch` to
+          // refuse: a request on an aborted signal is never sent, but the intent
+          // would already be on disk, and the next chunk would warn about a move
+          // that never left. Stopping here ends the batch the ordinary way, with
+          // every step already sent recorded.
+          if (!stopped && abortSignal?.aborted) {
+            stopped = "this call was cancelled or ran out of time";
+          }
           if (stopped) {
             trace.push(remaining(steps.length, index, stopped));
             break;
@@ -309,7 +317,8 @@ export function buildArcGameTools(
 
           const { frame, cookies } = await client.act(
             { action, gameId: session.gameId, guid: session.guid, x, y, note },
-            session.cookies
+            session.cookies,
+            abortSignal
           );
 
           // Diff against the board as it was immediately BEFORE this step, so each

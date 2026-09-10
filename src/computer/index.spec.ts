@@ -1479,3 +1479,103 @@ describe("the workspace a subtask reaches", () => {
     }
   });
 });
+
+/**
+ * Cancellation, and the two acts it takes when the container runtime has no
+ * signal of its own: stop waiting for the command, and stop the command.
+ */
+describe("a cancelled command", () => {
+  function hungContainer() {
+    const kills: Array<string | undefined> = [];
+    const execs: string[] = [];
+    const client = {
+      runtime: {
+        exec: async (command: string) => {
+          execs.push(command);
+          return {
+            // Never settles: the command is still running when the call ends.
+            result: () => new Promise(() => {}),
+            kill: async (signal?: string) => void kills.push(signal),
+            [Symbol.dispose]: () => {}
+          };
+        }
+      },
+      [Symbol.dispose]: () => {}
+    } as unknown as WorkspaceClient;
+    return { workspace: async () => client, kills, execs };
+  }
+
+  const execWith = (tools: ToolSet, input: unknown, abortSignal: AbortSignal) =>
+    (tools.sb_exec!.execute as (i: unknown, o: unknown) => Promise<string>)(
+      input,
+      { abortSignal }
+    );
+
+  /** Long enough for every microtask ahead of the exec to drain. */
+  const started = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("kills the process rather than abandoning it", async () => {
+    const { workspace, kills } = hungContainer();
+    const controller = new AbortController();
+    const pending = execWith(
+      buildComputerTools(workspace, config),
+      { command: "npm test" },
+      controller.signal
+    );
+
+    await started();
+    controller.abort();
+    const out = await pending;
+
+    // Disposing the handle only detaches this side. Without the kill the command
+    // goes on running in the container after the call has given up on it.
+    expect(kills).toEqual(["SIGTERM"]);
+    expect(out).toContain("cancelled");
+  });
+
+  it("says the time limit stopped it when that is what happened", async () => {
+    const { workspace } = hungContainer();
+    const controller = new AbortController();
+    const pending = execWith(
+      buildComputerTools(workspace, config),
+      { command: "npm test" },
+      controller.signal
+    );
+
+    await started();
+    controller.abort(new DOMException("tool deadline", "TimeoutError"));
+
+    // A model told only that something failed runs the same command again; one
+    // told it ran out of time can narrow it.
+    expect(await pending).toContain("time limit");
+  });
+
+  it("does not start a command on a call that is already cancelled", async () => {
+    const { workspace, execs } = hungContainer();
+    const controller = new AbortController();
+    controller.abort();
+
+    await execWith(
+      buildComputerTools(workspace, config),
+      { command: "rm -rf build" },
+      controller.signal
+    );
+
+    expect(execs).toHaveLength(0);
+  });
+
+  it("stops a file tool waiting on a workspace that has stopped answering", async () => {
+    const controller = new AbortController();
+    const tools = buildComputerTools(
+      () => new Promise<WorkspaceClient>(() => {}),
+      config
+    );
+
+    const pending = (
+      tools.sb_read!.execute as (i: unknown, o: unknown) => Promise<string>
+    )({ path: "/workspace/repo/a.ts" }, { abortSignal: controller.signal });
+    controller.abort();
+
+    expect(await pending).toMatch(/^error reading/);
+  });
+});

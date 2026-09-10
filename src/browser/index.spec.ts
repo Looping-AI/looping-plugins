@@ -106,3 +106,29 @@ describe("browser()", () => {
     );
   });
 });
+
+describe("a cancelled page read", () => {
+  it("stops waiting on a render that never finishes", async () => {
+    // Every method answers with a promise that never settles, whatever the SDK's
+    // tool reaches for — its internals are not this plugin's to depend on.
+    const hung = new Proxy(
+      {},
+      { get: () => () => new Promise(() => {}) }
+    ) as QuickActionBinding;
+    const tools = await browser({ binding: hung }).mainAgentTools!(toolCtx);
+    const controller = new AbortController();
+    const reason = new Error("round cancelled");
+
+    const pending = (
+      tools.browser_markdown!.execute as (
+        i: unknown,
+        o: unknown
+      ) => Promise<unknown>
+    )({ url: "https://example.com" }, { abortSignal: controller.signal });
+    controller.abort(reason);
+
+    // The SDK's tools receive this signal and drop it, so the page read would
+    // otherwise hold the round for as long as Browser Rendering does.
+    await expect(pending).rejects.toBe(reason);
+  });
+});

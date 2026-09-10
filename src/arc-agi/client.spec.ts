@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { makeArcClient, ARC_AUTH_ERROR } from "./client.js";
+import { makeArcClient, ARC_AUTH_ERROR, MAX_RETRY_AFTER_MS } from "./client.js";
 import type { CookieJar } from "./types.js";
 
 /** A fetch double that records calls and returns scripted responses. */
@@ -159,5 +159,55 @@ describe("makeArcClient", () => {
       jar
     );
     expect(cookies).toEqual({ AWSALB: "old", AWSALBCORS: "new" });
+  });
+});
+
+describe("a cancelled request", () => {
+  it("hands the caller's signal to fetch", async () => {
+    const { fn, calls } = fetchStub([json([])]);
+    const client = makeArcClient("k", { fetchFn: fn });
+    const controller = new AbortController();
+
+    await client.listGames({}, controller.signal);
+
+    expect(calls[0].init.signal).toBe(controller.signal);
+  });
+
+  it("caps a Retry-After instead of sleeping as long as the server says", async () => {
+    const limited = new Response("", {
+      status: 429,
+      headers: { "retry-after": "3600" }
+    });
+    const { fn } = fetchStub([limited, json([])]);
+    const sleep = vi.fn(async (_ms: number) => {});
+    const client = makeArcClient("k", { fetchFn: fn, sleep });
+
+    await client.listGames({});
+
+    // An hour, from one header. Honoured as written, a single hostile or confused
+    // response parks the tool — and the round waiting on it — for all of it.
+    expect(sleep).toHaveBeenCalledWith(MAX_RETRY_AFTER_MS);
+  });
+
+  it("stops waiting out a backoff when the call is cancelled", async () => {
+    const limited = new Response("", {
+      status: 429,
+      headers: { "retry-after": "30" }
+    });
+    const { fn, calls } = fetchStub([limited, json([])]);
+    const controller = new AbortController();
+    const reason = new Error("cancelled");
+    const client = makeArcClient("k", {
+      fetchFn: fn,
+      // Cancelled while the backoff runs, which is the longest wait this loop has.
+      sleep: () => {
+        controller.abort(reason);
+        return new Promise(() => {});
+      }
+    });
+
+    await expect(client.listGames({}, controller.signal)).rejects.toBe(reason);
+    // No second attempt: the retry would belong to a call nobody is waiting on.
+    expect(calls).toHaveLength(1);
   });
 });

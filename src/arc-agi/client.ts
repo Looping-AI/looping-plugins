@@ -1,3 +1,4 @@
+import { withAbort } from "@dynamicagents/core";
 import {
   ARC_BASE_URL,
   type CookieJar,
@@ -21,13 +22,19 @@ import {
  *   exponential backoff. Exhausted retries and 5xx throw (transient — the
  *   Workflow step retries and the runner resumes from its checkpoint); a 401
  *   throws a tagged deterministic error (bad key — a terminal failure).
+ * - **Cancellation**: every method takes the calling tool's signal, and it reaches
+ *   the `fetch` and the backoff between retries alike. `Retry-After` is honoured
+ *   up to {@link MAX_RETRY_AFTER_MS} and no further: the header is the server's to
+ *   set, and an uncapped one parks a tool for as long as the server likes.
  */
 export interface ArcClient {
   listGames(
-    cookies: CookieJar
+    cookies: CookieJar,
+    signal?: AbortSignal
   ): Promise<{ games: GameInfo[]; cookies: CookieJar }>;
   openScorecard(
-    cookies: CookieJar
+    cookies: CookieJar,
+    signal?: AbortSignal
   ): Promise<{ cardId: string; cookies: CookieJar }>;
   /**
    * The whole card, with one `environments` entry per game played on it.
@@ -36,11 +43,13 @@ export interface ArcClient {
    */
   getScorecard(
     cardId: string,
-    cookies: CookieJar
+    cookies: CookieJar,
+    signal?: AbortSignal
   ): Promise<{ summary: ScorecardSummary; cookies: CookieJar }>;
   reset(
     input: { gameId: string; cardId: string; guid?: string },
-    cookies: CookieJar
+    cookies: CookieJar,
+    signal?: AbortSignal
   ): Promise<{ frame: FrameResponse; cookies: CookieJar }>;
   act(
     input: {
@@ -51,9 +60,17 @@ export interface ArcClient {
       y?: number;
       note?: string;
     },
-    cookies: CookieJar
+    cookies: CookieJar,
+    signal?: AbortSignal
   ): Promise<{ frame: FrameResponse; cookies: CookieJar }>;
 }
+
+/**
+ * The longest a `Retry-After` is waited out. A minute covers the API's own
+ * per-minute rate window; past that the header is either hostile or describing an
+ * outage, and a retry loop is the wrong place to sit through either.
+ */
+export const MAX_RETRY_AFTER_MS = 60_000;
 
 /** Message prefix of the deterministic (non-retryable) auth error. */
 export const ARC_AUTH_ERROR = "arc-client: unauthorized";
@@ -98,7 +115,8 @@ export function makeArcClient(
   async function request<T>(
     path: string,
     init: { method: string; body?: unknown },
-    cookies: CookieJar
+    cookies: CookieJar,
+    signal?: AbortSignal
   ): Promise<{ data: T; cookies: CookieJar }> {
     const headers: Record<string, string> = {
       "X-API-Key": apiKey,
@@ -114,7 +132,8 @@ export function makeArcClient(
       const res = await doFetch(`${ARC_BASE_URL}${path}`, {
         method: init.method,
         headers,
-        body: init.body === undefined ? undefined : JSON.stringify(init.body)
+        body: init.body === undefined ? undefined : JSON.stringify(init.body),
+        ...(signal ? { signal } : {})
       });
 
       if (res.ok) {
@@ -137,41 +156,46 @@ export function makeArcClient(
       const retryAfter = Number(res.headers.get("retry-after"));
       const backoffMs =
         Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
+          ? Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS)
           : Math.min(1000 * 2 ** (attempt - 1), 8000);
-      await sleep(backoffMs);
+      // The wait between attempts is the longest thing this loop does, so it is
+      // the part a cancel most needs to reach.
+      await withAbort(signal, sleep(backoffMs));
     }
   }
 
   return {
-    async listGames(cookies) {
+    async listGames(cookies, signal) {
       const { data, cookies: next } = await request<GameInfo[]>(
         "/api/games",
         { method: "GET" },
-        cookies
+        cookies,
+        signal
       );
       return { games: data, cookies: next };
     },
 
-    async openScorecard(cookies) {
+    async openScorecard(cookies, signal) {
       const { data, cookies: next } = await request<{ card_id: string }>(
         "/api/scorecard/open",
         { method: "POST", body: {} },
-        cookies
+        cookies,
+        signal
       );
       return { cardId: data.card_id, cookies: next };
     },
 
-    async getScorecard(cardId, cookies) {
+    async getScorecard(cardId, cookies, signal) {
       const { data, cookies: next } = await request<ScorecardSummary>(
         `/api/scorecard/${encodeURIComponent(cardId)}`,
         { method: "GET" },
-        cookies
+        cookies,
+        signal
       );
       return { summary: data, cookies: next };
     },
 
-    async reset(input, cookies) {
+    async reset(input, cookies, signal) {
       const body: Record<string, unknown> = {
         game_id: input.gameId,
         card_id: input.cardId
@@ -180,12 +204,13 @@ export function makeArcClient(
       const { data, cookies: next } = await request<FrameResponse>(
         "/api/cmd/RESET",
         { method: "POST", body },
-        cookies
+        cookies,
+        signal
       );
       return { frame: data, cookies: next };
     },
 
-    async act(input, cookies) {
+    async act(input, cookies, signal) {
       const body: Record<string, unknown> = {
         game_id: input.gameId,
         guid: input.guid
@@ -198,7 +223,8 @@ export function makeArcClient(
       const { data, cookies: next } = await request<FrameResponse>(
         `/api/cmd/ACTION${input.action}`,
         { method: "POST", body },
-        cookies
+        cookies,
+        signal
       );
       return { frame: data, cookies: next };
     }

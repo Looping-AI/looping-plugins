@@ -1,6 +1,6 @@
-import { definePlugin } from "@dynamicagents/core";
+import { definePlugin, withAbort } from "@dynamicagents/core";
 import type { AgentPlugin } from "@dynamicagents/core";
-import type { ToolSet } from "ai";
+import type { Tool, ToolSet } from "ai";
 import { createQuickActionTools } from "agents/browser/ai";
 import type { QuickActionToolName } from "agents/browser/ai";
 import type {
@@ -53,6 +53,33 @@ export interface BrowserConfig {
   options?: QuickActionCommonOptions;
 }
 
+/**
+ * The SDK's quick-action tools, each made to stop waiting when its call is
+ * cancelled or reaches its deadline.
+ *
+ * They receive the `execute` signal and do not pass it on, so without this a page
+ * that never finishes rendering holds the round for as long as Browser Rendering
+ * does. There is nothing to terminate: each call is a read, and an abandoned one
+ * costs a render.
+ */
+function honourSignal(tools: ToolSet): ToolSet {
+  return Object.fromEntries(
+    Object.entries(tools).map(([name, original]) => {
+      const execute = original.execute;
+      if (!execute) return [name, original];
+      const bounded: Tool = {
+        ...original,
+        execute: (input, options) =>
+          withAbort(
+            options.abortSignal,
+            Promise.resolve(execute(input, options))
+          )
+      };
+      return [name, bounded];
+    })
+  );
+}
+
 export function browser(config: BrowserConfig): AgentPlugin {
   const { binding, maxChars = DEFAULT_MAX_CHARS, actions, options } = config;
 
@@ -60,12 +87,14 @@ export function browser(config: BrowserConfig): AgentPlugin {
   // fresh ToolSet each call and a tool object is not obviously safe to share
   // across two concurrent executions; building twice costs nothing.
   const tools = (): ToolSet =>
-    createQuickActionTools({
-      browser: binding,
-      maxChars,
-      ...(actions ? { actions } : {}),
-      ...(options ? { options } : {})
-    });
+    honourSignal(
+      createQuickActionTools({
+        browser: binding,
+        maxChars,
+        ...(actions ? { actions } : {}),
+        ...(options ? { options } : {})
+      })
+    );
 
   return definePlugin({
     key: "browser",

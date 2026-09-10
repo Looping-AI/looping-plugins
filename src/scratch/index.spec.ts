@@ -380,3 +380,30 @@ describe("the capability block", () => {
     expect(capability).toContain("One task works in one place");
   });
 });
+
+describe("a cancelled open", () => {
+  it("ends as a cancellation, not as a container that did not answer", async () => {
+    const controller = new AbortController();
+    const reason = new Error("round cancelled");
+    // What `computerExec` does on an abort: the command is killed, and the call
+    // rejects with the signal's reason.
+    const { exec } = fakeExec(() => {
+      controller.abort(reason);
+      return reason;
+    });
+    const tools = (await scratch({ exec }).mainAgentTools?.(
+      {} as never
+    )) as ToolSet;
+    const execute = tools[SCRATCH_OPEN_TOOL]!.execute as (
+      input: unknown,
+      options: unknown
+    ) => Promise<string>;
+
+    // "could not reach the container … try again in a moment" is the sentence an
+    // unreachable container earns, and it would send the model straight back to
+    // a call that was cancelled on purpose.
+    await expect(execute({}, { abortSignal: controller.signal })).rejects.toBe(
+      reason
+    );
+  });
+});

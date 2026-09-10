@@ -1555,3 +1555,40 @@ describe("concurrent git", () => {
     expect(calls).toBeGreaterThan(1);
   });
 });
+
+describe("a cancelled forge call", () => {
+  it("aborts the request when the tool call is cancelled", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ html_url: "https://github.com/o/r/pull/7" }),
+          { status: 201 }
+        )
+      );
+    try {
+      const { exec } = recorder();
+      const controller = new AbortController();
+
+      await (
+        tools(exec).repo_open_pr!.execute as (
+          i: unknown,
+          o: unknown
+        ) => Promise<string>
+      )(
+        { dir: "/w/r", head: "coder/x", base: "main", title: "t", body: "b" },
+        { abortSignal: controller.signal }
+      );
+
+      const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+      // Merged with the forge's own bound rather than replacing it: a call nobody
+      // cancels must still time out, and a cancelled one must not wait for that.
+      expect(init.signal).not.toBe(controller.signal);
+      expect(init.signal?.aborted).toBe(false);
+      controller.abort();
+      expect(init.signal?.aborted).toBe(true);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});

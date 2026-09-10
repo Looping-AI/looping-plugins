@@ -1004,3 +1004,29 @@ describe("arc_act sequences", () => {
     expect(next).not.toContain("Unchanged");
   });
 });
+
+describe("a cancelled arc_act", () => {
+  it("sends nothing, and writes no intent, once the call is cancelled", async () => {
+    const hits = stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
+    const { ctx: c } = ctx();
+    const { tools } = build(c);
+    const controller = new AbortController();
+    controller.abort();
+
+    const out = await (
+      tools.arc_act as {
+        execute: (i: unknown, o: unknown) => Promise<string>;
+      }
+    ).execute(one(1), { abortSignal: controller.signal });
+
+    // Refused before the request, not by it: a `fetch` on an aborted signal is
+    // never sent, but the write-ahead ahead of it would already be on disk.
+    expect(hits).toHaveLength(0);
+    expect(out).toContain("cancelled or ran out of time");
+
+    // The write-ahead is what a later call reads as an interrupted move. A step
+    // stopped before it was sent must leave nothing for that warning to find.
+    const next = await callTool(tools.arc_act, one(1));
+    expect(next).not.toMatch(/may have been interrupted/);
+  });
+});
