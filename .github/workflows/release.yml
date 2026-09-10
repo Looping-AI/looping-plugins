@@ -106,9 +106,9 @@ jobs:
             echo "publish=true" >>"$GITHUB_OUTPUT"
           fi
 
-      # `@dynamicagents/core` always from the registry, never from a sibling
-      # checkout. A `file:../core` install is an inner-loop convenience, and a
-      # package that only builds against one must never be able to ship.
+      # From the committed lockfile, never from a sibling checkout. This only runs
+      # on `main`, where the release has to have put core back on a semver range —
+      # AGENTS.md says why — so what ships is built against a published core.
       - if: steps.gate.outputs.publish == 'true'
         run: npm ci
 

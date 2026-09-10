@@ -136,8 +136,9 @@ npm run verify:exports
 
 ### Working against an unpublished core
 
-`@dynamicagents/core` is a **peer** dependency, so a plain `npm install` always resolves
-it from the registry — including over a local build you are testing against.
+A plain `npm install` resolves `@dynamicagents/core` from whatever this branch's
+`package.json` declares — `AGENTS.md` says which — and does it right over a local build
+you are testing against.
 
 ```bash
 npm run link:local   # npm pack + tarball install from ../core
@@ -150,7 +151,7 @@ repo's source for a contract change sitting uninstalled one directory away.
 `npm pack` + tarball, deliberately — not `npm link`, which symlinks the checkout and
 gives it its own copy of every peer. Two copies of `agents` in one bundle breaks the
 `Session` types and every `instanceof`, at runtime rather than at the type level.
-Nothing is written to `package.json`, so CI still builds against the real packages.
+Nothing is written to `package.json`, so CI never builds against a local checkout.
 
 `test/arc-agi/recorded.spec.ts` drives the **real** ARC API and replays a committed
 cassette, so it needs no key either. Re-record it against the live API with:

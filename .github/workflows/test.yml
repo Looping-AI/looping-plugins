@@ -34,9 +34,10 @@ jobs:
           # One source of truth with local dev; `engines` requires >=24.
           node-version-file: .nvmrc
 
-      # `@dynamicagents/core` always from the registry, never from a sibling
-      # checkout. A `file:../core` install is an inner-loop convenience, and a
-      # package that only builds against one must never be able to ship.
+      # From the committed lockfile, never from a sibling checkout. Whether that
+      # lockfile resolves core to the registry or to a git ref is the branch's
+      # business, and AGENTS.md's to explain. A local install is an inner-loop
+      # convenience, and a package that only builds against one must never ship.
       - run: npm ci
 
       # `npm test` alone would pass on code that neither typechecks nor formats:
