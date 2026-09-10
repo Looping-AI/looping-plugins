@@ -55,12 +55,13 @@ the rest.
 Core ships first. A version here whose peer range admits a core that is not yet
 on the registry is one nobody can install.
 
-**The two core references say different things, and both are load-bearing.** The
-`devDependency` is a git ref onto core's `next`: it is what this repo builds and
-tests against, and it is how a core change can be exercised here before it is
-released. The `peerDependency` stays a semver range, because that is the only one a
-published consumer installs against — a git ref there would name a moving branch in
-somebody else's `node_modules`.
+**The core references say different things, and both are load-bearing.** The
+`peerDependency` stays a semver range, because that is the only one a published
+consumer installs against — a git ref there would name a moving branch in somebody
+else's `node_modules`. The `devDependency` is what this repo builds and tests
+against, so it becomes a git ref onto core's `next`, which is how a core change is
+exercised here before it is released. That switch is pending: it needs a `prepare`
+that builds on core's `next` first, or there is nothing on that branch to install.
 
 `verify:peer-ranges` still holds that range honest: it reads the **installed** copy,
 and a git-installed core reports its real version. What it cannot see is that an
