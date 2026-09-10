@@ -235,10 +235,7 @@ export function recall(config: RecallConfig): AgentPlugin {
       });
       const { embeddings } = await embedMany({
         model: provider.embedding(embeddingModelId),
-        values: texts,
-        // Failures surface to the caller; archival is best-effort and the SDK's
-        // backoff would only add latency in front of a compaction.
-        maxRetries: 0
+        values: texts
       });
       return embeddings;
     });
