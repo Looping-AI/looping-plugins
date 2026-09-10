@@ -163,12 +163,15 @@ describe("makeArcClient", () => {
 });
 
 describe("a cancelled request", () => {
-  it("hands the caller's signal to fetch", async () => {
+  it("hands the signal it was built with to fetch", async () => {
     const { fn, calls } = fetchStub([json([])]);
-    const client = makeArcClient("k", { fetchFn: fn });
     const controller = new AbortController();
+    const client = makeArcClient("k", {
+      fetchFn: fn,
+      signal: controller.signal
+    });
 
-    await client.listGames({}, controller.signal);
+    await client.listGames({});
 
     expect(calls[0].init.signal).toBe(controller.signal);
   });
@@ -199,6 +202,7 @@ describe("a cancelled request", () => {
     const reason = new Error("cancelled");
     const client = makeArcClient("k", {
       fetchFn: fn,
+      signal: controller.signal,
       // Cancelled while the backoff runs, which is the longest wait this loop has.
       sleep: () => {
         controller.abort(reason);
@@ -206,7 +210,7 @@ describe("a cancelled request", () => {
       }
     });
 
-    await expect(client.listGames({}, controller.signal)).rejects.toBe(reason);
+    await expect(client.listGames({})).rejects.toBe(reason);
     // No second attempt: the retry would belong to a call nobody is waiting on.
     expect(calls).toHaveLength(1);
   });

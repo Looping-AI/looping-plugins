@@ -549,16 +549,11 @@ export function buildComputerTools(
    * Fails **open** for the same reason the exec gate does: a read of another
    * Durable Object's state must not take out a working tool.
    */
-  const refuseWrite = async (
-    signal?: AbortSignal
-  ): Promise<string | undefined> => {
+  const refuseWrite = async (): Promise<string | undefined> => {
     if (!advisories) return undefined;
     try {
-      signal?.throwIfAborted();
-      return writeGate(await withAbort(signal, advisories()));
-    } catch (err) {
-      // Open on a failed read, as the exec gate is — and closed on a cancel.
-      if (signal?.aborted) throw err;
+      return writeGate(await advisories());
+    } catch {
       return undefined;
     }
   };
@@ -593,26 +588,13 @@ export function buildComputerTools(
    * catch saying something this cannot.
    */
   const inWorkspace = async (
-    signal: AbortSignal | undefined,
     gerund: string,
     subject: string,
     body: (fs: WorkspaceClient["fs"]) => Promise<string>
   ): Promise<string> => {
     try {
-      // Checked before the operation is built, because building it starts it: a
-      // write on a call already cancelled would otherwise still land.
-      signal?.throwIfAborted();
-      // Stops the wait, not the operation. A file RPC takes no signal and has no
-      // process to kill, so a write abandoned here may still land; what this
-      // bounds is a workspace that has stopped answering, which would otherwise
-      // hold the round for as long as it stayed silent.
-      return await withAbort(
-        signal,
-        (async () => {
-          using ws = await workspace();
-          return await body(ws.fs);
-        })()
-      );
+      using ws = await workspace();
+      return await body(ws.fs);
     } catch (err) {
       return `error ${gerund} ${subject}: ${String(err)}`;
     }
@@ -675,10 +657,16 @@ export function buildComputerTools(
         /**
          * What the model is told when this call stops before the command
          * finishes. Said plainly, because the likeliest next move after a bare
-         * error is the same command again — and one that outran the limit once
-         * will.
+         * error is the same command again — and whether that is right depends on
+         * where the call stopped. A command that outran the limit once will again;
+         * one that never started because the workspace did not answer may not.
+         *
+         * This is the one tool that reads its call's signal rather than leaving the
+         * wait to core, and this is why: core's abandonment can say only that the
+         * command may still be running. Core's `TOOL_CALL_GRACE_MS` is the window
+         * this answer has to arrive in, and it covers sending the kill below.
          */
-        const stopped = (gateMs: number): string => {
+        const stopped = (gateMs: number, started: boolean): string => {
           const timedOut =
             (abortSignal?.reason as { name?: string } | undefined)?.name ===
             "TimeoutError";
@@ -686,11 +674,14 @@ export function buildComputerTools(
             command,
             gateMs,
             durationMs: Date.now() - startedAtMs - gateMs,
+            started,
             reason: timedOut ? "time limit" : "cancelled"
           });
-          return timedOut
-            ? "the command was stopped: this call ran past its time limit. Anything it changed before then is still changed. Try something narrower."
-            : "the command was stopped because this call was cancelled. Anything it changed before then is still changed.";
+          if (!timedOut)
+            return "the command was stopped because this call was cancelled. Anything it changed before then is still changed.";
+          return started
+            ? "the command was stopped: it ran past this call's time limit. Anything it changed before then is still changed. Try something narrower."
+            : "the command did not run: this call reached its time limit while the workspace was still getting ready, so nothing was changed. Try again; if it happens again, the workspace is not responding.";
         };
 
         // Only `sb_exec` waits on an install. The file tools read and write
@@ -704,7 +695,8 @@ export function buildComputerTools(
           gate = await awaitAdvisories(command, abortSignal);
         } catch (err) {
           // Only a cancel gets out of the gate; a failed advisory read opens it.
-          if (abortSignal?.aborted) return stopped(Date.now() - startedAtMs);
+          if (abortSignal?.aborted)
+            return stopped(Date.now() - startedAtMs, false);
           throw err;
         }
         const gateMsWaited = Date.now() - startedAtMs;
@@ -720,6 +712,8 @@ export function buildComputerTools(
         // is carried through the catch as well.
         const note = (body: string) =>
           gate.warn ? `${gate.warn}\n\n${body}` : body;
+        // Set once the exec is sent. See `stopped`.
+        let started = false;
 
         try {
           // A workspace that stops answering would hold the call before any of the
@@ -741,6 +735,9 @@ export function buildComputerTools(
           // Not started at all on a signal that has already fired: a process that
           // is killed on the next line still ran long enough to change something.
           abortSignal?.throwIfAborted();
+          // From here a stop cannot promise nothing ran: the exec may reach the
+          // container before its handle reaches this side.
+          started = true;
           using handle = await acquire(
             abortSignal,
             ws.runtime.exec(
@@ -767,7 +764,7 @@ export function buildComputerTools(
           });
           return note(renderResult(result, maxChars));
         } catch (err) {
-          if (abortSignal?.aborted) return note(stopped(gateMsWaited));
+          if (abortSignal?.aborted) return note(stopped(gateMsWaited, started));
           const lost = execLostNote(err);
           console.warn("[computer] sb_exec failed", {
             command,
@@ -810,10 +807,10 @@ export function buildComputerTools(
           .optional()
           .describe("Maximum bytes to return from `offset`")
       }),
-      execute: async ({ path, offset, length }, { abortSignal }) => {
+      execute: async ({ path, offset, length }) => {
         const refusal = guardPath(path, "sb_read");
         if (refusal) return refusal;
-        return inWorkspace(abortSignal, "reading", path, async (fs) => {
+        return inWorkspace("reading", path, async (fs) => {
           // Either knob means the model chose a region; only an unqualified read
           // gets the middle-out guess.
           return offset === undefined && length === undefined
@@ -838,14 +835,14 @@ export function buildComputerTools(
           .string()
           .describe("Full file content (overwrites any existing file)")
       }),
-      execute: async ({ path, content }, { abortSignal }) => {
+      execute: async ({ path, content }) => {
         const refusal = guardPath(path, "sb_write");
         if (refusal) return refusal;
         // Before the write, not after: the point is to not report a success that
         // did not happen.
-        const lost = await refuseWrite(abortSignal);
+        const lost = await refuseWrite();
         if (lost) return lost;
-        return inWorkspace(abortSignal, "writing", path, async (fs) => {
+        return inWorkspace("writing", path, async (fs) => {
           const dir = path.slice(0, path.lastIndexOf("/"));
           if (dir) await fs.mkdir(dir, { recursive: true });
           await fs.writeFile(path, content);
@@ -878,12 +875,12 @@ export function buildComputerTools(
           .describe("Exact text to replace, unique within the file"),
         replace: z.string().describe("Replacement text")
       }),
-      execute: async ({ path, find, replace }, { abortSignal }) => {
+      execute: async ({ path, find, replace }) => {
         const refusal = guardPath(path, "sb_edit");
         if (refusal) return refusal;
-        const lost = await refuseWrite(abortSignal);
+        const lost = await refuseWrite();
         if (lost) return lost;
-        return inWorkspace(abortSignal, "editing", path, async (fs) => {
+        return inWorkspace("editing", path, async (fs) => {
           const content = await fs.readFile(path, "utf8");
           const occurrences = content.split(find).length - 1;
           // Refusing an ambiguous edit is the whole value of this tool over
@@ -932,14 +929,11 @@ export function buildComputerTools(
           .optional()
           .describe("Entries to skip — use the offset a cut listing reports")
       }),
-      execute: async (
-        { path, recursive, pattern, offset },
-        { abortSignal }
-      ) => {
+      execute: async ({ path, recursive, pattern, offset }) => {
         const refusal = guardPath(path, "sb_ls");
         if (refusal) return refusal;
         const from = offset ?? 0;
-        return inWorkspace(abortSignal, "listing", path, async (fs) => {
+        return inWorkspace("listing", path, async (fs) => {
           if (recursive || pattern) {
             // `find` rather than `ls`, which took no bound: a prefix scan
             // returned every path in the subtree and the ceiling then threw most
@@ -1057,15 +1051,20 @@ export function buildComputerTools(
           .optional()
           .describe("Matches to skip — use the offset a cut result reports")
       }),
-      execute: async (
-        { query, path, include, regex, ignoreCase, context, offset },
-        { abortSignal }
-      ) => {
+      execute: async ({
+        query,
+        path,
+        include,
+        regex,
+        ignoreCase,
+        context,
+        offset
+      }) => {
         const target = path ?? cwd;
         const refusal = guardPath(target, "sb_grep");
         if (refusal) return refusal;
         const from = offset ?? 0;
-        return inWorkspace(abortSignal, "searching", target, async (fs) => {
+        return inWorkspace("searching", target, async (fs) => {
           // Two rounds, not four: a `grep` retry re-reads and re-scans every file
           // it already looked at, where the `find` retry in `sb_ls` only re-walks
           // dirents. `.git` is also far less likely to flood a page here — its
@@ -1110,10 +1109,10 @@ export function buildComputerTools(
     sb_exists: tool({
       description: "Check whether a path exists in the workspace.",
       inputSchema: z.object({ path: z.string().describe("Absolute path") }),
-      execute: async ({ path }, { abortSignal }) => {
+      execute: async ({ path }) => {
         const refusal = guardPath(path, "sb_exists");
         if (refusal) return refusal;
-        return inWorkspace(abortSignal, "checking", path, async (fs) => {
+        return inWorkspace("checking", path, async (fs) => {
           return (await pathExists(fs, path))
             ? `${path} exists`
             : `${path} does not exist`;
@@ -1165,12 +1164,6 @@ export function computerExec(config: ComputerConfig): (
     env?: Record<string, string | undefined>;
     timeout?: number;
     runtime?: unknown;
-    /**
-     * The caller's cancellation. The container runtime takes no signal, so on an
-     * abort this stops waiting and sends SIGTERM — the command is killed, not
-     * merely abandoned.
-     */
-    signal?: AbortSignal;
   }
 ) => Promise<{
   success: boolean;
@@ -1184,10 +1177,8 @@ export function computerExec(config: ComputerConfig): (
     // shared workspace without importing anything from here.
     const name =
       workspaceNameFromRuntime(options?.runtime) ?? config.workspaceName();
-    options?.signal?.throwIfAborted();
-    using ws = await acquire(
-      options?.signal,
-      openWorkspace(config.binding.get(config.binding.idFromName(name)))
+    using ws = await openWorkspace(
+      config.binding.get(config.binding.idFromName(name))
     );
 
     const env = options?.env
@@ -1207,20 +1198,13 @@ export function computerExec(config: ComputerConfig): (
     // decide a tree is clean, and reads a sha out of it to push — all of which
     // need `stdout` to carry the answer alone, with git's diagnostics on the
     // channel git put them on.
-    options?.signal?.throwIfAborted();
-    using handle = await acquire(
-      options?.signal,
-      ws.runtime.exec(withShell(command, config.shell), {
-        cwd: options?.cwd ?? config.cwd ?? DEFAULT_CWD,
-        encoding: "utf8",
-        timeoutMs,
-        ...(env ? { env } : {})
-      }),
-      killLate
-    );
-    const result = await withAbort(options?.signal, handle.result(), () =>
-      handle.kill("SIGTERM")
-    );
+    using handle = await ws.runtime.exec(withShell(command, config.shell), {
+      cwd: options?.cwd ?? config.cwd ?? DEFAULT_CWD,
+      encoding: "utf8",
+      timeoutMs,
+      ...(env ? { env } : {})
+    });
+    const result = await handle.result();
     const killed = cancelledNote(result.status, result.exitCode, timeoutMs);
 
     return {

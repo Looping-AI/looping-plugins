@@ -11,16 +11,13 @@ import type { Tool, ToolSet } from "ai";
 /**
  * Run a tool the way the AI SDK would, and return what the model would read.
  *
- * `ToolExecutionOptions` carries fields a real call supplies that most specs care
- * nothing about, so they are filled with the minimum that typechecks. A spec about
- * cancellation passes `abortSignal`, which is what the SDK hands `execute` merged
- * with the tool's deadline. The cast is confined here rather than repeated in
- * every spec.
+ * `ToolExecutionOptions` carries four fields a real call supplies; a spec cares
+ * about none of them, so they are filled with the minimum that typechecks. The
+ * cast is confined here rather than repeated in every spec.
  */
 export async function callTool<T = string>(
   tool: Tool,
-  input: unknown,
-  options: { abortSignal?: AbortSignal } = {}
+  input: unknown
 ): Promise<T> {
   const execute = tool.execute;
   if (!execute) throw new Error("tool has no execute");
@@ -29,8 +26,7 @@ export async function callTool<T = string>(
     {
       toolCallId: "test-call",
       messages: [],
-      context: undefined,
-      ...options
+      context: undefined
     } as never
   )) as T;
 }
@@ -39,12 +35,11 @@ export async function callTool<T = string>(
 export function callNamed<T = string>(
   tools: ToolSet,
   name: string,
-  input: unknown,
-  options: { abortSignal?: AbortSignal } = {}
+  input: unknown
 ): Promise<T> {
   const tool = tools[name];
   if (!tool) throw new Error(`no tool named "${name}"`);
-  return callTool<T>(tool, input, options);
+  return callTool<T>(tool, input);
 }
 
 /**

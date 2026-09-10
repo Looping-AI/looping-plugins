@@ -3,7 +3,7 @@ import type { ToolSet } from "ai";
 import { z } from "zod";
 import { createWorkersAI } from "workers-ai-provider";
 import type { SessionMessage } from "agents/experimental/memory/session";
-import { definePlugin, withAbort } from "@dynamicagents/core";
+import { definePlugin } from "@dynamicagents/core";
 import type { AgentPlugin } from "@dynamicagents/core";
 import { parseTurn, sessionText } from "@dynamicagents/core/agent";
 
@@ -52,18 +52,8 @@ export interface RecallIndex {
   upsert(vectors: VectorizeVector[]): Promise<unknown>;
 }
 
-/**
- * Embed a batch of texts. Output dimension must match the Vectorize index.
- *
- * The signal is the tool call's, and an implementation that reaches a network is
- * expected to honour it — a deadline the caller cannot enforce is not a deadline.
- * Optional so an existing implementation keeps compiling and a caller with
- * nothing to cancel from passes nothing.
- */
-export type Embed = (
-  texts: string[],
-  signal?: AbortSignal
-) => Promise<number[][]>;
+/** Embed a batch of texts. Output dimension must match the Vectorize index. */
+export type Embed = (texts: string[]) => Promise<number[][]>;
 
 /** A single archived message returned by a recall search. */
 export interface RecallResult {
@@ -140,24 +130,15 @@ export async function recallSearch(
   namespace: string,
   query: string,
   embed: Embed,
-  topK: number = DEFAULT_TOP_K,
-  signal?: AbortSignal
+  topK: number = DEFAULT_TOP_K
 ): Promise<RecallResult[]> {
-  // Nothing is started for a call that is already cancelled.
-  signal?.throwIfAborted();
-  const [vector] = await embed([query], signal);
+  const [vector] = await embed([query]);
   if (!vector) return [];
-  // Vectorize takes no signal on any method, so this stops the wait and nothing
-  // else. There is no terminate to send either — the query is a read, and an
-  // abandoned one costs the index nothing.
-  const { matches } = await withAbort(
-    signal,
-    index.query(vector, {
-      namespace,
-      topK,
-      returnMetadata: "all"
-    })
-  );
+  const { matches } = await index.query(vector, {
+    namespace,
+    topK,
+    returnMetadata: "all"
+  });
   return matches.map((match) => {
     const md = (match.metadata ?? {}) as Record<string, string>;
     const result: RecallResult = {
@@ -246,7 +227,7 @@ export function recall(config: RecallConfig): AgentPlugin {
   let provider: ReturnType<typeof createWorkersAI> | undefined;
   const embed: Embed =
     config.embed ??
-    (async (texts, signal) => {
+    (async (texts) => {
       if (texts.length === 0) return [];
       provider ??= createWorkersAI({
         binding: ai,
@@ -257,8 +238,7 @@ export function recall(config: RecallConfig): AgentPlugin {
         values: texts,
         // Failures surface to the caller; archival is best-effort and the SDK's
         // backoff would only add latency in front of a compaction.
-        maxRetries: 0,
-        abortSignal: signal
+        maxRetries: 0
       });
       return embeddings;
     });
@@ -293,14 +273,13 @@ export function recall(config: RecallConfig): AgentPlugin {
           }),
           // The index, the namespace and the embedder all come from the closure.
           // The model can only ever supply a query string and a count.
-          execute: async ({ query, limit }, { abortSignal }) => ({
+          execute: async ({ query, limit }) => ({
             results: await recallSearch(
               index,
               namespace(),
               query,
               embed,
-              limit ?? topK,
-              abortSignal
+              limit ?? topK
             )
           })
         })

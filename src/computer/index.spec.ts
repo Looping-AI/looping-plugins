@@ -1547,7 +1547,25 @@ describe("a cancelled command", () => {
 
     // A model told only that something failed runs the same command again; one
     // told it ran out of time can narrow it.
-    expect(await pending).toContain("time limit");
+    expect(await pending).toContain("it ran past this call's time limit");
+  });
+
+  it("says nothing ran when the time limit came before the command started", async () => {
+    const controller = new AbortController();
+    const pending = execWith(
+      buildComputerTools(() => new Promise<WorkspaceClient>(() => {}), config),
+      { command: "npm test" },
+      controller.signal
+    );
+
+    await started();
+    controller.abort(new DOMException("tool deadline", "TimeoutError"));
+
+    // Not "try something narrower": the command was never the problem, and a
+    // narrower one waits on the same workspace.
+    const out = await pending;
+    expect(out).toContain("did not run");
+    expect(out).toContain("nothing was changed");
   });
 
   it("does not start a command on a call that is already cancelled", async () => {
@@ -1563,26 +1581,11 @@ describe("a cancelled command", () => {
 
     expect(execs).toHaveLength(0);
   });
-
-  it("stops a file tool waiting on a workspace that has stopped answering", async () => {
-    const controller = new AbortController();
-    const tools = buildComputerTools(
-      () => new Promise<WorkspaceClient>(() => {}),
-      config
-    );
-
-    const pending = (
-      tools.sb_read!.execute as (i: unknown, o: unknown) => Promise<string>
-    )({ path: "/workspace/repo/a.ts" }, { abortSignal: controller.signal });
-    controller.abort();
-
-    expect(await pending).toMatch(/^error reading/);
-  });
 });
 
 /**
- * Everything in front of the command: the checks that stop work starting, and
- * the waits that used to sit outside any bound.
+ * Everything in front of the command: the checks that keep it from starting, and
+ * the waits a cancel has to reach before it does.
  */
 describe("cancellation before the command runs", () => {
   const call = (
@@ -1596,29 +1599,6 @@ describe("cancellation before the command runs", () => {
       { abortSignal }
     );
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-  it("writes nothing on a call that is already cancelled", async () => {
-    const { workspace, files } = stub({ "/workspace/repo/a.ts": "before" });
-    let opened = 0;
-    const counting = () => {
-      opened += 1;
-      return workspace();
-    };
-    const controller = new AbortController();
-    controller.abort();
-
-    const out = await call(
-      buildComputerTools(counting, config),
-      "sb_write",
-      { path: "/workspace/repo/a.ts", content: "after" },
-      controller.signal
-    );
-
-    expect(out).toMatch(/^error writing/);
-    // Building the operation is what starts it, so the check has to come first.
-    expect(opened).toBe(0);
-    expect(files.get("/workspace/repo/a.ts")).toBe("before");
-  });
 
   it("stops waiting on an advisory read that never answers, without running the command", async () => {
     const { workspace, execs } = stub();

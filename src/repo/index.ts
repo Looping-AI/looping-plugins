@@ -709,7 +709,7 @@ export function buildRepoTools(
   const forge = async (
     tool: string,
     path: string,
-    opts?: { method?: string; body?: unknown; signal?: AbortSignal }
+    init?: { method: string; body: unknown }
   ): Promise<{ ok: true; data: unknown } | { ok: false; message: string }> => {
     const secret = credential();
     if ("failure" in secret) {
@@ -719,25 +719,15 @@ export function buildRepoTools(
     let response: Response;
     try {
       response = await fetch(`${apiBase}${path}`, {
-        method: opts?.method ?? "GET",
+        method: init?.method ?? "GET",
         headers: {
           authorization: `Bearer ${secret.token}`,
           accept: "application/vnd.github+json",
           "content-type": "application/json",
           "user-agent": "da-coder"
         },
-        ...(opts?.body !== undefined
-          ? { body: JSON.stringify(opts.body) }
-          : {}),
-        // The caller's own deadline as well as this bound, whichever comes
-        // first — a round that was cancelled should not wait out a forge call,
-        // and a forge call must stay bounded even when nobody cancels.
-        signal: opts?.signal
-          ? AbortSignal.any([
-              opts.signal,
-              AbortSignal.timeout(FORGE_TIMEOUT_MS)
-            ])
-          : AbortSignal.timeout(FORGE_TIMEOUT_MS)
+        ...(init ? { body: JSON.stringify(init.body) } : {}),
+        signal: AbortSignal.timeout(FORGE_TIMEOUT_MS)
       });
     } catch (err) {
       logFailure(tool, { stderr: String(err) });
@@ -1302,7 +1292,7 @@ export function buildRepoTools(
             "Pull request description — what changed and why, and how you verified it"
           )
       }),
-      execute: async ({ dir, head, base, title, body }, { abortSignal }) => {
+      execute: async ({ dir, head, base, title, body }) => {
         // The checkout's own origin, never a URL the model names — the rule the
         // three read tools follow, and it binds harder here because this one
         // writes. A repository named at the call site is bounded only by the
@@ -1315,11 +1305,7 @@ export function buildRepoTools(
         const opened = await forge(
           "repo_open_pr",
           `/repos/${owner}/${repo}/pulls`,
-          {
-            method: "POST",
-            body: { title, head, base, body },
-            signal: abortSignal
-          }
+          { method: "POST", body: { title, head, base, body } }
         );
         if (!opened.ok)
           // A POST whose answer never arrived may still have been received, and
@@ -1344,7 +1330,7 @@ export function buildRepoTools(
         dir: z.string().describe("The checkout directory"),
         number: z.number().int().positive().describe("Issue or PR number")
       }),
-      execute: async ({ dir, number }, { abortSignal }) => {
+      execute: async ({ dir, number }) => {
         const target = await forgeRepo(dir);
         if ("refusal" in target) return target.refusal;
         const { owner, repo } = target;
@@ -1354,8 +1340,7 @@ export function buildRepoTools(
         // discussion. `repo_pr_view` is for the parts that are only a PR's.
         const issue = await forge(
           "repo_issue_view",
-          `/repos/${owner}/${repo}/issues/${number}`,
-          { signal: abortSignal }
+          `/repos/${owner}/${repo}/issues/${number}`
         );
         if (!issue.ok) return bounded(issue.message);
         const data = issue.data as {
@@ -1368,8 +1353,7 @@ export function buildRepoTools(
 
         const comments = await forge(
           "repo_issue_view",
-          `/repos/${owner}/${repo}/issues/${number}/comments?per_page=${FORGE_PAGE_SIZE}`,
-          { signal: abortSignal }
+          `/repos/${owner}/${repo}/issues/${number}/comments?per_page=${FORGE_PAGE_SIZE}`
         );
         // A failure here is not a failure of the tool: the issue itself was
         // read, and half an answer beats none.
@@ -1412,15 +1396,14 @@ export function buildRepoTools(
         dir: z.string().describe("The checkout directory"),
         number: z.number().int().positive().describe("Pull request number")
       }),
-      execute: async ({ dir, number }, { abortSignal }) => {
+      execute: async ({ dir, number }) => {
         const target = await forgeRepo(dir);
         if ("refusal" in target) return target.refusal;
         const { owner, repo } = target;
 
         const pr = await forge(
           "repo_pr_view",
-          `/repos/${owner}/${repo}/pulls/${number}`,
-          { signal: abortSignal }
+          `/repos/${owner}/${repo}/pulls/${number}`
         );
         if (!pr.ok) return bounded(pr.message);
         const data = pr.data as {
@@ -1436,8 +1419,7 @@ export function buildRepoTools(
 
         const files = await forge(
           "repo_pr_view",
-          `/repos/${owner}/${repo}/pulls/${number}/files?per_page=${FORGE_PAGE_SIZE}`,
-          { signal: abortSignal }
+          `/repos/${owner}/${repo}/pulls/${number}/files?per_page=${FORGE_PAGE_SIZE}`
         );
         const changed = (
           files.ok && Array.isArray(files.data) ? files.data : []
@@ -1493,7 +1475,7 @@ export function buildRepoTools(
           .describe("Pull request or issue number"),
         body: z.string().describe("The comment, as markdown")
       }),
-      execute: async ({ dir, number, body }, { abortSignal }) => {
+      execute: async ({ dir, number, body }) => {
         const target = await forgeRepo(dir);
         if ("refusal" in target) return target.refusal;
         const { owner, repo } = target;
@@ -1501,7 +1483,7 @@ export function buildRepoTools(
         const posted = await forge(
           "repo_pr_comment",
           `/repos/${owner}/${repo}/issues/${number}/comments`,
-          { method: "POST", body: { body }, signal: abortSignal }
+          { method: "POST", body: { body } }
         );
         if (!posted.ok)
           // The same hazard `repo_open_pr` names, for the same reason: a POST

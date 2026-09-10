@@ -40,8 +40,8 @@ export function buildArcGamesTools(deps: ArcGamesDeps): ToolSet {
       description:
         "List the ARC-AGI-3 games available to play, with their exact game ids and tags describing how each is played. Use this to find the full game id before delegating a play.",
       inputSchema: z.object({}),
-      execute: async (_input, { abortSignal }) => {
-        const { games } = await deps.client.listGames({}, abortSignal);
+      execute: async () => {
+        const { games } = await deps.client.listGames({});
         return renderGames(games);
       }
     })
