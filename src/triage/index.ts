@@ -205,10 +205,7 @@ export async function shouldReply(
     const { output } = await generateText({
       model,
       output: Output.object({ schema: triageSchema }),
-      prompt: buildTriagePrompt(history, options),
-      // Consistent with the rest of the runtime: we handle failure ourselves
-      // (here, by failing open), so SDK backoff would only delay the turn.
-      maxRetries: 0
+      prompt: buildTriagePrompt(history, options)
     });
     // Log the whole verdict, not just the outcome. The booleans are the
     // reasoning — a correct verdict reached through wrong booleans means the
