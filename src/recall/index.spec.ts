@@ -392,3 +392,33 @@ describe("a cancelled recall", () => {
     await expect(pending).rejects.toBe(reason);
   });
 });
+
+describe("a recall cancelled before it starts", () => {
+  it("starts no embedding and no query", async () => {
+    const { index, queries } = fakeIndex();
+    let embedded = 0;
+    const counting: Embed = async (texts) => {
+      embedded += 1;
+      return texts.map(() => [0, 0, 0]);
+    };
+    const plugin = recall({
+      ai: {} as Ai,
+      index,
+      namespace: () => "caller:abc",
+      embed: counting
+    });
+    const tools = await plugin.mainAgentTools!({ session: sessionWith(1) });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      callTool(
+        tools.recall,
+        { query: "the deploy" },
+        { abortSignal: controller.signal }
+      )
+    ).rejects.toBeDefined();
+    expect(embedded).toBe(0);
+    expect(queries).toHaveLength(0);
+  });
+});

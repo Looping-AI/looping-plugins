@@ -143,6 +143,8 @@ export async function recallSearch(
   topK: number = DEFAULT_TOP_K,
   signal?: AbortSignal
 ): Promise<RecallResult[]> {
+  // Nothing is started for a call that is already cancelled.
+  signal?.throwIfAborted();
   const [vector] = await embed([query], signal);
   if (!vector) return [];
   // Vectorize takes no signal on any method, so this stops the wait and nothing

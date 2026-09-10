@@ -1579,3 +1579,138 @@ describe("a cancelled command", () => {
     expect(await pending).toMatch(/^error reading/);
   });
 });
+
+/**
+ * Everything in front of the command: the checks that stop work starting, and
+ * the waits that used to sit outside any bound.
+ */
+describe("cancellation before the command runs", () => {
+  const call = (
+    tools: ToolSet,
+    name: string,
+    input: unknown,
+    abortSignal: AbortSignal
+  ) =>
+    (tools[name]!.execute as (i: unknown, o: unknown) => Promise<string>)(
+      input,
+      { abortSignal }
+    );
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("writes nothing on a call that is already cancelled", async () => {
+    const { workspace, files } = stub({ "/workspace/repo/a.ts": "before" });
+    let opened = 0;
+    const counting = () => {
+      opened += 1;
+      return workspace();
+    };
+    const controller = new AbortController();
+    controller.abort();
+
+    const out = await call(
+      buildComputerTools(counting, config),
+      "sb_write",
+      { path: "/workspace/repo/a.ts", content: "after" },
+      controller.signal
+    );
+
+    expect(out).toMatch(/^error writing/);
+    // Building the operation is what starts it, so the check has to come first.
+    expect(opened).toBe(0);
+    expect(files.get("/workspace/repo/a.ts")).toBe("before");
+  });
+
+  it("stops waiting on an advisory read that never answers, without running the command", async () => {
+    const { workspace, execs } = stub();
+    const tools = buildComputerTools(
+      workspace,
+      { ...config, installGateMs: 60_000 },
+      () => new Promise<readonly WorkspaceAdvisory[]>(() => {})
+    );
+    const controller = new AbortController();
+
+    const pending = call(
+      tools,
+      "sb_exec",
+      { command: "npm test" },
+      controller.signal
+    );
+    await tick();
+    controller.abort();
+
+    // Failing the gate open on a cancel would run the very command given up on.
+    expect(await pending).toContain("cancelled");
+    expect(execs).toHaveLength(0);
+  });
+
+  it("disposes a workspace that opens only after the call gave up", async () => {
+    let arrive: ((client: WorkspaceClient) => void) | undefined;
+    const tools = buildComputerTools(
+      () =>
+        new Promise<WorkspaceClient>((resolve) => {
+          arrive = resolve;
+        }),
+      config
+    );
+    const controller = new AbortController();
+
+    const pending = call(
+      tools,
+      "sb_exec",
+      { command: "npm test" },
+      controller.signal
+    );
+    await tick();
+    controller.abort();
+    expect(await pending).toContain("cancelled");
+
+    let disposed = false;
+    arrive?.({
+      [Symbol.dispose]: () => {
+        disposed = true;
+      }
+    } as unknown as WorkspaceClient);
+    await tick();
+    // Nobody is left holding it, so it is released the moment it turns up.
+    expect(disposed).toBe(true);
+  });
+
+  it("kills a process whose handle arrives only after the call gave up", async () => {
+    let started: ((handle: unknown) => void) | undefined;
+    const client = {
+      runtime: {
+        exec: () =>
+          new Promise((resolve) => {
+            started = resolve;
+          })
+      },
+      [Symbol.dispose]: () => {}
+    } as unknown as WorkspaceClient;
+    const tools = buildComputerTools(async () => client, config);
+    const controller = new AbortController();
+
+    const pending = call(
+      tools,
+      "sb_exec",
+      { command: "npm test" },
+      controller.signal
+    );
+    await tick();
+    controller.abort();
+    expect(await pending).toContain("cancelled");
+
+    const kills: Array<string | undefined> = [];
+    let disposed = false;
+    started?.({
+      result: () => new Promise(() => {}),
+      kill: async (signal?: string) => void kills.push(signal),
+      [Symbol.dispose]: () => {
+        disposed = true;
+      }
+    });
+    await tick();
+    // Disposing alone detaches this side and leaves the process running.
+    expect(kills).toEqual(["SIGTERM"]);
+    expect(disposed).toBe(true);
+  });
+});

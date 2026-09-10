@@ -132,3 +132,33 @@ describe("a cancelled page read", () => {
     await expect(pending).rejects.toBe(reason);
   });
 });
+
+describe("a page read cancelled before it starts", () => {
+  it("never reaches Browser Rendering", async () => {
+    let reached = 0;
+    const counting = new Proxy(
+      {},
+      {
+        get: () => {
+          reached += 1;
+          return () => new Promise(() => {});
+        }
+      }
+    ) as QuickActionBinding;
+    const tools = await browser({ binding: counting }).mainAgentTools!(toolCtx);
+    const before = reached;
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      (
+        tools.browser_markdown!.execute as (
+          i: unknown,
+          o: unknown
+        ) => Promise<unknown>
+      )({ url: "https://example.com" }, { abortSignal: controller.signal })
+    ).rejects.toBeDefined();
+    // A render started only to be abandoned is the cost this wrapper exists to bound.
+    expect(reached).toBe(before);
+  });
+});

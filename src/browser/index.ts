@@ -69,11 +69,15 @@ function honourSignal(tools: ToolSet): ToolSet {
       if (!execute) return [name, original];
       const bounded: Tool = {
         ...original,
-        execute: (input, options) =>
-          withAbort(
+        execute: async (input, options) => {
+          // Checked before the original runs, because running it starts the
+          // render: a call already cancelled would spend one only to abandon it.
+          options.abortSignal?.throwIfAborted();
+          return withAbort(
             options.abortSignal,
             Promise.resolve(execute(input, options))
-          )
+          );
+        }
       };
       return [name, bounded];
     })
