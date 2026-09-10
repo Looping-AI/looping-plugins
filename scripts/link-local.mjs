@@ -16,14 +16,13 @@
  *   locally and 404s for everyone else.
  *
  * A tarball is what npm actually publishes, so if it works here it works from the
- * registry. Nothing is written to `package.json` — this leaves the manifest's
- * published semver ranges alone, so a plain `npm install` (and CI, which never
- * runs this) always builds against the real packages.
+ * registry. Nothing is written to `package.json`, so a plain `npm install` (and CI,
+ * which never runs this) builds against whatever the branch declares.
  *
  * ## Why this repo needs it
  *
- * `@dynamicagents/core` is a **peer** dependency here, so a plain `npm install`
- * resolves it from the registry — and will happily overwrite a local build of it
+ * A plain `npm install` resolves `@dynamicagents/core` from what `package.json`
+ * declares — and will happily overwrite a local build of it
  * that you are in the middle of testing against. The failure is quiet and
  * misleading: the next `tsc` reports type errors in *this* repo's source, for a
  * contract change that is sitting uninstalled one directory away. That happened
@@ -123,7 +122,7 @@ execFileSync("npm", ["install", "--no-save", ...tarballs], {
  *
  * Restoring is safe precisely because the linked install is meant to be
  * throwaway: `node_modules` keeps the local tarballs, the lockfile keeps
- * describing the registry, and a plain `npm install` puts the two back in step.
+ * describing the manifest, and a plain `npm install` puts the two back in step.
  *
  * *Any* difference is reverted, not just a `file:` path. Everything npm writes
  * here is an artifact of a throwaway install — a dropped `integrity`, a
