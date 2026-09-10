@@ -661,10 +661,10 @@ export function buildComputerTools(
          * where the call stopped. A command that outran the limit once will again;
          * one that never started because the workspace did not answer may not.
          *
-         * This is the one tool that reads its call's signal rather than leaving the
-         * wait to core, and this is why: core's abandonment can say only that the
-         * command may still be running. Core's `TOOL_CALL_GRACE_MS` is the window
-         * this answer has to arrive in, and it covers sending the kill below.
+         * `sb_exec` reads its call's signal rather than leaving the wait to core,
+         * and this is why: core's abandonment can say only that the command may
+         * still be running. Core's `TOOL_CALL_GRACE_MS` is the window this answer
+         * has to arrive in, and it covers sending the kill below.
          */
         const stopped = (gateMs: number, started: boolean): string => {
           const timedOut =

@@ -298,14 +298,6 @@ export function buildArcGameTools(
           } else if (action === 6 && (x === undefined || y === undefined)) {
             stopped = "click (action 6) requires x and y (0–63)";
           }
-          // Ahead of the write-ahead below rather than left to the `fetch` to
-          // refuse: a request on an aborted signal is never sent, but the intent
-          // would already be on disk, and the next chunk would warn about a move
-          // that never left. Stopping here ends the batch the ordinary way, with
-          // every step already sent recorded.
-          if (!stopped && ctx.signal?.aborted) {
-            stopped = "this call was cancelled";
-          }
           if (stopped) {
             trace.push(remaining(steps.length, index, stopped));
             break;
@@ -316,6 +308,21 @@ export function buildArcGameTools(
           // exactly as a crash mid-action always was.
           session.pendingAction = { action, x, y };
           await save(session);
+
+          // A cancel is checked here, with the intent already on disk, because this
+          // is the last moment before the request: a check ahead of the write would
+          // miss a cancel that lands during it. A request on an aborted signal is
+          // never sent, so the intent is taken back rather than left for the next
+          // chunk to warn about a move that never left. The batch ends the ordinary
+          // way, with every step already sent recorded.
+          if (ctx.signal?.aborted) {
+            session.pendingAction = null;
+            await save(session);
+            trace.push(
+              remaining(steps.length, index, "this call was cancelled")
+            );
+            break;
+          }
 
           const { frame, cookies } = await client.act(
             { action, gameId: session.gameId, guid: session.guid, x, y, note },
