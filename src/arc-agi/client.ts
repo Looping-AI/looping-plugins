@@ -1,3 +1,4 @@
+import { withAbort } from "@dynamicagents/core";
 import {
   ARC_BASE_URL,
   type CookieJar,
@@ -21,6 +22,10 @@ import {
  *   exponential backoff. Exhausted retries and 5xx throw (transient — the
  *   Workflow step retries and the runner resumes from its checkpoint); a 401
  *   throws a tagged deterministic error (bad key — a terminal failure).
+ * - **Cancellation**: a client built with a `signal` stops at it — the `fetch` and
+ *   the backoff between retries alike. `Retry-After` is honoured up to
+ *   {@link MAX_RETRY_AFTER_MS} and no further: the header is the server's to set,
+ *   and an uncapped one parks a tool for as long as the server likes.
  */
 export interface ArcClient {
   listGames(
@@ -55,6 +60,13 @@ export interface ArcClient {
   ): Promise<{ frame: FrameResponse; cookies: CookieJar }>;
 }
 
+/**
+ * The longest a `Retry-After` is waited out. A minute covers the API's own
+ * per-minute rate window; past that the header is either hostile or describing an
+ * outage, and a retry loop is the wrong place to sit through either.
+ */
+export const MAX_RETRY_AFTER_MS = 60_000;
+
 /** Message prefix of the deterministic (non-retryable) auth error. */
 export const ARC_AUTH_ERROR = "arc-client: unauthorized";
 
@@ -64,6 +76,12 @@ export interface ArcClientOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Max attempts per request before a 429/5xx becomes a thrown transient fault. */
   maxAttempts?: number;
+  /**
+   * Stops every request this client makes, and every wait between them. Taken at
+   * construction, because a client built for one tool surface stops on that
+   * surface's signal — core's `ToolFamilyContext.signal` for a subagent's.
+   */
+  signal?: AbortSignal;
 }
 
 const realSleep = (ms: number): Promise<void> =>
@@ -94,6 +112,7 @@ export function makeArcClient(
   const doFetch = options.fetchFn ?? fetch;
   const sleep = options.sleep ?? realSleep;
   const maxAttempts = options.maxAttempts ?? 4;
+  const signal = options.signal;
 
   async function request<T>(
     path: string,
@@ -114,7 +133,8 @@ export function makeArcClient(
       const res = await doFetch(`${ARC_BASE_URL}${path}`, {
         method: init.method,
         headers,
-        body: init.body === undefined ? undefined : JSON.stringify(init.body)
+        body: init.body === undefined ? undefined : JSON.stringify(init.body),
+        ...(signal ? { signal } : {})
       });
 
       if (res.ok) {
@@ -137,9 +157,11 @@ export function makeArcClient(
       const retryAfter = Number(res.headers.get("retry-after"));
       const backoffMs =
         Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
+          ? Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS)
           : Math.min(1000 * 2 ** (attempt - 1), 8000);
-      await sleep(backoffMs);
+      // The wait between attempts is the longest thing this loop does, so it is
+      // the part a cancel most needs to reach.
+      await withAbort(signal, sleep(backoffMs));
     }
   }
 

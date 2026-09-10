@@ -75,7 +75,9 @@ export function buildArcGameTools(
   // cannot do — `Env` is the ambient interface `wrangler types` generates into a
   // *consumer's* app and does not exist here. Config-at-instantiation is also
   // the only thing that works on Workers at all, where `env` has no module scope.
-  const client = makeArcClient(apiKey);
+  // The execution's signal goes in the same way, so a cancel reaches a request or
+  // a backoff without every call having to carry it.
+  const client = makeArcClient(apiKey, { signal: ctx.signal });
   const runtime = runtimeAs<ArcRuntime>(ctx.runtime);
 
   // All settled before the model runs — it cannot pick a different game, and it
@@ -306,6 +308,21 @@ export function buildArcGameTools(
           // exactly as a crash mid-action always was.
           session.pendingAction = { action, x, y };
           await save(session);
+
+          // A cancel is checked here, with the intent already on disk, because this
+          // is the last moment before the request: a check ahead of the write would
+          // miss a cancel that lands during it. A request on an aborted signal is
+          // never sent, so the intent is taken back rather than left for the next
+          // chunk to warn about a move that never left. The batch ends the ordinary
+          // way, with every step already sent recorded.
+          if (ctx.signal?.aborted) {
+            session.pendingAction = null;
+            await save(session);
+            trace.push(
+              remaining(steps.length, index, "this call was cancelled")
+            );
+            break;
+          }
 
           const { frame, cookies } = await client.act(
             { action, gameId: session.gameId, guid: session.guid, x, y, note },

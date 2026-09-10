@@ -1,7 +1,7 @@
 import { tool } from "ai";
 import type { ToolSet } from "ai";
 import { z } from "zod";
-import { definePlugin } from "@dynamicagents/core";
+import { definePlugin, withAbort } from "@dynamicagents/core";
 import type { AgentPlugin } from "@dynamicagents/core";
 import { getWorkspace, shellQuote } from "@cloudflare/computer";
 import type { WorkspaceClient, WorkspaceStub } from "@cloudflare/computer";
@@ -434,6 +434,39 @@ export interface ComputerConfig {
   env?: () => Record<string, string | undefined>;
 }
 
+/**
+ * Wait for a disposable resource without outliving `signal`.
+ *
+ * `withAbort` can abandon the wait but not the resource, and one that arrives
+ * after its caller has given up has nobody left to dispose it. So it is released
+ * on arrival instead — disposed by default, or handed to `release` where
+ * disposing alone would leave work running.
+ */
+function acquire<R extends Disposable>(
+  signal: AbortSignal | undefined,
+  opening: Promise<R>,
+  release: (resource: R) => unknown = (resource) => resource[Symbol.dispose]()
+): Promise<R> {
+  return withAbort(signal, opening, () => {
+    void opening.then(release).catch(() => {});
+  });
+}
+
+/**
+ * How an exec handle that arrived too late is released. Disposing only detaches
+ * this side, so the process is killed first.
+ */
+async function killLate(handle: {
+  kill(signal?: "SIGTERM"): Promise<void>;
+  [Symbol.dispose](): void;
+}): Promise<void> {
+  try {
+    await handle.kill("SIGTERM");
+  } finally {
+    handle[Symbol.dispose]();
+  }
+}
+
 export function buildComputerTools(
   workspace: () => Promise<WorkspaceClient>,
   config: ComputerConfig,
@@ -460,7 +493,10 @@ export function buildComputerTools(
    * it was dropping. The cost is one same-colo RPC on commands that previously
    * skipped it, against a class of silent data loss.
    */
-  const awaitAdvisories = async (command: string): Promise<ExecGate> => {
+  const awaitAdvisories = async (
+    command: string,
+    signal?: AbortSignal
+  ): Promise<ExecGate> => {
     if (!advisories) return {};
 
     // Fails **open**, and that belongs here rather than at the call site: this
@@ -470,8 +506,12 @@ export function buildComputerTools(
     // subagent.
     const read = async (): Promise<readonly WorkspaceAdvisory[]> => {
       try {
-        return await advisories();
-      } catch {
+        signal?.throwIfAborted();
+        return await withAbort(signal, advisories());
+      } catch (err) {
+        // Open on a failed read, never on a cancel: failing open here would go on
+        // to run the command the caller just gave up on.
+        if (signal?.aborted) throw err;
         return [];
       }
     };
@@ -487,7 +527,12 @@ export function buildComputerTools(
     // the outcome.
     while (execGate(current, command).block && Date.now() < deadline) {
       const wait = Math.min(INSTALL_POLL_MS, deadline - Date.now());
-      await new Promise((resolve) => setTimeout(resolve, wait));
+      // Throws on a cancel rather than returning the verdict so far: a gate that
+      // outlived its caller would otherwise go on to run the command it was holding.
+      await withAbort(
+        signal,
+        new Promise((resolve) => setTimeout(resolve, wait))
+      );
       current = await read();
     }
     return execGate(current, command);
@@ -590,7 +635,7 @@ export function buildComputerTools(
           .optional()
           .describe(`Working directory (default: ${cwd})`)
       }),
-      execute: async ({ command, cwd: overrideCwd }) => {
+      execute: async ({ command, cwd: overrideCwd }, { abortSignal }) => {
         /**
          * One line per command, and it is the only view of where a task's wall
          * clock actually goes.
@@ -609,13 +654,51 @@ export function buildComputerTools(
          */
         const startedAtMs = Date.now();
 
+        /**
+         * What the model is told when this call stops before the command
+         * finishes. Said plainly, because the likeliest next move after a bare
+         * error is the same command again — and whether that is right depends on
+         * where the call stopped. A command that outran the limit once will again;
+         * one that never started because the workspace did not answer may not.
+         *
+         * `sb_exec` reads its call's signal rather than leaving the wait to core,
+         * and this is why: core's abandonment can say only that the command may
+         * still be running. Core's `TOOL_CALL_GRACE_MS` is the window this answer
+         * has to arrive in, and it covers sending the kill below.
+         */
+        const stopped = (gateMs: number, started: boolean): string => {
+          const timedOut =
+            (abortSignal?.reason as { name?: string } | undefined)?.name ===
+            "TimeoutError";
+          console.info("[computer] sb_exec stopped", {
+            command,
+            gateMs,
+            durationMs: Date.now() - startedAtMs - gateMs,
+            started,
+            reason: timedOut ? "time limit" : "cancelled"
+          });
+          if (!timedOut)
+            return "the command was stopped because this call was cancelled. Anything it changed before then is still changed.";
+          return started
+            ? "the command was stopped: it ran past this call's time limit. Anything it changed before then is still changed. Try something narrower."
+            : "the command did not run: this call reached its time limit while the workspace was still getting ready, so nothing was changed. Try again; if it happens again, the workspace is not responding.";
+        };
+
         // Only `sb_exec` waits on an install. The file tools read and write
         // source, which is in the workspace and unaffected by an install in
         // flight — blocking them would stop the subagent doing the reading it
         // could usefully do while it waits. They do consult `writeGate`, which
         // is a different question: not "is the tree ready" but "does a write
         // survive at all".
-        const gate = await awaitAdvisories(command);
+        let gate: ExecGate;
+        try {
+          gate = await awaitAdvisories(command, abortSignal);
+        } catch (err) {
+          // Only a cancel gets out of the gate; a failed advisory read opens it.
+          if (abortSignal?.aborted)
+            return stopped(Date.now() - startedAtMs, false);
+          throw err;
+        }
         const gateMsWaited = Date.now() - startedAtMs;
         if (gate.block) {
           console.info("[computer] sb_exec blocked by a workspace advisory", {
@@ -629,9 +712,14 @@ export function buildComputerTools(
         // is carried through the catch as well.
         const note = (body: string) =>
           gate.warn ? `${gate.warn}\n\n${body}` : body;
+        // Set once the exec is sent. See `stopped`.
+        let started = false;
 
         try {
-          using ws = await workspace();
+          // A workspace that stops answering would hold the call before any of the
+          // cancellation below is reached.
+          abortSignal?.throwIfAborted();
+          using ws = await acquire(abortSignal, workspace());
           // Read once per command. This is the *host's* thunk, so calling it
           // twice in the construction of one command's options is two chances to
           // disagree — the check and the value would come from different reads.
@@ -644,11 +732,26 @@ export function buildComputerTools(
           };
           // Transcript, not two streams: this result goes to a model, which
           // reads it as a terminal session rather than parsing it.
-          using handle = await ws.runtime.exec(
-            withShellTranscript(command, config.shell),
-            options
+          // Not started at all on a signal that has already fired: a process that
+          // is killed on the next line still ran long enough to change something.
+          abortSignal?.throwIfAborted();
+          // From here a stop cannot promise nothing ran: the exec may reach the
+          // container before its handle reaches this side.
+          started = true;
+          using handle = await acquire(
+            abortSignal,
+            ws.runtime.exec(
+              withShellTranscript(command, config.shell),
+              options
+            ),
+            killLate
           );
-          const result = await handle.result();
+          // The runtime takes no signal, so stopping the wait and stopping the
+          // process are two acts. Disposing the handle is neither — it releases
+          // this side's attachment and leaves the command running.
+          const result = await withAbort(abortSignal, handle.result(), () =>
+            handle.kill("SIGTERM")
+          );
           console.info("[computer] sb_exec", {
             command,
             exitCode: result.exitCode,
@@ -661,6 +764,7 @@ export function buildComputerTools(
           });
           return note(renderResult(result, maxChars));
         } catch (err) {
+          if (abortSignal?.aborted) return note(stopped(gateMsWaited, started));
           const lost = execLostNote(err);
           console.warn("[computer] sb_exec failed", {
             command,

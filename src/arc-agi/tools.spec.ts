@@ -1004,3 +1004,50 @@ describe("arc_act sequences", () => {
     expect(next).not.toContain("Unchanged");
   });
 });
+
+describe("a cancelled arc_act", () => {
+  it("sends nothing, and leaves no intent, once the execution is cancelled", async () => {
+    const hits = stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
+    const { ctx: c } = ctx();
+    const controller = new AbortController();
+    const { tools } = build({ ...c, signal: controller.signal });
+    controller.abort();
+
+    const out = await callTool(tools.arc_act, one(1));
+
+    // Refused before the request, not by it: a `fetch` on an aborted signal is
+    // never sent, but the write-ahead ahead of it is already on disk.
+    expect(hits).toHaveLength(0);
+    expect(out).toContain("this call was cancelled");
+
+    // The write-ahead is what a later call reads as an interrupted move. A step
+    // stopped before it was sent must leave nothing for that warning to find —
+    // and the next chunk builds its tools again, over the same workspace.
+    const next = await callTool(build(c).tools.arc_act, one(1));
+    expect(next).not.toMatch(/may have been interrupted/);
+  });
+
+  it("takes back the intent when the cancel lands during its write", async () => {
+    const hits = stubFetch({ "/api/cmd/ACTION1": () => FRAME() });
+    const { ctx: c } = ctx();
+    const controller = new AbortController();
+    // Cancelled by the write-ahead itself: after anything checked ahead of the
+    // write, and before the request that would follow it.
+    const workspace: typeof c.workspace = {
+      ...c.workspace,
+      writeJson: async (path, value) => {
+        if ((value as { pendingAction?: unknown }).pendingAction)
+          controller.abort();
+        return c.workspace.writeJson(path, value);
+      }
+    };
+    const { tools } = build({ ...c, workspace, signal: controller.signal });
+
+    const out = await callTool(tools.arc_act, one(1));
+
+    expect(hits).toHaveLength(0);
+    expect(out).toContain("this call was cancelled");
+    const next = await callTool(build(c).tools.arc_act, one(1));
+    expect(next).not.toMatch(/may have been interrupted/);
+  });
+});
