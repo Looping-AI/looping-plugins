@@ -109,7 +109,7 @@
     "@cloudflare/computer": "^0.2.1",
     "@cloudflare/shell": "0.4.3",
     "@cloudflare/vitest-plugin": "^1.1.5",
-    "@dynamicagents/core": "^0.9.0",
+    "@dynamicagents/core": "git+https://github.com/dynamicagents/core.git#next",
     "@types/node": "^26.5.0",
     "agents": ">=0.21.0 <0.23.0",
     "ai": "^7.0.93",

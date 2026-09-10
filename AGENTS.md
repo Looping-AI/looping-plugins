@@ -59,9 +59,11 @@ on the registry is one nobody can install.
 `peerDependency` stays a semver range, because that is the only one a published
 consumer installs against — a git ref there would name a moving branch in somebody
 else's `node_modules`. The `devDependency` is what this repo builds and tests
-against, so it becomes a git ref onto core's `next`, which is how a core change is
-exercised here before it is released. That switch is pending: it needs a `prepare`
-that builds on core's `next` first, or there is nothing on that branch to install.
+against, so it is a git ref onto core's `next`, which is how a core change is
+exercised here before it is released. It installs only because core's `prepare`
+builds and because `allowScripts` in `package.json` lists core, which is what lets
+npm run that `prepare` — drop either and every core subpath resolves to a missing
+file. The workspace AGENTS.md has the why.
 
 `verify:peer-ranges` still holds that range honest: it reads the **installed** copy,
 and a git-installed core reports its real version. What it cannot see is that an
