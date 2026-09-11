@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildRepoTools,
+  repo,
+  repoToolApproval,
   type RepoConfig,
   type RepoExec,
   type RepoGit,
@@ -1553,5 +1555,106 @@ describe("concurrent git", () => {
       ])
     ).resolves.toHaveLength(2);
     expect(calls).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * The calls a person approves before they run.
+ *
+ * What matters about each rule is what it makes the person read: an approval
+ * worded vaguely is one a person clicks without knowing what they allowed.
+ */
+describe("what a person approves before it runs", () => {
+  const rules = repoToolApproval();
+
+  const verdict = async (name: string, input: unknown) => {
+    const rule = rules[name];
+    return typeof rule === "function"
+      ? await rule(input, { toolCallId: "call-1", messages: [] })
+      : rule;
+  };
+
+  it("holds a push, naming the branch and the checkout", async () => {
+    expect(
+      await verdict("repo_push", {
+        dir: "/workspace/web",
+        branch: "coder/fix-login"
+      })
+    ).toEqual({
+      type: "user-approval",
+      reason: expect.stringMatching(/coder\/fix-login.*web/)
+    });
+  });
+
+  it("holds a pull request, naming where it goes and what it is called", async () => {
+    const held = await verdict("repo_open_pr", {
+      dir: "/workspace/web",
+      head: "coder/fix-login",
+      base: "main",
+      title: "Fix the login redirect",
+      body: "What changed and why."
+    });
+
+    expect(held).toMatchObject({ type: "user-approval" });
+    for (const part of ["coder/fix-login", "main", "Fix the login redirect"])
+      expect(JSON.stringify(held)).toContain(part);
+  });
+
+  it("holds a comment, showing what it will say", async () => {
+    const held = await verdict("repo_pr_comment", {
+      dir: "/workspace/web",
+      number: 42,
+      body: "Pushed the fix; the tests pass."
+    });
+
+    expect(JSON.stringify(held)).toContain("#42");
+    expect(JSON.stringify(held)).toContain("Pushed the fix; the tests pass.");
+  });
+
+  it("keeps a long comment short enough to read before approving", async () => {
+    const held = (await verdict("repo_pr_comment", {
+      dir: "/workspace/web",
+      number: 42,
+      body: "x".repeat(20_000)
+    })) as { reason: string };
+
+    expect(held.reason.length).toBeLessThan(1_000);
+  });
+
+  it("gates only tools the plugin offers, so a rename cannot leave one unasked", () => {
+    // At runtime a rule for a name no tool has is dropped with a log line; a
+    // rename that did that is caught here instead.
+    const offered = Object.keys(tools(recorder().exec));
+
+    expect(Object.keys(rules).sort()).toEqual([
+      "repo_open_pr",
+      "repo_pr_comment",
+      "repo_push"
+    ]);
+    expect(Object.keys(rules).every((name) => offered.includes(name))).toBe(
+      true
+    );
+  });
+
+  it("lets what stays in the checkout run without asking", () => {
+    for (const name of [
+      "repo_clone",
+      "repo_status",
+      "repo_diff",
+      "repo_commit",
+      "repo_issue_view",
+      "repo_pr_view"
+    ])
+      expect(rules[name]).toBeUndefined();
+  });
+
+  it("installs the rules with the plugin", () => {
+    const plugin = repo({
+      exec: recorder().exec,
+      git: gitRecorder().git,
+      token: () => TOKEN
+    } as RepoConfig);
+
+    expect(plugin.mainAgentToolApproval).toBeDefined();
   });
 });

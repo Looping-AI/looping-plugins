@@ -2,7 +2,7 @@ import { tool } from "ai";
 import type { ToolSet } from "ai";
 import { z } from "zod";
 import { definePlugin } from "@dynamicagents/core";
-import type { AgentPlugin } from "@dynamicagents/core";
+import type { AgentPlugin, MainAgentToolApproval } from "@dynamicagents/core";
 import {
   DEFAULT_ALLOWED_HOSTS,
   parseRepo,
@@ -1500,11 +1500,67 @@ export function buildRepoTools(
   };
 }
 
+/** The longest comment a person is shown in full before approving it. */
+const APPROVAL_COMMENT_CHARS = 400;
+
+/** A checkout's directory as a person knows it: the repository's own name. */
+function checkoutName(dir: string): string {
+  return dir.split("/").filter(Boolean).at(-1) ?? dir;
+}
+
+/**
+ * The repo tools a person approves before they run: the ones that publish to the
+ * forge, where a mistake is seen by other people and the agent cannot take it
+ * back. Everything else the tools do stays in the checkout — a commit included,
+ * which nothing outside it sees until a push.
+ *
+ * Each reason is what the person reads beside Approve and Reject, so it says what
+ * the call will do in their terms: which branch goes where, which pull request,
+ * and what a comment says. The input has already passed the tool's own schema.
+ * What a rule is, and whose calls it covers, is core's to say — see
+ * `AgentPlugin.mainAgentToolApproval`.
+ */
+export function repoToolApproval(): MainAgentToolApproval {
+  return {
+    repo_push: (input) => {
+      const { dir, branch } = input as { dir: string; branch: string };
+      return {
+        type: "user-approval",
+        reason: `Push the branch \`${branch}\` of ${checkoutName(dir)} to its remote.`
+      };
+    },
+    repo_open_pr: (input) => {
+      const { dir, head, base, title } = input as {
+        dir: string;
+        head: string;
+        base: string;
+        title: string;
+      };
+      return {
+        type: "user-approval",
+        reason: `Open a pull request on ${checkoutName(dir)} from \`${head}\` into \`${base}\`: ${title}`
+      };
+    },
+    repo_pr_comment: (input) => {
+      const { dir, number, body } = input as {
+        dir: string;
+        number: number;
+        body: string;
+      };
+      return {
+        type: "user-approval",
+        reason: `Comment on #${number} in ${checkoutName(dir)}:\n\n${truncateOutput(body, APPROVAL_COMMENT_CHARS)}`
+      };
+    }
+  };
+}
+
 export function repo(config: RepoConfig): AgentPlugin {
   return definePlugin({
     key: "repo",
 
     mainAgentTools: () => buildRepoTools(config),
+    mainAgentToolApproval: () => repoToolApproval(),
 
     // The runtime state goes through to `exec` untouched, so a delegated
     // subtask's git commands run in the same container its parent cloned into.
